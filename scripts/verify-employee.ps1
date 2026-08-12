@@ -68,6 +68,19 @@ function Test-ConfigEquals {
     }
 }
 
+function Test-ConfigUnset {
+    param([Parameter(Mandatory = $true)][string]$Key)
+
+    $Arguments = @("-p", $ProfileId, "config", "get", $Key)
+    $Result = Invoke-HermesCapture -Arguments $Arguments
+    if ($Result.ExitCode -eq 0) {
+        Add-Failure "$Key must be unset according to the provisioning manifest."
+    }
+    elseif ($Result.Output.Trim() -cne "Config key not set: $Key") {
+        Add-Failure "Could not verify that $Key is unset."
+    }
+}
+
 function Get-FileHashOrMissing {
     param([Parameter(Mandatory = $true)][string]$Path)
 
@@ -253,7 +266,7 @@ else {
 
 if ($null -ne $Manifest) {
     $AllowedManifestFields = @(
-        "schemaVersion", "profileId", "provider", "model", "baseUrl",
+        "schemaVersion", "profileId", "provider", "model", "baseUrl", "hasBaseUrl",
         "reasoningEffort", "workspace", "keyConfigured", "assetHashes",
         "defaultBaseline"
     )
@@ -265,7 +278,20 @@ if ($null -ne $Manifest) {
     if ($Manifest.schemaVersion -ne 1 -or $Manifest.profileId -cne $ProfileId) {
         Add-Failure "Provisioning manifest identity or schema is invalid."
     }
-    [void](Test-SecureBaseUrl -Value ([string]$Manifest.baseUrl))
+    $HasBaseUrl = [bool]$Manifest.hasBaseUrl
+    $ProviderRequiresBaseUrl = ([string]$Manifest.provider).ToLowerInvariant() -notin @("codex")
+    if ($ProviderRequiresBaseUrl -and -not $HasBaseUrl) {
+        Add-Failure "A custom provider manifest must include a validated base URL."
+    }
+    if (-not $ProviderRequiresBaseUrl -and $HasBaseUrl) {
+        Add-Failure "The built-in provider manifest must not include a base URL override."
+    }
+    if ($HasBaseUrl) {
+        [void](Test-SecureBaseUrl -Value ([string]$Manifest.baseUrl))
+    }
+    elseif ($null -ne $Manifest.baseUrl) {
+        Add-Failure "Provisioning manifest base URL must be null when hasBaseUrl is false."
+    }
 
     Test-ConfigEquals -Key "terminal.backend" -Expected "local" -IgnoreCase
     Test-ConfigEquals -Key "terminal.home_mode" -Expected "profile" -IgnoreCase
@@ -275,7 +301,12 @@ if ($null -ne $Manifest) {
     Test-ConfigEquals -Key "skills.write_approval" -Expected "true" -IgnoreCase
     Test-ConfigEquals -Key "model.provider" -Expected ([string]$Manifest.provider)
     Test-ConfigEquals -Key "model.default" -Expected ([string]$Manifest.model)
-    Test-ConfigEquals -Key "model.base_url" -Expected ([string]$Manifest.baseUrl)
+    if ($HasBaseUrl) {
+        Test-ConfigEquals -Key "model.base_url" -Expected ([string]$Manifest.baseUrl)
+    }
+    else {
+        Test-ConfigUnset -Key "model.base_url"
+    }
     Test-ConfigEquals -Key "agent.reasoning_effort" -Expected ([string]$Manifest.reasoningEffort)
 
     $ExpectedWorkspace = (Join-Path $ProfileHome "workspace").Replace("\", "/").TrimEnd("/")

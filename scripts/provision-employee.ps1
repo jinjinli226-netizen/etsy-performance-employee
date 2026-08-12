@@ -4,7 +4,7 @@ param(
     [string]$Provider = "custom",
     [string]$ModelId = "gpt-5.6-sol",
     [string]$BaseUrl,
-    [ValidateSet("low", "medium", "high")]
+    [ValidateSet("minimal", "low", "medium", "high", "xhigh", "max", "ultra")]
     [string]$ReasoningEffort = "high",
     [string]$HermesCommand = "hermes"
 )
@@ -23,6 +23,7 @@ $Workspace = Join-Path $ProfileHome "workspace"
 $VerifyScript = Join-Path $PSScriptRoot "verify-employee.ps1"
 $ManifestPath = Join-Path $ProfileHome "provisioning-manifest.json"
 $NormalizedBaseUrl = $null
+$NoBaseUrlProviders = @("codex")
 
 function Assert-Parameters {
     if ($ProfileId -notmatch '^[a-z0-9]+(?:-[a-z0-9]+)*$') {
@@ -33,6 +34,14 @@ function Assert-Parameters {
     }
     if ([string]::IsNullOrWhiteSpace($ModelId) -or $ModelId -notmatch '^[a-zA-Z0-9._:/-]+$') {
         throw "Invalid model ID format."
+    }
+    $UsesBuiltInEndpoint = $Provider.ToLowerInvariant() -in $NoBaseUrlProviders
+    if ($UsesBuiltInEndpoint) {
+        if (-not [string]::IsNullOrWhiteSpace($BaseUrl)) {
+            throw "The built-in $Provider provider requires the base URL to be omitted."
+        }
+        $script:NormalizedBaseUrl = $null
+        return
     }
     if ([string]::IsNullOrWhiteSpace($BaseUrl)) {
         throw "A non-secret HTTPS base URL is required. Pass -BaseUrl explicitly."
@@ -156,8 +165,10 @@ try {
         "skills.write_approval" = "true"
         "model.provider" = $Provider
         "model.default" = $ModelId
-        "model.base_url" = $NormalizedBaseUrl
         "agent.reasoning_effort" = $ReasoningEffort
+    }
+    if ($null -ne $NormalizedBaseUrl) {
+        $Settings["model.base_url"] = $NormalizedBaseUrl
     }
     foreach ($Entry in $Settings.GetEnumerator()) {
         $SetArguments = @("-p", $ProfileId, "config", "set", $Entry.Key, [string]$Entry.Value)
@@ -184,6 +195,7 @@ try {
         provider = $Provider
         model = $ModelId
         baseUrl = $NormalizedBaseUrl
+        hasBaseUrl = $null -ne $NormalizedBaseUrl
         reasoningEffort = $ReasoningEffort
         workspace = $NormalizedWorkspace
         keyConfigured = $false

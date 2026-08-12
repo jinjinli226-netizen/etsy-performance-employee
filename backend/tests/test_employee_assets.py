@@ -108,6 +108,7 @@ def create_verifier_fixture(tmp_path: Path) -> tuple[Path, Path, Path, dict[str,
         "provider": values["model.provider"],
         "model": values["model.default"],
         "baseUrl": values["model.base_url"],
+        "hasBaseUrl": True,
         "reasoningEffort": values["agent.reasoning_effort"],
         "workspace": values["terminal.cwd"],
         "keyConfigured": False,
@@ -134,6 +135,7 @@ def write_fake_hermes(
     doctor_output: str | None = None,
     provision_profile_home: Path | None = None,
     command_log: Path | None = None,
+    missing_config_output: str | None = None,
 ) -> None:
     escaped_values = ((key, value.replace("'", "''")) for key, value in values.items())
     literal_values = "\n".join(
@@ -166,6 +168,8 @@ def write_fake_hermes(
     if command_log is not None:
         escaped_log = str(command_log).replace("'", "''")
         log_block = f"Add-Content -LiteralPath '{escaped_log}' -Value ($args -join '|')\n"
+    missing_output = missing_config_output or "Config key not set: model.base_url"
+    escaped_missing_output = missing_output.replace("'", "''")
     path.write_text(
         "$Values = @{\n"
         f"{literal_values}\n"
@@ -175,7 +179,8 @@ def write_fake_hermes(
         f"{doctor_block}"
         "$Key = $args[$args.Count - 1]\n"
         "if ($Values.ContainsKey($Key)) { Write-Output $Values[$Key]; exit 0 }\n"
-        "exit 9\n",
+        f"Write-Output '{escaped_missing_output}'\n"
+        "exit 1\n",
         encoding="utf-8-sig",
     )
 
@@ -333,6 +338,7 @@ def test_provisioner_encodes_isolation_and_safe_secret_handling() -> None:
     assert MANIFEST_NAME in script
     assert "assetHashes" in script and "defaultBaseline" in script
     assert "keyConfigured" in script
+    assert 'ValidateSet("minimal", "low", "medium", "high", "xhigh", "max", "ultra")' in script
 
 
 def test_verifier_is_read_only_and_checks_isolation() -> None:
@@ -667,6 +673,164 @@ def test_fake_real_hermes_provision_path_accepts_terminal_env_mirror(tmp_path: P
     assert result.returncode == 0, result.stdout + result.stderr
     assert "credential configuration pending" in (result.stdout + result.stderr).lower()
     assert "model.api_key" not in command_log.read_text(encoding="utf-8")
+
+
+def test_fake_hermes_provision_accepts_codex_without_base_url_and_xhigh(
+    tmp_path: Path,
+) -> None:
+    local_app_data = tmp_path / "local-app-data"
+    hermes_home = local_app_data / "hermes"
+    profile_home = hermes_home / "profiles" / "etsy-performance-us"
+    hermes_home.mkdir(parents=True)
+    for name, content in {
+        "SOUL.md": "default soul",
+        "config.yaml": "default config",
+        ".env": "# default placeholder",
+    }.items():
+        (hermes_home / name).write_text(content, encoding="utf-8")
+    fake_hermes = tmp_path / "fake-hermes.ps1"
+    command_log = tmp_path / "commands.log"
+    values = {
+        "terminal.backend": "local",
+        "terminal.cwd": profile_home.joinpath("workspace").as_posix(),
+        "terminal.home_mode": "profile",
+        "memory.memory_enabled": "true",
+        "memory.user_profile_enabled": "true",
+        "memory.write_approval": "true",
+        "skills.write_approval": "true",
+        "model.provider": "codex",
+        "model.default": "gpt-5.6-sol",
+        "agent.reasoning_effort": "xhigh",
+    }
+    write_fake_hermes(
+        fake_hermes,
+        values,
+        provision_profile_home=profile_home,
+        command_log=command_log,
+    )
+    environment = dict(os.environ)
+    environment["LOCALAPPDATA"] = str(local_app_data)
+
+    result = subprocess.run(
+        [
+            powershell_executable(),
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(PROVISION_PATH),
+            "-Provider",
+            "codex",
+            "-ReasoningEffort",
+            "xhigh",
+            "-HermesCommand",
+            str(fake_hermes),
+        ],
+        capture_output=True,
+        text=True,
+        env=environment,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    manifest = json.loads((profile_home / MANIFEST_NAME).read_text(encoding="utf-8-sig"))
+    assert manifest["hasBaseUrl"] is False
+    assert manifest["baseUrl"] is None
+    assert "config|set|model.base_url" not in command_log.read_text(encoding="utf-8")
+
+
+def test_custom_provider_still_requires_base_url_before_profile_creation(
+    tmp_path: Path,
+) -> None:
+    local_app_data = tmp_path / "local-app-data"
+    environment = dict(os.environ)
+    environment["LOCALAPPDATA"] = str(local_app_data)
+
+    result = subprocess.run(
+        [
+            powershell_executable(),
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(PROVISION_PATH),
+            "-Provider",
+            "custom",
+            "-HermesCommand",
+            str(tmp_path / "must-not-run.ps1"),
+        ],
+        capture_output=True,
+        text=True,
+        env=environment,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "base URL" in (result.stdout + result.stderr)
+    assert not (local_app_data / "hermes" / "profiles").exists()
+
+
+def test_verifier_accepts_exactly_unset_base_url_for_codex(tmp_path: Path) -> None:
+    hermes_home, profile_home, fake_hermes, values = create_verifier_fixture(tmp_path)
+    manifest_path = profile_home / MANIFEST_NAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.update({"provider": "codex", "baseUrl": None, "hasBaseUrl": False})
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    values["model.provider"] = "codex"
+    values.pop("model.base_url")
+    write_fake_hermes(fake_hermes, values)
+
+    result = run_verifier(hermes_home, fake_hermes)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_verifier_rejects_base_url_present_when_manifest_requires_absence(
+    tmp_path: Path,
+) -> None:
+    hermes_home, profile_home, fake_hermes, values = create_verifier_fixture(tmp_path)
+    manifest_path = profile_home / MANIFEST_NAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.update({"provider": "codex", "baseUrl": None, "hasBaseUrl": False})
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    values["model.provider"] = "codex"
+    write_fake_hermes(fake_hermes, values)
+
+    result = run_verifier(hermes_home, fake_hermes)
+
+    assert result.returncode == 1
+    assert "model.base_url" in (result.stdout + result.stderr)
+
+
+def test_verifier_rejects_custom_provider_manifest_without_base_url(tmp_path: Path) -> None:
+    hermes_home, profile_home, fake_hermes, values = create_verifier_fixture(tmp_path)
+    manifest_path = profile_home / MANIFEST_NAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.update({"baseUrl": None, "hasBaseUrl": False})
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    values.pop("model.base_url")
+    write_fake_hermes(fake_hermes, values)
+
+    result = run_verifier(hermes_home, fake_hermes)
+
+    assert result.returncode == 1
+    assert "custom provider" in (result.stdout + result.stderr).lower()
+
+
+def test_verifier_does_not_treat_arbitrary_config_get_failure_as_unset(
+    tmp_path: Path,
+) -> None:
+    hermes_home, profile_home, fake_hermes, values = create_verifier_fixture(tmp_path)
+    manifest_path = profile_home / MANIFEST_NAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.update({"provider": "codex", "baseUrl": None, "hasBaseUrl": False})
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    values["model.provider"] = "codex"
+    values.pop("model.base_url")
+    write_fake_hermes(fake_hermes, values, missing_config_output="configuration unavailable")
+
+    result = run_verifier(hermes_home, fake_hermes)
+
+    assert result.returncode == 1
+    assert "could not verify" in (result.stdout + result.stderr).lower()
 
 
 @pytest.mark.parametrize(
