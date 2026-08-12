@@ -65,6 +65,7 @@ class Conversation(TimestampMixin, Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     title: Mapped[str] = mapped_column(String(255), nullable=False)
+    employee_session_id: Mapped[str | None] = mapped_column(String(255))
 
     messages: Mapped[list[Message]] = relationship(
         back_populates="conversation", cascade="all, delete-orphan", order_by="Message.id"
@@ -86,6 +87,8 @@ class Message(Base):
         strict_enum(MessageRole, "ck_messages_role"), nullable=False
     )
     content: Mapped[str] = mapped_column(Text, nullable=False)
+    operation_id: Mapped[str | None] = mapped_column(String(36), index=True)
+    operation_status: Mapped[str | None] = mapped_column(String(31))
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now, nullable=False)
 
     conversation: Mapped[Conversation] = relationship(back_populates="messages")

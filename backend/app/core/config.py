@@ -13,6 +13,11 @@ class Settings(BaseSettings):
 
     data_dir: Path = Field(default_factory=lambda: Path.home() / ".etsy-performance-employee")
     database_url: str | None = None
+    hermes_executable: str = "hermes"
+    hermes_profile: str = "etsy-performance-us"
+    hermes_timeout_seconds: float = 180
+    hermes_max_turns: int = 12
+    max_attachment_bytes: int = 5 * 1024 * 1024
 
     @property
     def resolved_database_url(self) -> str:
@@ -22,6 +27,7 @@ class Settings(BaseSettings):
 
     def ensure_runtime_dirs(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        (self.data_dir / "attachments").mkdir(parents=True, exist_ok=True)
 
 
 def get_settings() -> Settings:

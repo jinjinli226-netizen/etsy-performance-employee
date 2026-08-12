@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from enum import StrEnum
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class MessageRole(StrEnum):
@@ -26,7 +26,7 @@ class MessageRead(MessageCreate):
 
 
 class ConversationCreate(BaseModel):
-    title: str
+    title: str = Field(min_length=1, max_length=255)
 
 
 class ConversationRead(ConversationCreate):
@@ -36,3 +36,39 @@ class ConversationRead(ConversationCreate):
     created_at: datetime
     updated_at: datetime
     messages: list[MessageRead]
+
+
+class ConversationSummary(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    title: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class ConversationPage(BaseModel):
+    items: list[ConversationSummary]
+    total: int
+    limit: int
+    offset: int
+
+
+class ChatSendRequest(BaseModel):
+    content: str = Field(min_length=1, max_length=100_000)
+    attachment_ids: list[int] = Field(default_factory=list, max_length=20)
+
+
+class OperationAccepted(BaseModel):
+    operation_id: str
+    status: str
+
+
+class AttachmentRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    conversation_id: int
+    filename: str
+    media_type: str
+    created_at: datetime
