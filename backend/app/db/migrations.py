@@ -73,7 +73,7 @@ _JOB_STATUSES = "'queued','running','completed','failed','cancelled','needs_revi
 
 def _valid_uuid(value: object) -> bool:
     try:
-        return isinstance(value, str) and str(UUID(value)) == value.casefold()
+        return isinstance(value, str) and str(UUID(value)) == value
     except (ValueError, AttributeError):
         return False
 
@@ -151,6 +151,13 @@ def _task6_legacy_policy_and_constraints(connection: Connection) -> None:
     connection.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_excel_jobs_public_id ON excel_jobs (public_id)"))
     condition = (
         "NEW.public_id IS NULL OR length(NEW.public_id) != 36 "
+        "OR NEW.public_id != lower(NEW.public_id) "
+        "OR substr(NEW.public_id, 9, 1) != '-' "
+        "OR substr(NEW.public_id, 14, 1) != '-' "
+        "OR substr(NEW.public_id, 19, 1) != '-' "
+        "OR substr(NEW.public_id, 24, 1) != '-' "
+        "OR length(replace(NEW.public_id, '-', '')) != 32 "
+        "OR replace(NEW.public_id, '-', '') GLOB '*[^0-9a-f]*' "
         "OR NEW.source_filename IS NULL OR length(trim(NEW.source_filename)) = 0 "
         "OR NEW.source_sha256 IS NULL OR NOT ("
         "NEW.source_sha256 = 'legacy-unavailable' OR (length(NEW.source_sha256) = 64 "
@@ -177,6 +184,8 @@ MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (1, _task4_chat_columns),
     (2, _task6_excel_job_columns),
     (3, _task6_legacy_policy_and_constraints),
+    # Refresh the v3 contract for databases that applied it before canonical UUID checks.
+    (4, _task6_legacy_policy_and_constraints),
 )
 
 

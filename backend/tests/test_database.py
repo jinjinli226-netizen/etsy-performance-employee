@@ -236,6 +236,40 @@ def test_database_enum_constraints_reject_invalid_raw_values(session_factory) ->
             )
 
 
+def test_excel_job_contract_rejects_unreachable_public_ids_and_accepts_canonical_uuid(
+    session_factory,
+) -> None:
+    engine = session_factory.kw["bind"]
+    canonical = "12345678-1234-4abc-8def-1234567890ab"
+    invalid_ids = (
+        "x" * 36,
+        "1234567-81234-4abc-8def-1234567890ab",
+        "g2345678-1234-4abc-8def-1234567890ab",
+        canonical.upper(),
+    )
+    insert = text(
+        "INSERT INTO excel_jobs "
+        "(public_id, source_filename, source_sha256, source_size_bytes, status, "
+        "progress_percent, created_at, updated_at) VALUES "
+        "(:public_id, 'raw.xlsx', :sha, 1, 'failed', 100, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+    )
+    with engine.begin() as connection:
+        connection.execute(insert, {"public_id": canonical, "sha": "a" * 64})
+        assert connection.execute(
+            text("SELECT public_id FROM excel_jobs WHERE public_id=:public_id"),
+            {"public_id": canonical},
+        ).scalar_one() == canonical
+
+        for public_id in invalid_ids:
+            with pytest.raises(IntegrityError):
+                connection.execute(insert, {"public_id": public_id, "sha": "b" * 64})
+            with pytest.raises(IntegrityError):
+                connection.execute(
+                    text("UPDATE excel_jobs SET public_id=:public_id WHERE public_id=:canonical"),
+                    {"public_id": public_id, "canonical": canonical},
+                )
+
+
 def test_session_scope_commits_successful_transaction(session_factory) -> None:
     with session_scope(session_factory) as session:
         session.add(Conversation(title="Committed"))
@@ -304,7 +338,7 @@ def test_init_db_migrates_task2_sqlite_schema_and_preserves_data(tmp_path) -> No
         with engine.connect() as connection:
             assert connection.execute(
                 text("SELECT version FROM schema_migrations ORDER BY version")
-            ).scalars().all() == [1, 2, 3]
+            ).scalars().all() == [1, 2, 3, 4]
             index_names = {
                 row[1] for row in connection.execute(text("PRAGMA index_list('messages')"))
             }
@@ -342,7 +376,7 @@ def test_init_db_migrates_legacy_excel_jobs_and_preserves_rows(tmp_path) -> None
                 100,
             )
             assert connection.execute(text("SELECT kind, path FROM artifacts WHERE id=8")).one() == ("legacy", "legacy/output.xlsx")
-            assert connection.execute(text("SELECT version FROM schema_migrations ORDER BY version")).scalars().all() == [1, 2, 3]
+            assert connection.execute(text("SELECT version FROM schema_migrations ORDER BY version")).scalars().all() == [1, 2, 3, 4]
             assert {row[1] for row in connection.execute(text("PRAGMA table_info('excel_jobs')"))} >= {"public_id", "source_sha256", "source_size_bytes", "error_code", "error_message", "progress_percent"}
             assert {row[1] for row in connection.execute(text("PRAGMA table_info('artifacts')"))} >= {"filename", "sha256", "size_bytes"}
             assert "job_events" in {row[0] for row in connection.execute(text("SELECT name FROM sqlite_master WHERE type='table'"))}
@@ -367,5 +401,39 @@ def test_init_db_migrates_legacy_excel_jobs_and_preserves_rows(tmp_path) -> None
             ):
                 with pytest.raises(IntegrityError):
                     connection.execute(text(f"UPDATE excel_jobs SET {clause} WHERE id=7"))
+    finally:
+        engine.dispose()
+
+
+def test_uuid_contract_upgrade_archives_ids_accepted_by_older_v3(tmp_path) -> None:
+    engine = create_engine_for_url(f"sqlite:///{tmp_path / 'uuid-upgrade.db'}")
+    try:
+        init_db(engine)
+        with engine.begin() as connection:
+            connection.execute(text("DROP TRIGGER trg_excel_jobs_v2_insert"))
+            connection.execute(text("DROP TRIGGER trg_excel_jobs_v2_update"))
+            connection.execute(text("DELETE FROM schema_migrations WHERE version=4"))
+            connection.execute(
+                text(
+                    "INSERT INTO excel_jobs "
+                    "(public_id, source_filename, source_sha256, source_size_bytes, status, "
+                    "progress_percent, created_at, updated_at) VALUES "
+                    "(:public_id, 'v3.xlsx', :sha, 1, 'completed', 100, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+                ),
+                {"public_id": "x" * 36, "sha": "c" * 64},
+            )
+            legacy_id = connection.execute(text("SELECT max(id) FROM excel_jobs")).scalar_one()
+
+        init_db(engine)
+        init_db(engine)
+        expected = str(uuid5(NAMESPACE_URL, f"etsy-performance-employee:legacy-excel-job:{legacy_id}"))
+        with engine.connect() as connection:
+            assert connection.execute(
+                text("SELECT public_id, status, error_code FROM excel_jobs WHERE id=:id"),
+                {"id": legacy_id},
+            ).one() == (expected, "failed", "legacy_migrated")
+            assert connection.execute(
+                text("SELECT version FROM schema_migrations ORDER BY version")
+            ).scalars().all() == [1, 2, 3, 4]
     finally:
         engine.dispose()
