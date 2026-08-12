@@ -709,6 +709,31 @@ def test_provisioner_rejects_noncanonical_url_before_profile_creation(
         ("All checks passed!", 0, "DOCTOR_CLEAN"),
         ("OpenRouter API (not configured)\nTelegram (optional, not configured)", 0, "DOCTOR_WARN"),
         ("Found 1 issue(s) to address:\n1. Invalid model/provider config", 1, "DOCTOR_CORE_FAILURE"),
+        (
+            "Found 1 issue(s) to address:\n1. model.provider 'bogus' is unknown",
+            1,
+            "DOCTOR_CORE_FAILURE",
+        ),
+        (
+            "Found 1 issue(s) to address:\n1. model provider 'bogus' is unrecognized",
+            1,
+            "DOCTOR_CORE_FAILURE",
+        ),
+        (
+            "Found 1 issue(s) to address:\n1. model provider 'bogus' is unrecognised",
+            1,
+            "DOCTOR_CORE_FAILURE",
+        ),
+        (
+            "Found 1 issue(s) to address:\n1. Configuration migration required",
+            1,
+            "DOCTOR_CORE_FAILURE",
+        ),
+        (
+            "Found 1 issue(s) to address:\n1. Required package 'llama-cpp-python' is missing",
+            1,
+            "DOCTOR_CORE_FAILURE",
+        ),
     ],
 )
 def test_doctor_output_is_classified_without_false_pass(

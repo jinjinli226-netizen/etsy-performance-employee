@@ -343,7 +343,7 @@ if ($RunDoctor -and $Failures.Count -eq 0) {
         }
         else {
             $HasIssueSummary = $DoctorText -match '(?i)Found\s+\d+\s+issue\(s\)\s+to address'
-            $HasCoreFailure = $DoctorText -match '(?i)(?:invalid|missing|failed|failure|broken|mismatch|unavailable).{0,80}(?:model|provider|config|terminal|python|required package)|(?:model|provider|config|terminal|python|required package).{0,80}(?:invalid|missing|failed|failure|broken|mismatch|unavailable)'
+            $HasCoreFailure = $DoctorText -match '(?i)(?:invalid|missing|failed|failure|broken|mismatch|unavailable|unknown|unrecogni[sz]ed|migration required).{0,80}(?:model(?:\.|\s+)?provider|model|provider|config(?:uration)?|terminal|python|required package)|(?:model(?:\.|\s+)?provider|model|provider|config(?:uration)?|terminal|python|required package).{0,80}(?:invalid|missing|failed|failure|broken|mismatch|unavailable|unknown|unrecogni[sz]ed|migration required)'
             if ($HasIssueSummary -and $HasCoreFailure) {
                 Add-Failure "DOCTOR_CORE_FAILURE: Hermes Doctor found a core profile, model, terminal, or configuration problem."
             }
