@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -39,15 +40,47 @@ class ArtifactRead(BaseModel):
 
     id: int
     kind: str
-    path: str
+    filename: str
+    sha256: str
+    size_bytes: int
     created_at: datetime
 
 
-class ExcelJobRead(ExcelJobCreate):
+class JobErrorRead(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    code: str
+    message: str
+
+
+class ExcelJobRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
-    id: int
+    id: UUID
+    source_filename: str
+    source_sha256: str
+    source_size_bytes: int
     status: JobStatus
+    progress_percent: int = Field(ge=0, le=100)
+    error: JobErrorRead | None = None
     created_at: datetime
     updated_at: datetime
-    artifacts: list[ArtifactRead]
+    artifact: ArtifactRead | None = None
+
+
+class ExcelJobPage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[ExcelJobRead]
+    total: int
+    limit: int
+    offset: int
+
+
+class JobEventRead(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: int
+    type: str
+    payload: dict
+    created_at: datetime

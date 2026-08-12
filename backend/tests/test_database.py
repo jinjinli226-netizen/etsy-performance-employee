@@ -12,6 +12,7 @@ from app.db.models import (
     Artifact,
     Conversation,
     ExcelJob,
+    JobEvent,
     KnowledgeCandidate,
     KnowledgePattern,
     Message,
@@ -156,6 +157,7 @@ def test_init_db_creates_all_required_tables(tmp_path) -> None:
             "rule_versions",
             "feedback_events",
             "audit_events",
+            "job_events",
         } <= table_names
         assert set(Base.metadata.tables) == {
             "conversations",
@@ -168,6 +170,7 @@ def test_init_db_creates_all_required_tables(tmp_path) -> None:
             "rule_versions",
             "feedback_events",
             "audit_events",
+            "job_events",
         }
     finally:
         engine.dispose()
@@ -291,10 +294,33 @@ def test_init_db_migrates_task2_sqlite_schema_and_preserves_data(tmp_path) -> No
         with engine.connect() as connection:
             assert connection.execute(
                 text("SELECT version FROM schema_migrations ORDER BY version")
-            ).scalars().all() == [1]
+            ).scalars().all() == [1, 2]
             index_names = {
                 row[1] for row in connection.execute(text("PRAGMA index_list('messages')"))
             }
             assert "ix_messages_operation_id" in index_names
+    finally:
+        engine.dispose()
+
+
+def test_init_db_migrates_legacy_excel_jobs_and_preserves_rows(tmp_path) -> None:
+    engine = create_engine_for_url(f"sqlite:///{tmp_path / 'legacy-excel.db'}")
+    try:
+        with engine.begin() as connection:
+            connection.execute(text("CREATE TABLE conversations (id INTEGER PRIMARY KEY, title VARCHAR(255) NOT NULL, created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL)"))
+            connection.execute(text("CREATE TABLE excel_jobs (id INTEGER PRIMARY KEY, conversation_id INTEGER, source_filename VARCHAR(255) NOT NULL, status VARCHAR(12) NOT NULL, error TEXT, created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL)"))
+            connection.execute(text("CREATE TABLE artifacts (id INTEGER PRIMARY KEY, excel_job_id INTEGER NOT NULL, kind VARCHAR(63) NOT NULL, path TEXT NOT NULL, created_at DATETIME NOT NULL)"))
+            connection.execute(text("INSERT INTO excel_jobs VALUES (7, NULL, 'legacy.xlsx', 'failed', 'old error', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"))
+            connection.execute(text("INSERT INTO artifacts VALUES (8, 7, 'legacy', 'legacy/output.xlsx', CURRENT_TIMESTAMP)"))
+
+        init_db(engine)
+        init_db(engine)
+        with engine.connect() as connection:
+            assert connection.execute(text("SELECT source_filename, status FROM excel_jobs WHERE id=7")).one() == ("legacy.xlsx", "failed")
+            assert connection.execute(text("SELECT kind, path FROM artifacts WHERE id=8")).one() == ("legacy", "legacy/output.xlsx")
+            assert connection.execute(text("SELECT version FROM schema_migrations ORDER BY version")).scalars().all() == [1, 2]
+            assert {row[1] for row in connection.execute(text("PRAGMA table_info('excel_jobs')"))} >= {"public_id", "source_sha256", "source_size_bytes", "error_code", "error_message", "progress_percent"}
+            assert {row[1] for row in connection.execute(text("PRAGMA table_info('artifacts')"))} >= {"filename", "sha256", "size_bytes"}
+            assert "job_events" in {row[0] for row in connection.execute(text("SELECT name FROM sqlite_master WHERE type='table'"))}
     finally:
         engine.dispose()

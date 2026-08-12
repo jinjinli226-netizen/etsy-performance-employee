@@ -28,7 +28,46 @@ def _task4_chat_columns(connection: Connection) -> None:
     )
 
 
-MIGRATIONS: tuple[tuple[int, Migration], ...] = ((1, _task4_chat_columns),)
+def _task6_excel_job_columns(connection: Connection) -> None:
+    job_columns = _columns(connection, "excel_jobs")
+    additions = {
+        "public_id": "VARCHAR(36)",
+        "source_sha256": "VARCHAR(64)",
+        "source_size_bytes": "BIGINT",
+        "error_code": "VARCHAR(63)",
+        "error_message": "VARCHAR(255)",
+        "progress_percent": "INTEGER NOT NULL DEFAULT 0",
+    }
+    for name, definition in additions.items():
+        if name not in job_columns:
+            connection.execute(text(f"ALTER TABLE excel_jobs ADD COLUMN {name} {definition}"))
+    connection.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_excel_jobs_public_id ON excel_jobs (public_id)"))
+
+    artifact_columns = _columns(connection, "artifacts")
+    for name, definition in {
+        "filename": "VARCHAR(255)",
+        "sha256": "VARCHAR(64)",
+        "size_bytes": "BIGINT",
+    }.items():
+        if name not in artifact_columns:
+            connection.execute(text(f"ALTER TABLE artifacts ADD COLUMN {name} {definition}"))
+
+    connection.execute(
+        text(
+            "CREATE TABLE IF NOT EXISTS job_events ("
+            "id INTEGER PRIMARY KEY, excel_job_id INTEGER NOT NULL, "
+            "event_type VARCHAR(63) NOT NULL, payload JSON NOT NULL, "
+            "created_at DATETIME NOT NULL, "
+            "FOREIGN KEY(excel_job_id) REFERENCES excel_jobs(id) ON DELETE CASCADE)"
+        )
+    )
+    connection.execute(text("CREATE INDEX IF NOT EXISTS ix_job_events_excel_job_id ON job_events (excel_job_id)"))
+
+
+MIGRATIONS: tuple[tuple[int, Migration], ...] = (
+    (1, _task4_chat_columns),
+    (2, _task6_excel_job_columns),
+)
 
 
 def run_sqlite_migrations(engine: Engine) -> None:

@@ -18,6 +18,9 @@ class Settings(BaseSettings):
     hermes_timeout_seconds: float = 180
     hermes_max_turns: int = 12
     max_attachment_bytes: int = 5 * 1024 * 1024
+    max_excel_upload_bytes: int = 50 * 1024 * 1024
+    max_worker_event_bytes: int = 64 * 1024
+    excel_cancel_timeout_seconds: float = 5.0
 
     @property
     def resolved_database_url(self) -> str:
@@ -28,6 +31,8 @@ class Settings(BaseSettings):
     def ensure_runtime_dirs(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         (self.data_dir / "attachments").mkdir(parents=True, exist_ok=True)
+        (self.data_dir / "excel-jobs").mkdir(parents=True, exist_ok=True)
+        (self.data_dir / "trust").mkdir(parents=True, exist_ok=True)
 
 
 def get_settings() -> Settings:

@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from enum import Enum as PythonEnum
 from typing import Any, TypeVar
 
-from sqlalchemy import JSON, DateTime, Enum, ForeignKey, String, Text, TypeDecorator
+from sqlalchemy import JSON, BigInteger, DateTime, Enum, ForeignKey, Integer, String, Text, TypeDecorator
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.chat.schemas import MessageRole
@@ -113,20 +113,29 @@ class ExcelJob(TimestampMixin, Base):
     __tablename__ = "excel_jobs"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    public_id: Mapped[str | None] = mapped_column(String(36), unique=True, index=True)
     conversation_id: Mapped[int | None] = mapped_column(
         ForeignKey("conversations.id", ondelete="SET NULL")
     )
     source_filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    source_sha256: Mapped[str | None] = mapped_column(String(64))
+    source_size_bytes: Mapped[int | None] = mapped_column(BigInteger)
     status: Mapped[JobStatus] = mapped_column(
         strict_enum(JobStatus, "ck_excel_jobs_status"),
         default=JobStatus.QUEUED,
         nullable=False,
     )
     error: Mapped[str | None] = mapped_column(Text)
+    error_code: Mapped[str | None] = mapped_column(String(63))
+    error_message: Mapped[str | None] = mapped_column(String(255))
+    progress_percent: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
     conversation: Mapped[Conversation | None] = relationship(back_populates="excel_jobs")
     artifacts: Mapped[list[Artifact]] = relationship(
         back_populates="excel_job", cascade="all, delete-orphan", order_by="Artifact.id"
+    )
+    events: Mapped[list[JobEvent]] = relationship(
+        back_populates="excel_job", cascade="all, delete-orphan", order_by="JobEvent.id"
     )
 
 
@@ -139,9 +148,26 @@ class Artifact(Base):
     )
     kind: Mapped[str] = mapped_column(String(63), nullable=False)
     path: Mapped[str] = mapped_column(Text, nullable=False)
+    filename: Mapped[str | None] = mapped_column(String(255))
+    sha256: Mapped[str | None] = mapped_column(String(64))
+    size_bytes: Mapped[int | None] = mapped_column(BigInteger)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now, nullable=False)
 
     excel_job: Mapped[ExcelJob] = relationship(back_populates="artifacts")
+
+
+class JobEvent(Base):
+    __tablename__ = "job_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    excel_job_id: Mapped[int] = mapped_column(
+        ForeignKey("excel_jobs.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    event_type: Mapped[str] = mapped_column(String(63), nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now, nullable=False)
+
+    excel_job: Mapped[ExcelJob] = relationship(back_populates="events")
 
 
 class KnowledgeCandidate(TimestampMixin, Base):

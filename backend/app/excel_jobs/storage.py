@@ -1,0 +1,255 @@
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import os
+import re
+import shutil
+import stat
+import zipfile
+from dataclasses import dataclass
+from pathlib import Path
+from uuid import UUID
+
+from fastapi import UploadFile
+from openpyxl import load_workbook
+
+
+OUTPUT_HEADERS = (
+    "head titles",
+    "13 tags",
+    "SPECIFICATION",
+    "Category",
+    "Instructions for buyers",
+)
+MAX_UNCOMPRESSED_BYTES = 250 * 1024 * 1024
+MAX_ZIP_ENTRIES = 10_000
+MAX_ROWS = 20_000
+MAX_COLUMNS = 500
+UPLOAD_CHUNK_BYTES = 1024 * 1024
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+
+
+class StorageError(RuntimeError):
+    def __init__(self, code: str, message: str, status_code: int = 422) -> None:
+        super().__init__(message)
+        self.code = code
+        self.status_code = status_code
+
+
+@dataclass(frozen=True)
+class StoredSource:
+    workspace: Path
+    source_path: Path
+    sha256: str
+    size_bytes: int
+
+
+@dataclass(frozen=True)
+class KnowledgeTrust:
+    path: Path
+    export_id: str
+    payload_sha256: str
+    file_sha256: str
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(UPLOAD_CHUNK_BYTES), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _within(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def safe_path(path: Path, parent: Path, *, must_exist: bool = False) -> Path:
+    parent_resolved = parent.resolve(strict=True)
+    resolved = path.resolve(strict=must_exist)
+    if not _within(resolved, parent_resolved) or resolved == parent_resolved:
+        raise StorageError("unsafe_path", "The operation path is outside its job workspace.")
+    current = resolved if must_exist else resolved.parent
+    while current != parent_resolved:
+        if current.exists() and current.is_symlink():
+            raise StorageError("unsafe_path", "Symbolic links are not allowed in job workspaces.")
+        current = current.parent
+    return resolved
+
+
+def _validate_xlsx_package(path: Path) -> None:
+    try:
+        with zipfile.ZipFile(path) as archive:
+            infos = archive.infolist()
+            if len(infos) > MAX_ZIP_ENTRIES:
+                raise StorageError("unsafe_workbook", "The workbook package has too many entries.")
+            names = {info.filename.replace("\\", "/").casefold().lstrip("/") for info in infos}
+            if "[content_types].xml" not in names or "xl/workbook.xml" not in names:
+                raise StorageError("invalid_workbook", "The file is not a valid XLSX workbook.")
+            if any(name.endswith("vbaproject.bin") for name in names):
+                raise StorageError("unsupported_workbook", "Macro-enabled workbooks are not supported.", 415)
+            total = 0
+            for info in infos:
+                total += info.file_size
+                if total > MAX_UNCOMPRESSED_BYTES:
+                    raise StorageError("unsafe_workbook", "The workbook expands beyond the safe limit.")
+                if info.file_size > 10 * 1024 * 1024 and info.compress_size and info.file_size / info.compress_size > 200:
+                    raise StorageError("unsafe_workbook", "The workbook contains a suspicious archive entry.")
+        workbook = load_workbook(path, read_only=True, data_only=False, keep_links=False)
+        try:
+            for worksheet in workbook.worksheets:
+                if worksheet.max_row > MAX_ROWS or worksheet.max_column > MAX_COLUMNS:
+                    raise StorageError("unsafe_workbook", "A worksheet exceeds safe dimension limits.")
+        finally:
+            workbook.close()
+    except StorageError:
+        raise
+    except (OSError, zipfile.BadZipFile, KeyError, ValueError) as exc:
+        raise StorageError("invalid_workbook", "The file is not a valid XLSX workbook.") from exc
+    except Exception as exc:
+        raise StorageError("invalid_workbook", "The file is not a valid XLSX workbook.") from exc
+
+
+async def store_upload(
+    upload: UploadFile,
+    *,
+    root: Path,
+    public_id: UUID,
+    max_bytes: int,
+) -> StoredSource:
+    filename = Path(upload.filename or "").name
+    if Path(filename).suffix.casefold() != ".xlsx":
+        raise StorageError("unsupported_file_type", "Only .xlsx workbooks are supported.", 415)
+    workspace = root / str(public_id)
+    if workspace.exists():
+        raise StorageError("workspace_exists", "The job workspace already exists.", 409)
+    workspace.mkdir(parents=True, exist_ok=False)
+    source_dir = workspace / "source"
+    source_dir.mkdir()
+    source_path = source_dir / "source.xlsx"
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        with source_path.open("xb") as stream:
+            while True:
+                chunk = await upload.read(UPLOAD_CHUNK_BYTES)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > max_bytes:
+                    raise StorageError("upload_too_large", "The workbook exceeds the upload limit.", 413)
+                stream.write(chunk)
+                digest.update(chunk)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if size == 0:
+            raise StorageError("empty_upload", "The uploaded workbook is empty.")
+        await asyncio.to_thread(_validate_xlsx_package, source_path)
+        os.chmod(source_path, stat.S_IREAD)
+        return StoredSource(workspace, source_path, digest.hexdigest(), size)
+    except Exception:
+        if workspace.exists() and workspace.resolve().parent == root.resolve():
+            shutil.rmtree(workspace, ignore_errors=True)
+        raise
+    finally:
+        await upload.close()
+
+
+def create_operation_dir(workspace: Path, operation_id: str) -> Path:
+    operation_root = workspace / "operations"
+    operation_root.mkdir(exist_ok=True)
+    operation = operation_root / operation_id
+    safe_path(operation, workspace)
+    operation.mkdir(exist_ok=False)
+    return safe_path(operation, workspace, must_exist=True)
+
+
+def remove_operation_dir(operation: Path, workspace: Path) -> None:
+    try:
+        verified = safe_path(operation, workspace, must_exist=True)
+    except (StorageError, FileNotFoundError):
+        return
+    if verified.parent.name != "operations":
+        raise StorageError("unsafe_path", "Only operation-scoped temporary directories may be removed.")
+    def make_writable_and_retry(function, path, _error) -> None:
+        os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+        function(path)
+
+    shutil.rmtree(verified, onerror=make_writable_and_retry)
+
+
+def ensure_empty_knowledge_export(data_dir: Path) -> KnowledgeTrust:
+    export_id = "kx-" + hashlib.sha256(b"empty-active-knowledge-v1").hexdigest()[:32]
+    payload = {"schema_version": 1, "export_id": export_id, "issuer": "local-knowledge-pipeline-v1", "records": []}
+    payload_sha = hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    envelope = {**payload, "content_sha256": payload_sha}
+    path = data_dir / "trust" / "empty-active-knowledge.json"
+    encoded = json.dumps(envelope, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    if path.exists() and path.read_bytes() != encoded:
+        raise StorageError("invalid_trust_store", "The trusted empty knowledge export was modified.", 503)
+    if not path.exists():
+        temporary = path.with_suffix(".tmp")
+        temporary.write_bytes(encoded)
+        os.replace(temporary, path)
+        os.chmod(path, stat.S_IREAD)
+    return KnowledgeTrust(path.resolve(), export_id, payload_sha, hashlib.sha256(encoded).hexdigest())
+
+
+def ensure_default_rules(workspace: Path) -> Path:
+    path = workspace / "rules.json"
+    payload = {
+        "rule_version": "mvp-default-v1",
+        "title_min_words": 3,
+        "title_max_words": 14,
+        "tag_count": 13,
+        "tag_max_chars": 20,
+    }
+    path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+    return safe_path(path, workspace, must_exist=True)
+
+
+def validate_artifact(path: Path, *, operation_dir: Path, source_path: Path, source_sha256: str) -> tuple[str, int]:
+    artifact = safe_path(path, operation_dir, must_exist=True)
+    try:
+        same_source_file = artifact.samefile(source_path)
+    except OSError:
+        same_source_file = False
+    if same_source_file or artifact.suffix.casefold() != ".xlsx":
+        raise StorageError("invalid_artifact", "The worker did not create a new XLSX artifact.")
+    if file_sha256(source_path) != source_sha256:
+        raise StorageError("source_modified", "The source workbook changed during processing.")
+    _validate_xlsx_package(artifact)
+    workbook = load_workbook(artifact, read_only=True, data_only=False, keep_links=False)
+    counts = {header: 0 for header in OUTPUT_HEADERS}
+    try:
+        for worksheet in workbook.worksheets:
+            for row in worksheet.iter_rows(values_only=True):
+                for value in row:
+                    if isinstance(value, str):
+                        normalized = re.sub(r"\s+", " ", value).strip()
+                        if normalized in counts:
+                            counts[normalized] += 1
+    finally:
+        workbook.close()
+    if any(count != 1 for count in counts.values()):
+        raise StorageError("invalid_artifact", "The artifact does not contain exactly one of each fixed output header.")
+    return file_sha256(artifact), artifact.stat().st_size
+
+
+def publish_artifact(path: Path, *, workspace: Path, public_id: str) -> Path:
+    operation = path.parent.resolve()
+    safe_path(path, operation, must_exist=True)
+    artifact_dir = workspace / "artifacts"
+    artifact_dir.mkdir(exist_ok=True)
+    destination = artifact_dir / f"etsy-listings-{public_id}.xlsx"
+    safe_path(destination, workspace)
+    os.replace(path, destination)
+    return safe_path(destination, workspace, must_exist=True)
