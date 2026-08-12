@@ -6,7 +6,6 @@ param(
     [string]$BaseUrl,
     [ValidateSet("low", "medium", "high")]
     [string]$ReasoningEffort = "high",
-    [switch]$ConfigureApiKey,
     [string]$HermesCommand = "hermes"
 )
 
@@ -43,8 +42,10 @@ function Assert-Parameters {
     if (-not [Uri]::TryCreate($BaseUrl, [UriKind]::Absolute, [ref]$ParsedBaseUrl) -or
         $ParsedBaseUrl.Scheme -ne "https" -or
         [string]::IsNullOrWhiteSpace($ParsedBaseUrl.Host) -or
-        -not [string]::IsNullOrEmpty($ParsedBaseUrl.UserInfo)) {
-        throw "Invalid base URL format. Use an absolute HTTPS URL without embedded credentials."
+        -not [string]::IsNullOrEmpty($ParsedBaseUrl.UserInfo) -or
+        -not [string]::IsNullOrEmpty($ParsedBaseUrl.Query) -or
+        -not [string]::IsNullOrEmpty($ParsedBaseUrl.Fragment)) {
+        throw "Invalid base URL format. Use an absolute HTTPS URL without credentials, query, or fragment."
     }
     $script:NormalizedBaseUrl = $ParsedBaseUrl.AbsoluteUri.TrimEnd("/")
 }
@@ -129,7 +130,6 @@ $BaselinePath = Join-Path $OperationDirectory "default-hashes.json"
 $BeforeHashes = $null
 $PrimaryError = $null
 $ProfileCreated = $false
-$KeyConfigured = $false
 
 try {
     [void](New-Item -ItemType Directory -Path $OperationDirectory)
@@ -169,32 +169,10 @@ try {
     [void](New-Item -ItemType Directory -Path $SkillDestinationRoot -Force)
     Copy-Item -LiteralPath $SourceSkill -Destination $SkillDestinationRoot -Recurse -Force
 
-    if ($ConfigureApiKey) {
-        $SecureApiKey = Read-Host "Profile API key" -AsSecureString
-        $KeyPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecureApiKey)
-        try {
-            $PlainApiKey = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($KeyPointer)
-            if ([string]::IsNullOrWhiteSpace($PlainApiKey)) {
-                throw "The API key was empty."
-            }
-            $KeyArguments = @("-p", $ProfileId, "config", "set", "model.api_key", $PlainApiKey)
-            & $HermesCommand @KeyArguments *> $null
-            if ($LASTEXITCODE -ne 0) {
-                throw "Hermes rejected the credential configuration."
-            }
-            $KeyConfigured = $true
-        }
-        finally {
-            if ($KeyPointer -ne [IntPtr]::Zero) {
-                [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($KeyPointer)
-            }
-            Remove-Variable PlainApiKey -ErrorAction SilentlyContinue
-            Remove-Variable SecureApiKey -ErrorAction SilentlyContinue
-        }
-    }
-    else {
-        Write-Warning "Non-secret assets are configured; the credential step is pending. This provisioner will refuse to modify the existing Profile, so enter the credential separately only after review."
-    }
+    # Hermes v0.18.2 `config set` has no stdin-only value mode. Passing a key as
+    # a native-process argument exposes it to process inspection, so this script
+    # deliberately performs no credential operation.
+    Write-Warning "Credential configuration pending. Configure it separately with an operator-controlled interactive Hermes workflow after review."
 
     $DefaultBaseline = [ordered]@{}
     foreach ($Entry in $BeforeHashes) {
@@ -208,7 +186,7 @@ try {
         baseUrl = $NormalizedBaseUrl
         reasoningEffort = $ReasoningEffort
         workspace = $NormalizedWorkspace
-        keyConfigured = $KeyConfigured
+        keyConfigured = $false
         assetHashes = Get-AssetHashes
         defaultBaseline = $DefaultBaseline
     }

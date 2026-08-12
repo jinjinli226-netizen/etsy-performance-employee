@@ -6,6 +6,7 @@ param(
     [string]$BaselinePath,
     [string]$ManifestPath,
     [string]$HermesCommand = "hermes",
+    [string]$PythonCommand = "py",
     [string]$HermesHome = (Join-Path $env:LOCALAPPDATA "hermes")
 )
 
@@ -16,6 +17,7 @@ $ProfileId = "etsy-performance-us"
 $RepositoryRoot = Split-Path -Parent $PSScriptRoot
 $ProfileHome = Join-Path $HermesHome "profiles\$ProfileId"
 $DefaultManifestPath = Join-Path $ProfileHome "provisioning-manifest.json"
+$ConfigInspectorPath = Join-Path $PSScriptRoot "inspect-employee-config.py"
 $Failures = [Collections.Generic.List[string]]::new()
 $Warnings = [Collections.Generic.List[string]]::new()
 
@@ -92,8 +94,10 @@ function Test-SecureBaseUrl {
         $Parsed.Scheme -ne "https" -or
         [string]::IsNullOrWhiteSpace($Parsed.Host) -or
         -not [string]::IsNullOrEmpty($Parsed.UserInfo) -or
+        -not [string]::IsNullOrEmpty($Parsed.Query) -or
+        -not [string]::IsNullOrEmpty($Parsed.Fragment) -or
         $Value -ne $Parsed.AbsoluteUri.TrimEnd("/")) {
-        Add-Failure "Provisioning manifest base URL must be normalized HTTPS without embedded credentials."
+        Add-Failure "Provisioning manifest base URL must be normalized HTTPS without credentials, query, or fragment."
         return $false
     }
     return $true
@@ -143,18 +147,29 @@ function Test-AssetIsolation {
 function Test-EnvironmentIsolation {
     $EnvironmentPath = Join-Path $ProfileHome ".env"
     if (-not (Test-Path -LiteralPath $EnvironmentPath -PathType Leaf)) {
+        Add-Failure "Profile .env is missing the expected Hermes terminal mirror."
         return
     }
+    $AllowedAssignmentCount = 0
     foreach ($Line in [IO.File]::ReadAllLines($EnvironmentPath)) {
         $Trimmed = $Line.Trim()
-        if ($Trimmed -and -not $Trimmed.StartsWith("#") -and $Trimmed -match '^[A-Za-z_][A-Za-z0-9_]*\s*=') {
-            Add-Failure "Profile environment assignment is not allowed during isolated provisioning."
+        if (-not $Trimmed -or $Trimmed.StartsWith("#")) {
+            continue
+        }
+        if ($Trimmed -ceq "TERMINAL_ENV=local") {
+            $AllowedAssignmentCount++
+        }
+        else {
+            Add-Failure "Profile contains an unexpected or invalid environment assignment."
             return
         }
     }
+    if ($AllowedAssignmentCount -ne 1) {
+        Add-Failure "Profile must contain exactly one TERMINAL_ENV=local environment assignment."
+    }
 }
 
-function Test-ConfigCredentialIsolation {
+function Test-StructuredConfigIsolation {
     param([Parameter(Mandatory = $true)][bool]$KeyConfigured)
 
     $ConfigPath = Join-Path $ProfileHome "config.yaml"
@@ -163,51 +178,42 @@ function Test-ConfigCredentialIsolation {
         return
     }
 
-    $SensitiveRoots = @("gateway", "channels", "channel", "messaging", "message", "telegram", "discord", "slack", "whatsapp", "weixin", "wechat", "signal")
-    $PathStack = @()
-    $ModelApiKeyPresent = $false
-    foreach ($RawLine in [IO.File]::ReadAllLines($ConfigPath)) {
-        if ($RawLine -match '^\s*(?:#.*)?$') {
-            continue
-        }
-        if ($RawLine -notmatch '^(?<indent>\s*)(?<key>[A-Za-z0-9_.-]+)\s*:\s*(?<value>.*)$') {
-            continue
-        }
-        $Indent = $Matches.indent.Length
-        $Key = $Matches.key.ToLowerInvariant()
-        $Value = $Matches.value.Trim()
-        $PathStack = @($PathStack | Where-Object { $_.Indent -lt $Indent })
-        $PathStack += [pscustomobject]@{ Indent = $Indent; Key = $Key }
-        $PathKeys = @($PathStack | ForEach-Object Key)
-
-        if (($PathKeys -join ".") -eq "model.api_key" -and
-            $Value -and $Value -notin @("null", "~", "''", '""')) {
-            $ModelApiKeyPresent = $true
-        }
-
-        $TouchesSensitiveRoot = @($PathKeys | Where-Object { $_ -in $SensitiveRoots }).Count -gt 0
-        $HarmlessValue = $Value -in @("", "{}", "[]", "null", "~", "false", "disabled", "''", '""')
-        if ($TouchesSensitiveRoot -and -not $HarmlessValue) {
-            Add-Failure "Profile configuration contains gateway or messaging-channel configuration."
-            break
-        }
+    if (-not (Test-Path -LiteralPath $ConfigInspectorPath -PathType Leaf)) {
+        Add-Failure "The structural configuration inspector is missing."
+        return
     }
-
-    if ($KeyConfigured -ne $ModelApiKeyPresent) {
+    $InspectorArguments = @("-3.11", $ConfigInspectorPath, $ConfigPath)
+    $InspectorLines = @(& $PythonCommand @InspectorArguments 2>$null)
+    if ($LASTEXITCODE -ne 0) {
+        Add-Failure "Profile configuration could not be structurally inspected."
+        return
+    }
+    try {
+        $Inspection = (($InspectorLines | ForEach-Object { [string]$_ }) -join "") | ConvertFrom-Json
+    }
+    catch {
+        Add-Failure "Profile configuration inspection returned invalid metadata."
+        return
+    }
+    if (@($Inspection.forbidden_paths).Count -gt 0) {
+        Add-Failure "Profile configuration contains gateway or messaging-channel configuration."
+    }
+    if ($KeyConfigured -ne [bool]$Inspection.model_api_key_present) {
         Add-Failure "Credential presence does not match the non-secret keyConfigured manifest flag."
+    }
+}
+
+function Test-RootLegacyStateIsolation {
+    foreach ($ForbiddenName in @("MEMORY.md", "USER.md", "state.db")) {
+        if (Test-Path -LiteralPath (Join-Path $ProfileHome $ForbiddenName) -PathType Leaf) {
+            Add-Failure "Unexpected root legacy state file exists: $ForbiddenName."
+        }
     }
 }
 
 function Test-InitialStateIsolation {
     if (-not $InitialProvision) {
         return
-    }
-    foreach ($ForbiddenName in @("MEMORY.md", "USER.md", "state.db")) {
-        $Found = @(Get-ChildItem -LiteralPath $ProfileHome -Recurse -Force -File -ErrorAction SilentlyContinue |
-            Where-Object Name -eq $ForbiddenName)
-        if ($Found.Count -gt 0) {
-            Add-Failure "Unexpected initial employee state file exists: $ForbiddenName."
-        }
     }
     foreach ($StateDirectoryName in @("memories", "sessions", "logs")) {
         $StateDirectory = Join-Path $ProfileHome $StateDirectoryName
@@ -281,7 +287,8 @@ if ($null -ne $Manifest) {
 
     Test-AssetIsolation -Manifest $Manifest
     Test-EnvironmentIsolation
-    Test-ConfigCredentialIsolation -KeyConfigured ([bool]$Manifest.keyConfigured)
+    Test-StructuredConfigIsolation -KeyConfigured ([bool]$Manifest.keyConfigured)
+    Test-RootLegacyStateIsolation
     Test-InitialStateIsolation
 
     $CurrentDefaultHashes = Get-DefaultHashes
@@ -326,10 +333,24 @@ if ($RunDoctor -and $Failures.Count -eq 0) {
     $DoctorArguments = @("-p", $ProfileId, "doctor")
     $DoctorResult = Invoke-HermesCapture -Arguments $DoctorArguments
     if ($DoctorResult.ExitCode -ne 0) {
-        Add-Failure "Hermes Doctor returned a non-zero exit code."
+        Add-Failure "DOCTOR_CORE_FAILURE: Hermes Doctor could not complete."
     }
-    if (-not [string]::IsNullOrWhiteSpace($DoctorResult.Output)) {
-        $Warnings.Add("Hermes Doctor produced diagnostic output; review it locally. Secret values were not displayed by this verifier.")
+    else {
+        $Escape = [string][char]27
+        $DoctorText = [regex]::Replace($DoctorResult.Output, "$Escape\[[0-9;?]*[ -/]*[@-~]", "")
+        if ($DoctorText -match '(?i)All checks passed!') {
+            Write-Host "DOCTOR_CLEAN"
+        }
+        else {
+            $HasIssueSummary = $DoctorText -match '(?i)Found\s+\d+\s+issue\(s\)\s+to address'
+            $HasCoreFailure = $DoctorText -match '(?i)(?:invalid|missing|failed|failure|broken|mismatch|unavailable).{0,80}(?:model|provider|config|terminal|python|required package)|(?:model|provider|config|terminal|python|required package).{0,80}(?:invalid|missing|failed|failure|broken|mismatch|unavailable)'
+            if ($HasIssueSummary -and $HasCoreFailure) {
+                Add-Failure "DOCTOR_CORE_FAILURE: Hermes Doctor found a core profile, model, terminal, or configuration problem."
+            }
+            else {
+                $Warnings.Add("DOCTOR_WARN: Hermes Doctor returned optional or unclassified diagnostics. Review Doctor locally; this verifier does not expose its raw output.")
+            }
+        }
     }
 }
 
@@ -344,6 +365,7 @@ if ($Failures.Count -gt 0) {
 }
 
 Write-Host "Employee Profile verification passed."
+Write-Host "Manifest checks detect accidental drift; the unsigned manifest is not attacker-proof."
 if (-not $RunModelCheck) {
     Write-Host "Model/network check was not requested."
 }

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -22,6 +23,7 @@ SKILL_PATH = (
 CONTRACT_PATH = SKILL_PATH.parent / "references" / "output-contract.md"
 PROVISION_PATH = REPOSITORY_ROOT / "scripts" / "provision-employee.ps1"
 VERIFY_PATH = REPOSITORY_ROOT / "scripts" / "verify-employee.ps1"
+CONFIG_INSPECTOR_PATH = REPOSITORY_ROOT / "scripts" / "inspect-employee-config.py"
 MANIFEST_NAME = "provisioning-manifest.json"
 
 FIXED_HEADERS = (
@@ -73,11 +75,11 @@ def create_verifier_fixture(tmp_path: Path) -> tuple[Path, Path, Path, dict[str,
         shutil.copyfile(source_assets[relative_path], destination)
 
     (profile_home / ".env").write_text(
-        "# Per-profile secrets belong in config.yaml when explicitly approved.\n",
+        "# Hermes mirrors terminal.backend here.\nTERMINAL_ENV=local\n",
         encoding="utf-8",
     )
     (profile_home / "config.yaml").write_text(
-        "model:\n  api_key: placeholder-for-presence-test\ngateway: {}\n",
+        "model: {}\ngateway: {}\n",
         encoding="utf-8",
     )
     for name, content in {
@@ -108,7 +110,7 @@ def create_verifier_fixture(tmp_path: Path) -> tuple[Path, Path, Path, dict[str,
         "baseUrl": values["model.base_url"],
         "reasoningEffort": values["agent.reasoning_effort"],
         "workspace": values["terminal.cwd"],
-        "keyConfigured": True,
+        "keyConfigured": False,
         "assetHashes": {
             relative_path: sha256(source_path)
             for relative_path, source_path in source_assets.items()
@@ -125,15 +127,52 @@ def create_verifier_fixture(tmp_path: Path) -> tuple[Path, Path, Path, dict[str,
     return hermes_home, profile_home, fake_hermes, values
 
 
-def write_fake_hermes(path: Path, values: dict[str, str]) -> None:
+def write_fake_hermes(
+    path: Path,
+    values: dict[str, str],
+    *,
+    doctor_output: str | None = None,
+    provision_profile_home: Path | None = None,
+    command_log: Path | None = None,
+) -> None:
     escaped_values = ((key, value.replace("'", "''")) for key, value in values.items())
     literal_values = "\n".join(
         f"    '{key}' = '{escaped_value}'" for key, escaped_value in escaped_values
     )
+    provision_block = ""
+    if provision_profile_home is not None:
+        escaped_home = str(provision_profile_home).replace("'", "''")
+        provision_block = (
+            f"$ProfileHome = '{escaped_home}'\n"
+            "if ($args[0] -eq 'profile' -and $args[1] -eq 'show') { "
+            "if (Test-Path -LiteralPath $ProfileHome) { exit 0 } else { exit 1 } }\n"
+            "if ($args[0] -eq 'profile' -and $args[1] -eq 'create') { "
+            "New-Item -ItemType Directory -Path (Join-Path $ProfileHome 'skills') -Force | Out-Null; "
+            "Set-Content -LiteralPath (Join-Path $ProfileHome '.env') -Value '# generated' -Encoding UTF8; "
+            "Set-Content -LiteralPath (Join-Path $ProfileHome 'config.yaml') -Value 'model: {}' -Encoding UTF8; exit 0 }\n"
+            "if ($args[0] -eq '-p' -and $args[2] -eq 'config' -and $args[3] -eq 'set') { "
+            "$Values[$args[4]] = $args[5]; "
+            "if ($args[4] -eq 'terminal.backend') { Add-Content -LiteralPath (Join-Path $ProfileHome '.env') -Value 'TERMINAL_ENV=local' }; "
+            "$Values | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $ProfileHome 'fake-values.json') -Encoding UTF8; exit 0 }\n"
+        )
+    doctor_block = ""
+    if doctor_output is not None:
+        escaped_doctor = doctor_output.replace("'", "''")
+        doctor_block = (
+            "if ($args[$args.Count - 1] -eq 'doctor') { "
+            f"Write-Output '{escaped_doctor}'; exit 0 }}\n"
+        )
+    log_block = ""
+    if command_log is not None:
+        escaped_log = str(command_log).replace("'", "''")
+        log_block = f"Add-Content -LiteralPath '{escaped_log}' -Value ($args -join '|')\n"
     path.write_text(
         "$Values = @{\n"
         f"{literal_values}\n"
         "}\n"
+        f"{log_block}"
+        f"{provision_block}"
+        f"{doctor_block}"
         "$Key = $args[$args.Count - 1]\n"
         "if ($Values.ContainsKey($Key)) { Write-Output $Values[$Key]; exit 0 }\n"
         "exit 9\n",
@@ -142,7 +181,11 @@ def write_fake_hermes(path: Path, values: dict[str, str]) -> None:
 
 
 def run_verifier(
-    hermes_home: Path, fake_hermes: Path, *, initial_provision: bool = False
+    hermes_home: Path,
+    fake_hermes: Path,
+    *,
+    initial_provision: bool = False,
+    run_doctor: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     arguments = [
         powershell_executable(),
@@ -157,6 +200,8 @@ def run_verifier(
     ]
     if initial_provision:
         arguments.append("-InitialProvision")
+    if run_doctor:
+        arguments.append("-RunDoctor")
     return subprocess.run(
         arguments,
         capture_output=True,
@@ -273,8 +318,11 @@ def test_provisioner_encodes_isolation_and_safe_secret_handling() -> None:
         "agent.reasoning_effort",
     ):
         assert setting in script
-    assert "Read-Host" in script and "-AsSecureString" in script
-    assert "model.api_key" in script
+    assert "Read-Host" not in script
+    assert "-AsSecureString" not in script
+    assert "model.api_key" not in script
+    assert "ConfigureApiKey" not in script
+    assert "credential configuration pending" in lowered
     assert "try" in lowered and "finally" in lowered
     assert "Remove-Item" not in script
     assert "Invoke-Expression" not in script
@@ -462,9 +510,21 @@ def test_verifier_rejects_nested_gateway_configuration(tmp_path: Path) -> None:
     assert "gateway or messaging-channel" in (result.stdout + result.stderr)
 
 
-def test_verifier_rejects_any_environment_assignment(tmp_path: Path) -> None:
+def test_verifier_allows_only_real_hermes_terminal_env_mirror(tmp_path: Path) -> None:
+    hermes_home, _, fake_hermes, values = create_verifier_fixture(tmp_path)
+    write_fake_hermes(fake_hermes, values)
+
+    result = run_verifier(hermes_home, fake_hermes)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("assignment", ["OPENAI_API_KEY=copied-value", "TERMINAL_ENV=docker"])
+def test_verifier_rejects_other_or_wrong_environment_assignment(
+    tmp_path: Path, assignment: str
+) -> None:
     hermes_home, profile_home, fake_hermes, values = create_verifier_fixture(tmp_path)
-    (profile_home / ".env").write_text("OPENAI_API_KEY=copied-value\n", encoding="utf-8")
+    (profile_home / ".env").write_text(f"{assignment}\n", encoding="utf-8")
     write_fake_hermes(fake_hermes, values)
 
     result = run_verifier(hermes_home, fake_hermes)
@@ -488,3 +548,177 @@ def test_employee_owned_state_is_only_rejected_during_initial_provision(
     assert later_result.returncode == 0, later_result.stdout + later_result.stderr
     assert initial_result.returncode == 1
     assert "initial memories" in (initial_result.stdout + initial_result.stderr).lower()
+
+
+@pytest.mark.parametrize("legacy_name", ["MEMORY.md", "USER.md", "state.db"])
+def test_root_legacy_state_is_always_rejected(tmp_path: Path, legacy_name: str) -> None:
+    hermes_home, profile_home, fake_hermes, values = create_verifier_fixture(tmp_path)
+    (profile_home / legacy_name).write_text("copied legacy state", encoding="utf-8")
+    write_fake_hermes(fake_hermes, values)
+
+    result = run_verifier(hermes_home, fake_hermes)
+
+    assert result.returncode == 1
+    assert legacy_name in (result.stdout + result.stderr)
+
+
+@pytest.mark.parametrize(
+    "bad_url",
+    [
+        "https://relay.example/v1#fragment",
+        "https://relay.example/v1?API_KEY=secret",
+        "https://relay.example/v1?region=us",
+    ],
+)
+def test_verifier_rejects_fragment_or_any_query_in_manifest_url(
+    tmp_path: Path, bad_url: str
+) -> None:
+    hermes_home, profile_home, fake_hermes, values = create_verifier_fixture(tmp_path)
+    manifest_path = profile_home / MANIFEST_NAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["baseUrl"] = bad_url
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    values["model.base_url"] = bad_url
+    write_fake_hermes(fake_hermes, values)
+
+    result = run_verifier(hermes_home, fake_hermes)
+
+    assert result.returncode == 1
+    assert "base URL" in (result.stdout + result.stderr)
+
+
+def test_structural_yaml_inspector_handles_quoted_nested_keys(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        'model:\n  "api_key": configured\n"gateway":\n  "telegram":\n    "token": copied\n',
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        ["py", "-3.11", str(CONFIG_INSPECTOR_PATH), str(config_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    report = json.loads(result.stdout)
+    assert report == {
+        "model_api_key_present": True,
+        "forbidden_paths": ["gateway.telegram.token"],
+    }
+    assert "copied" not in result.stdout
+    assert "configured" not in result.stdout
+
+
+def test_fake_real_hermes_provision_path_accepts_terminal_env_mirror(tmp_path: Path) -> None:
+    local_app_data = tmp_path / "local-app-data"
+    hermes_home = local_app_data / "hermes"
+    profile_home = hermes_home / "profiles" / "etsy-performance-us"
+    hermes_home.mkdir(parents=True)
+    for name, content in {
+        "SOUL.md": "default soul",
+        "config.yaml": "default config",
+        ".env": "# default placeholder",
+    }.items():
+        (hermes_home / name).write_text(content, encoding="utf-8")
+    fake_hermes = tmp_path / "fake-hermes.ps1"
+    command_log = tmp_path / "commands.log"
+    values = {
+        "terminal.backend": "local",
+        "terminal.cwd": profile_home.joinpath("workspace").as_posix(),
+        "terminal.home_mode": "profile",
+        "memory.memory_enabled": "true",
+        "memory.user_profile_enabled": "true",
+        "memory.write_approval": "true",
+        "skills.write_approval": "true",
+        "model.provider": "custom",
+        "model.default": "gpt-5.6-sol",
+        "model.base_url": "https://relay.example/v1",
+        "agent.reasoning_effort": "high",
+    }
+    write_fake_hermes(
+        fake_hermes,
+        values,
+        provision_profile_home=profile_home,
+        command_log=command_log,
+    )
+    environment = dict(os.environ)
+    environment["LOCALAPPDATA"] = str(local_app_data)
+
+    result = subprocess.run(
+        [
+            powershell_executable(),
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(PROVISION_PATH),
+            "-BaseUrl",
+            "https://relay.example/v1",
+            "-HermesCommand",
+            str(fake_hermes),
+        ],
+        capture_output=True,
+        text=True,
+        env=environment,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "credential configuration pending" in (result.stdout + result.stderr).lower()
+    assert "model.api_key" not in command_log.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "bad_url",
+    ["https://relay.example/v1#fragment", "https://relay.example/v1?region=us"],
+)
+def test_provisioner_rejects_noncanonical_url_before_profile_creation(
+    tmp_path: Path, bad_url: str
+) -> None:
+    local_app_data = tmp_path / "local-app-data"
+    environment = dict(os.environ)
+    environment["LOCALAPPDATA"] = str(local_app_data)
+
+    result = subprocess.run(
+        [
+            powershell_executable(),
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(PROVISION_PATH),
+            "-BaseUrl",
+            bad_url,
+            "-HermesCommand",
+            str(tmp_path / "must-not-run.ps1"),
+        ],
+        capture_output=True,
+        text=True,
+        env=environment,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "base URL" in (result.stdout + result.stderr)
+    assert not (local_app_data / "hermes" / "profiles").exists()
+
+
+@pytest.mark.parametrize(
+    ("doctor_output", "expected_code", "expected_text"),
+    [
+        ("All checks passed!", 0, "DOCTOR_CLEAN"),
+        ("OpenRouter API (not configured)\nTelegram (optional, not configured)", 0, "DOCTOR_WARN"),
+        ("Found 1 issue(s) to address:\n1. Invalid model/provider config", 1, "DOCTOR_CORE_FAILURE"),
+    ],
+)
+def test_doctor_output_is_classified_without_false_pass(
+    tmp_path: Path, doctor_output: str, expected_code: int, expected_text: str
+) -> None:
+    hermes_home, _, fake_hermes, values = create_verifier_fixture(tmp_path)
+    write_fake_hermes(fake_hermes, values, doctor_output=doctor_output)
+
+    result = run_verifier(hermes_home, fake_hermes, run_doctor=True)
+
+    assert result.returncode == expected_code
+    assert expected_text in (result.stdout + result.stderr)
+    assert doctor_output not in (result.stdout + result.stderr)
