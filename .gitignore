@@ -7,4 +7,5 @@ __pycache__/
 frontend/dist/
 *.tsbuildinfo
 scripts/.dev-pids.json
+scripts/.dev-pids.stale.json
 
