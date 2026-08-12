@@ -22,6 +22,8 @@ $HermesHome = Join-Path $env:LOCALAPPDATA "hermes"
 $ProfileHome = Join-Path $HermesHome "profiles\$ProfileId"
 $Workspace = Join-Path $ProfileHome "workspace"
 $VerifyScript = Join-Path $PSScriptRoot "verify-employee.ps1"
+$ManifestPath = Join-Path $ProfileHome "provisioning-manifest.json"
+$NormalizedBaseUrl = $null
 
 function Assert-Parameters {
     if ($ProfileId -notmatch '^[a-z0-9]+(?:-[a-z0-9]+)*$') {
@@ -44,6 +46,7 @@ function Assert-Parameters {
         -not [string]::IsNullOrEmpty($ParsedBaseUrl.UserInfo)) {
         throw "Invalid base URL format. Use an absolute HTTPS URL without embedded credentials."
     }
+    $script:NormalizedBaseUrl = $ParsedBaseUrl.AbsoluteUri.TrimEnd("/")
 }
 
 function Get-DefaultHashes {
@@ -61,6 +64,14 @@ function Get-DefaultHashes {
         }
     }
     return $Results
+}
+
+function Get-AssetHashes {
+    return [ordered]@{
+        "SOUL.md" = (Get-FileHash -LiteralPath $SourceSoul -Algorithm SHA256).Hash
+        "skills/etsy-performance-listing/SKILL.md" = (Get-FileHash -LiteralPath (Join-Path $SourceSkill "SKILL.md") -Algorithm SHA256).Hash
+        "skills/etsy-performance-listing/references/output-contract.md" = (Get-FileHash -LiteralPath (Join-Path $SourceSkill "references\output-contract.md") -Algorithm SHA256).Hash
+    }
 }
 
 function Assert-DefaultHashesUnchanged {
@@ -118,6 +129,7 @@ $BaselinePath = Join-Path $OperationDirectory "default-hashes.json"
 $BeforeHashes = $null
 $PrimaryError = $null
 $ProfileCreated = $false
+$KeyConfigured = $false
 
 try {
     [void](New-Item -ItemType Directory -Path $OperationDirectory)
@@ -144,7 +156,7 @@ try {
         "skills.write_approval" = "true"
         "model.provider" = $Provider
         "model.default" = $ModelId
-        "model.base_url" = $BaseUrl
+        "model.base_url" = $NormalizedBaseUrl
         "agent.reasoning_effort" = $ReasoningEffort
     }
     foreach ($Entry in $Settings.GetEnumerator()) {
@@ -170,6 +182,7 @@ try {
             if ($LASTEXITCODE -ne 0) {
                 throw "Hermes rejected the credential configuration."
             }
+            $KeyConfigured = $true
         }
         finally {
             if ($KeyPointer -ne [IntPtr]::Zero) {
@@ -182,6 +195,24 @@ try {
     else {
         Write-Warning "Non-secret assets are configured; the credential step is pending. This provisioner will refuse to modify the existing Profile, so enter the credential separately only after review."
     }
+
+    $DefaultBaseline = [ordered]@{}
+    foreach ($Entry in $BeforeHashes) {
+        $DefaultBaseline[$Entry.Name] = $Entry.Hash
+    }
+    $Manifest = [ordered]@{
+        schemaVersion = 1
+        profileId = $ProfileId
+        provider = $Provider
+        model = $ModelId
+        baseUrl = $NormalizedBaseUrl
+        reasoningEffort = $ReasoningEffort
+        workspace = $NormalizedWorkspace
+        keyConfigured = $KeyConfigured
+        assetHashes = Get-AssetHashes
+        defaultBaseline = $DefaultBaseline
+    }
+    $Manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $ManifestPath -Encoding UTF8
 }
 catch {
     $PrimaryError = $_
@@ -212,3 +243,7 @@ if ($null -ne $PrimaryError) {
 
 Write-Host "Profile assets and non-secret settings were provisioned. Run the read-only verifier before any model check."
 Write-Host "Default baseline hashes are unchanged."
+& $VerifyScript -HermesCommand $HermesCommand -ManifestPath $ManifestPath -InitialProvision
+if ($LASTEXITCODE -ne 0) {
+    throw "Initial read-only Profile verification failed. Inspect the partial Profile and perform manual recovery."
+}
