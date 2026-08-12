@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import sys
+sys.dont_write_bytecode = True
+
 import argparse
 import hashlib
 import importlib.util
@@ -97,6 +100,11 @@ def write_workbook(
     destination_dir = Path(output_dir).resolve()
     if source.suffix.casefold() != ".xlsx":
         raise WorkbookWriteError("unsupported_workbook_type", "Only .xlsx workbooks are supported.")
+    inspect = _load_sibling("inspect_workbook")
+    try:
+        inspect._validate_container(source)
+    except inspect.WorkbookError as exc:
+        raise WorkbookWriteError(exc.code, str(exc), details=exc.details) from exc
     if _sha256(source) != manifest.get("source_sha256"):
         raise WorkbookWriteError("source_hash_mismatch", "The source workbook changed after inspection.")
     if not isinstance(expected_rule_version, str) or not expected_rule_version.strip():
@@ -135,7 +143,6 @@ def write_workbook(
         shutil.copyfile(source, temp_path)
         if _sha256(temp_path) != manifest.get("source_sha256"):
             raise WorkbookWriteError("copy_hash_mismatch", "The temporary workbook copy does not match the inspected source.")
-        inspect = _load_sibling("inspect_workbook")
         with tempfile.TemporaryDirectory(prefix="listing-reinspect-", dir=destination_dir) as reinspection_dir:
             derived = inspect.inspect_workbook(temp_path, reinspection_dir)
         identity_keys = ("row_id", "row_number", "context_hash", "context", "candidate_fields")
@@ -150,6 +157,7 @@ def write_workbook(
         workbook = load_workbook(temp_path, data_only=False, keep_links=True, read_only=False)
         ws, columns = _validate_manifest_mapping(workbook, manifest)
         changed: list[str] = []
+        expected_cells: dict[str, str] = {}
         for row_id in sorted(validated_results):
             row_number = manifest_rows[row_id].get("row_number")
             if not isinstance(row_number, int) or row_number <= manifest["header_row"]:
@@ -161,10 +169,18 @@ def write_workbook(
                 cell = ws.cell(row_number, columns[header])
                 cell.value = _safe_excel_string(result[key])
                 cell.data_type = "s"
-                changed.append(f"{ws.title}!{get_column_letter(columns[header])}{row_number}")
+                address = f"{ws.title}!{get_column_letter(columns[header])}{row_number}"
+                changed.append(address)
+                expected_cells[address] = cell.value
         workbook.save(temp_path)
         reopened = load_workbook(temp_path, data_only=False, keep_links=True, read_only=False)
-        _validate_manifest_mapping(reopened, manifest)
+        reopened_ws, reopened_columns = _validate_manifest_mapping(reopened, manifest)
+        for row_id, result in validated_results.items():
+            row_number = manifest_rows[row_id]["row_number"]
+            for header in HEADER_TO_KEY:
+                address = f"{reopened_ws.title}!{get_column_letter(reopened_columns[header])}{row_number}"
+                if reopened_ws.cell(row_number, reopened_columns[header]).value != expected_cells[address]:
+                    raise WorkbookWriteError("output_verification_failed", "A generated cell did not retain its exact validated value.", details={"cell": address})
         if _sha256(source) != manifest.get("source_sha256"):
             raise WorkbookWriteError("source_hash_mismatch", "The source workbook changed during writing.")
         os.replace(temp_path, final)
@@ -176,7 +192,11 @@ def write_workbook(
         raise WorkbookWriteError("workbook_write_failed", "The output workbook could not be written safely.") from exc
     finally:
         if temp_path is not None:
-            temp_path.unlink(missing_ok=True)
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                # Cleanup is best-effort and must never replace the primary write error.
+                pass
 
 
 def main() -> int:

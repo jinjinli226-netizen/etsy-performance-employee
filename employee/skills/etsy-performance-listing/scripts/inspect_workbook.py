@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import sys
+sys.dont_write_bytecode = True
+
 import argparse
 import hashlib
 import json
@@ -10,6 +13,7 @@ from datetime import date, datetime, time
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
+from xml.etree import ElementTree
 
 from openpyxl import load_workbook
 from openpyxl.cell.cell import MergedCell
@@ -28,6 +32,30 @@ MAX_UNCOMPRESSED_BYTES = 250 * 1024 * 1024
 MAX_ZIP_ENTRIES = 10_000
 MAX_ROWS = 20_000
 MAX_COLUMNS = 500
+MAX_CANDIDATE_FIELDS = 100
+MAX_CANDIDATE_HEADER_CHARS = 256
+MAX_CANDIDATE_VALUE_CHARS = 8_000
+MAX_ROW_CONTEXT_BYTES = 64 * 1024
+_UNSUPPORTED_PART_PREFIXES = (
+    "customxml/",
+    "xl/activex/",
+    "xl/controls/",
+    "xl/ctrlprops/",
+    "xl/customdata/",
+    "xl/externallinks/",
+    "xl/slicers/",
+    "xl/slicercaches/",
+    "xl/threadedcomments/",
+    "xl/webextensions/",
+)
+_UNSUPPORTED_PARTS = {
+    "xl/connections.xml",
+    "xl/model/model.xml",
+    "xl/vbaproject.bin",
+}
+_UNSUPPORTED_RELATIONSHIP_TERMS = (
+    "activex", "connection", "control", "customxml", "externallink", "slicer", "threadedcomment", "webextension",
+)
 _INTERNAL_HEADER_TERMS = (
     "cost", "price cost", "profit", "margin", "revenue", "commission", "fee",
     "shipping cost", "logistics", "freight", "warehouse", "supplier", "finance",
@@ -90,6 +118,26 @@ def _validate_container(path: Path) -> None:
             for item in infos:
                 if item.file_size > 10 * 1024 * 1024 and item.compress_size and item.file_size / item.compress_size > 200:
                     raise WorkbookError("unsafe_workbook_archive", "The workbook contains a suspicious archive entry.")
+                normalized_name = item.filename.replace("\\", "/").casefold().lstrip("/")
+                if normalized_name in _UNSUPPORTED_PARTS or normalized_name.startswith(_UNSUPPORTED_PART_PREFIXES):
+                    raise WorkbookError(
+                        "unsupported_workbook_part",
+                        "The workbook contains an advanced package part that cannot be preserved safely.",
+                        details={"part": item.filename},
+                    )
+                if normalized_name.endswith(".rels"):
+                    try:
+                        relationships = ElementTree.fromstring(archive.read(item.filename))
+                    except ElementTree.ParseError as exc:
+                        raise WorkbookError("invalid_workbook", "The workbook contains invalid package relationships.") from exc
+                    for relationship in relationships:
+                        relationship_type = str(relationship.attrib.get("Type", "")).casefold()
+                        if any(term in relationship_type for term in _UNSUPPORTED_RELATIONSHIP_TERMS):
+                            raise WorkbookError(
+                                "unsupported_workbook_part",
+                                "The workbook contains an advanced relationship that cannot be preserved safely.",
+                                details={"part": item.filename},
+                            )
     except zipfile.BadZipFile as exc:
         raise WorkbookError("invalid_workbook", "The workbook is not a valid XLSX archive.") from exc
 
@@ -241,10 +289,20 @@ def inspect_workbook(source_path: str | Path, operation_dir: str | Path) -> dict
             meaningful.append(cell.value)
             if _is_internal(header):
                 continue
-            candidate_fields.append({"header": normalize_header(header), "value": _json_value(cell.value), "type": _cell_type(cell)})
+            normalized_header = normalize_header(header)
+            json_value = _json_value(cell.value)
+            if len(normalized_header) > MAX_CANDIDATE_HEADER_CHARS:
+                raise WorkbookError("workbook_input_limit_exceeded", "A candidate field header exceeds the safe input limit.", details={"row": row_no})
+            if isinstance(json_value, str) and len(json_value) > MAX_CANDIDATE_VALUE_CHARS:
+                raise WorkbookError("workbook_input_limit_exceeded", "A candidate field value exceeds the safe input limit.", details={"row": row_no, "header": normalized_header})
+            candidate_fields.append({"header": normalized_header, "value": json_value, "type": _cell_type(cell)})
+            if len(candidate_fields) > MAX_CANDIDATE_FIELDS:
+                raise WorkbookError("workbook_input_limit_exceeded", "A product row contains too many candidate fields.", details={"row": row_no})
         if not meaningful or not candidate_fields or _is_instruction_only(candidate_fields):
             continue
         context = json.dumps(candidate_fields, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        if len(context.encode("utf-8")) > MAX_ROW_CONTEXT_BYTES:
+            raise WorkbookError("workbook_input_limit_exceeded", "A product row exceeds the safe context limit.", details={"row": row_no})
         context_hash = hashlib.sha256(context.encode("utf-8")).hexdigest()
         row_id = hashlib.sha256(f"{source_sha}:{ws.title}:{row_no}:{context_hash}".encode("utf-8")).hexdigest()
         rows.append({"row_id": row_id, "row_number": row_no, "context_hash": context_hash, "context": context, "candidate_fields": candidate_fields, "image_paths": [], "warnings": []})
@@ -253,6 +311,8 @@ def inspect_workbook(source_path: str | Path, operation_dir: str | Path) -> dict
         item["image_paths"] = images[item["row_number"]]
         if len(item["image_paths"]) > 1:
             item["warnings"].append(f"{len(item['image_paths'])} images are associated with this row; only the first will be sent to the model.")
+    if not rows:
+        raise WorkbookError("no_product_rows", "No product rows were found below the selected output header row.")
     return {
         "manifest_version": 1,
         "source_path": str(source),

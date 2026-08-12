@@ -355,6 +355,7 @@ def test_provisioner_encodes_isolation_and_safe_secret_handling() -> None:
     assert "assetHashes" in script and "defaultBaseline" in script
     assert "keyConfigured" in script
     assert 'ValidateSet("minimal", "low", "medium", "high", "xhigh", "max", "ultra")' in script
+    assert "__pycache__" not in script
 
 
 def test_verifier_is_read_only_and_checks_isolation() -> None:
@@ -388,6 +389,7 @@ def test_verifier_is_read_only_and_checks_isolation() -> None:
     ):
         assert safe_model_field in script
     assert 'config", "get", "model.api_key"' not in script
+    assert "__pycache__" in script and "*.pyc" in script
     assert "config get" not in lowered
     assert "config set" not in lowered
     assert "profile create" not in lowered
@@ -396,6 +398,14 @@ def test_verifier_is_read_only_and_checks_isolation() -> None:
     assert "Remove-Item" not in script
     assert "Invoke-Expression" not in script
     assert "--yolo" not in lowered
+
+
+def test_excel_scripts_disable_bytecode_before_dynamic_imports() -> None:
+    scripts = SKILL_PATH.parent / "scripts"
+    for name in ("inspect_workbook.py", "run_task.py", "validate_output.py", "write_workbook.py"):
+        text = read(scripts / name)
+        assert "sys.dont_write_bytecode = True" in text
+        assert text.index("sys.dont_write_bytecode = True") < text.find("importlib", 0) if "importlib" in text else True
 
 
 def test_verifier_reports_old_manifest_missing_script_hashes_without_strictmode_crash(tmp_path: Path) -> None:

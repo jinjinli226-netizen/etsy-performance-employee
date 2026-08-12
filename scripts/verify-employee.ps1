@@ -181,7 +181,11 @@ function Test-AssetIsolation {
                 $_.FullName.Substring($SkillsRoot.Length).TrimStart("\", "/").Replace("\", "/")
             })
         foreach ($Entry in $SkillEntries) {
-            if ($Entry -notin $AllowedEntries) {
+            if ($Entry -match '(^|/)__pycache__(/|$)' -or $Entry -like '*.pyc') {
+                Add-Failure "Python bytecode caches are not allowed in the isolated Profile skill."
+                break
+            }
+            elseif ($Entry -notin $AllowedEntries) {
                 Add-Failure "Additional skill content is not allowed in the isolated Profile."
                 break
             }
