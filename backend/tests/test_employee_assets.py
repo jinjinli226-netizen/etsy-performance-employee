@@ -291,6 +291,14 @@ def test_employee_assets_contain_no_secret_literal_or_unrelated_employee_state()
     combined = "\n".join(read(path) for path in (SOUL_PATH, SKILL_PATH, CONTRACT_PATH))
     lowered = combined.lower()
 
+    for detached_field in (
+        "expected_knowledge_export_id",
+        "expected_knowledge_payload_sha256",
+        "expected_knowledge_file_sha256",
+    ):
+        assert detached_field in read(CONTRACT_PATH)
+    assert "signed: true" in read(CONTRACT_PATH) and "no authority" in read(CONTRACT_PATH)
+
     secret_literal_patterns = (
         r"sk-[a-z0-9_-]{12,}",
         r"(?i)(?:api[_ -]?key|cookie|token)\s*[:=]\s*[\"']?[a-z0-9_./+-]{12,}",

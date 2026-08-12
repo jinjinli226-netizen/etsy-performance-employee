@@ -3,7 +3,7 @@ name: etsy-performance-listing
 description: Interpret dynamic performance-costume workbooks and generate original Etsy US listing fields under a strict output contract.
 ---
 
-Runtime safety contract: the runner accepts only locally signed and approved schema-v1 abstract-knowledge envelopes. It validates active rules, allowed fields, item counts, text lengths, prompt/response bytes, and per-call timeout before model invocation. Timeouts, cancellation, and excessive output use bounded child-process-tree cleanup. Workbooks containing preservation-unsafe advanced package parts (including external links, ActiveX/controls, slicers, connections, and custom XML) are rejected before inspection or writing.
+Runtime safety contract: a knowledge file cannot attest to its own trust. For every schema-v1 knowledge export, the trusted caller must independently pass the expected export ID, canonical payload SHA-256, and whole-file SHA-256. The runner validates those detached values plus each active, approved record ID and canonical content digest before model invocation; the prompt receives only each record's ID and abstract. It also validates active rules, allowed fields, item counts, text lengths, prompt/response bytes, and per-call timeout. Timeouts, cancellation, and excessive output use bounded child-process-tree cleanup. Workbooks containing preservation-unsafe advanced package parts or relationships (including embeddings/OLE packages, external links, ActiveX/controls, VML, slicers, connections, and custom XML) are rejected before inspection or writing. Before publication, the writer requires the package-member and relationship type/target inventories to remain identical.
 
 # Etsy 表演服工作簿 Listing 技能
 

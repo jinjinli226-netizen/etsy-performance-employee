@@ -4,6 +4,7 @@ import sys
 sys.dont_write_bytecode = True
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
@@ -36,8 +37,11 @@ DEFAULT_CLEANUP_TIMEOUT_SECONDS = 2.0
 KNOWLEDGE_SCHEMA_VERSION = 1
 KNOWLEDGE_ISSUER = "local-knowledge-pipeline-v1"
 _RULE_FIELDS = {"rule_version", "title_min_words", "title_max_words", "tag_count", "tag_max_chars"}
-_KNOWLEDGE_ROOT_FIELDS = {"schema_version", "signed", "approved", "issuer", "items"}
-_KNOWLEDGE_ITEM_FIELDS = {"id", "status", "abstract"}
+_KNOWLEDGE_ROOT_FIELDS = {"schema_version", "export_id", "issuer", "records", "content_sha256"}
+_KNOWLEDGE_ITEM_FIELDS = {"id", "status", "approved", "abstract", "content_sha256"}
+_EXPORT_ID = re.compile(r"^kx-[0-9a-f]{32}$")
+_RECORD_ID = re.compile(r"^rec-[0-9a-f]{16,64}$")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _DANGEROUS_KNOWLEDGE = re.compile(
     r"https?://|www\.|\b(?:competitor|evidence|listing|source|raw)\b|ignore\s+(?:all\s+)?previous|system\s+prompt|developer\s+message|follow\s+these\s+instructions",
     re.IGNORECASE,
@@ -268,37 +272,83 @@ def _safe_row_for_prompt(row: dict[str, Any]) -> dict[str, Any]:
     return {"candidate_fields": safe_fields, "image_count": len(images), "row_warnings": list(warnings)}
 
 
-def _safe_knowledge(path: str | Path | None) -> Any:
+def _canonical_sha256(value: Any) -> str:
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _safe_knowledge(
+    path: str | Path | None,
+    *,
+    expected_export_id: str | None = None,
+    expected_payload_sha256: str | None = None,
+    expected_file_sha256: str | None = None,
+) -> Any:
     if path is None:
+        if any(value is not None for value in (expected_export_id, expected_payload_sha256, expected_file_sha256)):
+            raise TaskError("invalid_knowledge", "Detached knowledge trust values require a knowledge export file.")
         return []
+    if not (
+        isinstance(expected_export_id, str)
+        and _EXPORT_ID.fullmatch(expected_export_id)
+        and isinstance(expected_payload_sha256, str)
+        and _SHA256.fullmatch(expected_payload_sha256)
+        and isinstance(expected_file_sha256, str)
+        and _SHA256.fullmatch(expected_file_sha256)
+    ):
+        raise TaskError("invalid_knowledge", "A knowledge export requires detached trusted identity and digests.")
     knowledge_path = Path(path)
     try:
         if knowledge_path.stat().st_size > MAX_KNOWLEDGE_BYTES:
             raise TaskError("invalid_knowledge", "The active abstract knowledge exceeds the safe size limit.")
+        if _file_sha256(knowledge_path) != expected_file_sha256:
+            raise TaskError("invalid_knowledge", "The knowledge export file digest does not match detached trust.")
         value = json.loads(knowledge_path.read_text(encoding="utf-8"))
+    except TaskError:
+        raise
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise TaskError("invalid_knowledge", "The active abstract knowledge JSON could not be parsed.") from exc
     if not isinstance(value, dict) or set(value) != _KNOWLEDGE_ROOT_FIELDS:
         raise TaskError("invalid_knowledge", "The active abstract knowledge envelope does not match the approved schema.")
-    if value.get("schema_version") != KNOWLEDGE_SCHEMA_VERSION or value.get("signed") is not True or value.get("approved") is not True or value.get("issuer") != KNOWLEDGE_ISSUER:
-        raise TaskError("invalid_knowledge", "The active abstract knowledge is not locally signed and approved.")
-    entries = value.get("items")
+    if (
+        value.get("schema_version") != KNOWLEDGE_SCHEMA_VERSION
+        or value.get("export_id") != expected_export_id
+        or not _EXPORT_ID.fullmatch(str(value.get("export_id", "")))
+        or value.get("issuer") != KNOWLEDGE_ISSUER
+        or value.get("content_sha256") != expected_payload_sha256
+    ):
+        raise TaskError("invalid_knowledge", "The knowledge export identity does not match detached trust.")
+    payload = {key: value[key] for key in ("schema_version", "export_id", "issuer", "records")}
+    if _canonical_sha256(payload) != value["content_sha256"]:
+        raise TaskError("invalid_knowledge", "The knowledge export canonical payload digest is invalid.")
+    entries = value.get("records")
     if not isinstance(entries, list) or len(entries) > MAX_KNOWLEDGE_ITEMS:
         raise TaskError("invalid_knowledge", "The active abstract knowledge item count is invalid.")
     safe_entries: list[dict[str, str]] = []
     for entry in entries:
-        if not isinstance(entry, dict) or set(entry) != _KNOWLEDGE_ITEM_FIELDS or entry.get("status") not in {"active", "inactive"}:
+        if not isinstance(entry, dict) or set(entry) != _KNOWLEDGE_ITEM_FIELDS:
             raise TaskError("invalid_knowledge", "An abstract knowledge item does not match the approved schema.")
         abstract = entry.get("abstract")
         identifier = entry.get("id")
-        if not isinstance(identifier, str) or not identifier.strip() or len(identifier.strip()) > MAX_KNOWLEDGE_ID_CHARS:
+        if not isinstance(identifier, str) or not _RECORD_ID.fullmatch(identifier) or len(identifier) > MAX_KNOWLEDGE_ID_CHARS:
             raise TaskError("invalid_knowledge", "An abstract knowledge identifier is invalid.")
         if not isinstance(abstract, str) or not abstract.strip() or len(abstract.strip()) > MAX_KNOWLEDGE_ABSTRACT_CHARS:
             raise TaskError("invalid_knowledge", "An abstract knowledge value is invalid.")
+        record_payload = {key: entry[key] for key in ("id", "status", "approved", "abstract")}
+        if not isinstance(entry.get("content_sha256"), str) or not _SHA256.fullmatch(entry["content_sha256"]) or _canonical_sha256(record_payload) != entry["content_sha256"]:
+            raise TaskError("invalid_knowledge", "An abstract knowledge record digest is invalid.")
+        if entry.get("status") != "active" or entry.get("approved") is not True:
+            raise TaskError("invalid_knowledge", "Knowledge records must be active and approved before export.")
         if _DANGEROUS_KNOWLEDGE.search(identifier) or _DANGEROUS_KNOWLEDGE.search(abstract):
             raise TaskError("invalid_knowledge", "Abstract knowledge contains forbidden raw, sourced, or instructional content.")
-        if entry["status"] != "active":
-            continue
         safe_entry = {"id": identifier.strip(), "abstract": abstract.strip()}
         safe_entries.append(safe_entry)
     return safe_entries
@@ -404,6 +454,9 @@ def run_task(
     emit: Callable[[dict[str, Any]], None] = _emit_stdout,
     timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
+    expected_knowledge_export_id: str | None = None,
+    expected_knowledge_payload_sha256: str | None = None,
+    expected_knowledge_file_sha256: str | None = None,
 ) -> dict[str, Any]:
     operation = Path(operation_dir).resolve()
     operation.mkdir(parents=True, exist_ok=True)
@@ -412,7 +465,12 @@ def run_task(
         timeout_seconds = _bounded_number(timeout_seconds, name="timeout_seconds", minimum=0.01, maximum=MAX_TIMEOUT_SECONDS)
         max_response_bytes = int(_bounded_number(max_response_bytes, name="max_response_bytes", minimum=1, maximum=MAX_RESPONSE_BYTES))
         rules = _safe_rules(rules)
-        knowledge = _safe_knowledge(knowledge_path)
+        knowledge = _safe_knowledge(
+            knowledge_path,
+            expected_export_id=expected_knowledge_export_id,
+            expected_payload_sha256=expected_knowledge_payload_sha256,
+            expected_file_sha256=expected_knowledge_file_sha256,
+        )
         if command_runner is _default_runner:
             def active_runner(command: list[str], prompt: str) -> subprocess.CompletedProcess[str]:
                 return _default_runner(command, prompt, timeout_seconds=timeout_seconds, max_response_bytes=max_response_bytes)
@@ -451,6 +509,9 @@ def main() -> int:
     parser.add_argument("source")
     parser.add_argument("operation_dir")
     parser.add_argument("--knowledge")
+    parser.add_argument("--expected-knowledge-export-id")
+    parser.add_argument("--expected-knowledge-payload-sha256")
+    parser.add_argument("--expected-knowledge-file-sha256")
     parser.add_argument("--rules", required=True)
     parser.add_argument("--timeout-seconds", type=float, default=DEFAULT_TIMEOUT_SECONDS)
     parser.add_argument("--max-response-bytes", type=int, default=DEFAULT_MAX_RESPONSE_BYTES)
@@ -464,6 +525,9 @@ def main() -> int:
             rules=rules,
             timeout_seconds=args.timeout_seconds,
             max_response_bytes=args.max_response_bytes,
+            expected_knowledge_export_id=args.expected_knowledge_export_id,
+            expected_knowledge_payload_sha256=args.expected_knowledge_payload_sha256,
+            expected_knowledge_file_sha256=args.expected_knowledge_file_sha256,
         )
         return 0
     except (TaskError, OSError, UnicodeError, json.JSONDecodeError) as exc:

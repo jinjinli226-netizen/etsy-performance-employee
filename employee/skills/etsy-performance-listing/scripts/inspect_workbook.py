@@ -42,6 +42,7 @@ _UNSUPPORTED_PART_PREFIXES = (
     "xl/controls/",
     "xl/ctrlprops/",
     "xl/customdata/",
+    "xl/embeddings/",
     "xl/externallinks/",
     "xl/slicers/",
     "xl/slicercaches/",
@@ -53,9 +54,13 @@ _UNSUPPORTED_PARTS = {
     "xl/model/model.xml",
     "xl/vbaproject.bin",
 }
-_UNSUPPORTED_RELATIONSHIP_TERMS = (
-    "activex", "connection", "control", "customxml", "externallink", "slicer", "threadedcomment", "webextension",
-)
+_UNSUPPORTED_RELATIONSHIP_KINDS = {
+    "activexcontrolbinary", "activexcontrol", "connections", "control", "ctrlprop", "customxml",
+    "externallink", "externallinkpath", "oleobject", "package", "slicer", "slicercache",
+    "threadedcomment", "vmlDrawing".casefold(), "webextension",
+}
+_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+_HYPERLINK_RELATIONSHIP = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink"
 _INTERNAL_HEADER_TERMS = (
     "cost", "price cost", "profit", "margin", "revenue", "commission", "fee",
     "shipping cost", "logistics", "freight", "warehouse", "supplier", "finance",
@@ -100,6 +105,49 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _package_inventory(path: Path, *, validate_supported: bool) -> dict[str, tuple[Any, ...]]:
+    relationships: list[tuple[str, str, str, str]] = []
+    with zipfile.ZipFile(path) as archive:
+        members = tuple(sorted(item.filename.replace("\\", "/") for item in archive.infolist()))
+        for item in archive.infolist():
+            normalized_name = item.filename.replace("\\", "/").casefold().lstrip("/")
+            if validate_supported and (
+                normalized_name in _UNSUPPORTED_PARTS
+                or normalized_name.startswith(_UNSUPPORTED_PART_PREFIXES)
+                or normalized_name.endswith(".vml")
+            ):
+                raise WorkbookError(
+                    "unsupported_workbook_part",
+                    "The workbook contains an advanced package part that cannot be preserved safely.",
+                    details={"part": item.filename},
+                )
+            if not normalized_name.endswith(".rels"):
+                continue
+            try:
+                root = ElementTree.fromstring(archive.read(item.filename))
+            except ElementTree.ParseError as exc:
+                raise WorkbookError("invalid_workbook", "The workbook contains invalid package relationships.") from exc
+            for relationship in root.findall(f"{{{_REL_NS}}}Relationship"):
+                relationship_type = str(relationship.attrib.get("Type", ""))
+                target = str(relationship.attrib.get("Target", ""))
+                target_mode = str(relationship.attrib.get("TargetMode", ""))
+                if not relationship_type or not target:
+                    raise WorkbookError("invalid_workbook", "A package relationship is missing its type or target.")
+                relationships.append((item.filename.replace("\\", "/"), relationship_type, target, target_mode))
+                relationship_kind = relationship_type.rsplit("/", 1)[-1].casefold()
+                external_is_ordinary_hyperlink = target_mode.casefold() == "external" and relationship_type == _HYPERLINK_RELATIONSHIP
+                if validate_supported and (
+                    relationship_kind in _UNSUPPORTED_RELATIONSHIP_KINDS
+                    or (target_mode and not external_is_ordinary_hyperlink)
+                ):
+                    raise WorkbookError(
+                        "unsupported_workbook_part",
+                        "The workbook contains an advanced or external relationship that cannot be preserved safely.",
+                        details={"part": item.filename},
+                    )
+    return {"members": members, "relationships": tuple(sorted(relationships))}
+
+
 def _validate_container(path: Path) -> None:
     if path.suffix.casefold() != ".xlsx":
         raise WorkbookError("unsupported_workbook_type", "Only .xlsx workbooks are supported.")
@@ -118,26 +166,7 @@ def _validate_container(path: Path) -> None:
             for item in infos:
                 if item.file_size > 10 * 1024 * 1024 and item.compress_size and item.file_size / item.compress_size > 200:
                     raise WorkbookError("unsafe_workbook_archive", "The workbook contains a suspicious archive entry.")
-                normalized_name = item.filename.replace("\\", "/").casefold().lstrip("/")
-                if normalized_name in _UNSUPPORTED_PARTS or normalized_name.startswith(_UNSUPPORTED_PART_PREFIXES):
-                    raise WorkbookError(
-                        "unsupported_workbook_part",
-                        "The workbook contains an advanced package part that cannot be preserved safely.",
-                        details={"part": item.filename},
-                    )
-                if normalized_name.endswith(".rels"):
-                    try:
-                        relationships = ElementTree.fromstring(archive.read(item.filename))
-                    except ElementTree.ParseError as exc:
-                        raise WorkbookError("invalid_workbook", "The workbook contains invalid package relationships.") from exc
-                    for relationship in relationships:
-                        relationship_type = str(relationship.attrib.get("Type", "")).casefold()
-                        if any(term in relationship_type for term in _UNSUPPORTED_RELATIONSHIP_TERMS):
-                            raise WorkbookError(
-                                "unsupported_workbook_part",
-                                "The workbook contains an advanced relationship that cannot be preserved safely.",
-                                details={"part": item.filename},
-                            )
+            _package_inventory(path, validate_supported=True)
     except zipfile.BadZipFile as exc:
         raise WorkbookError("invalid_workbook", "The workbook is not a valid XLSX archive.") from exc
 

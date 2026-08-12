@@ -1,5 +1,9 @@
 # Listing 输出契约
 
+## Detached knowledge trust contract
+
+A knowledge export is data, not proof of trust. The trusted caller must supply `expected_knowledge_export_id`, `expected_knowledge_payload_sha256`, and `expected_knowledge_file_sha256` independently of the export file. The export root has exactly `schema_version`, `export_id`, `issuer`, `records`, and `content_sha256`; every record has exactly `id`, `status`, `approved`, `abstract`, and `content_sha256`. Canonical SHA-256 uses UTF-8 JSON with sorted keys and compact separators. Only active, approved records with matching record digests may reach the model, and only their `id` and `abstract` fields are included in the prompt. A `signed: true` value inside the file has no authority and is not accepted.
+
 契约版本由任务显式选择，并随每次结果返回。规则必须可版本化、可配置和可回滚；参考行、示例文字、列号、列顺序及当前工作簿习惯都不得硬编码为永久规则。
 
 ## 固定工作簿表头
