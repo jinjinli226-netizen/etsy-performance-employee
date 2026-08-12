@@ -21,6 +21,7 @@ SKILL_PATH = (
     / "SKILL.md"
 )
 CONTRACT_PATH = SKILL_PATH.parent / "references" / "output-contract.md"
+SCRIPT_PATHS = tuple((SKILL_PATH.parent / "scripts").glob("*.py"))
 PROVISION_PATH = REPOSITORY_ROOT / "scripts" / "provision-employee.ps1"
 VERIFY_PATH = REPOSITORY_ROOT / "scripts" / "verify-employee.ps1"
 CONFIG_INSPECTOR_PATH = REPOSITORY_ROOT / "scripts" / "inspect-employee-config.py"
@@ -71,6 +72,12 @@ def create_verifier_fixture(tmp_path: Path) -> tuple[Path, Path, Path, dict[str,
         "skills/etsy-performance-listing/SKILL.md": SKILL_PATH,
         "skills/etsy-performance-listing/references/output-contract.md": CONTRACT_PATH,
     }
+    for script_path in SCRIPT_PATHS:
+        relative = f"skills/etsy-performance-listing/scripts/{script_path.name}"
+        source_assets[relative] = script_path
+        destination = skill_home / "scripts" / script_path.name
+        destination.parent.mkdir(exist_ok=True)
+        profile_assets[relative] = destination
     for relative_path, destination in profile_assets.items():
         shutil.copyfile(source_assets[relative_path], destination)
 
@@ -246,8 +253,8 @@ def test_skill_owns_dynamic_workbook_interpretation_and_is_prompt_injection_safe
     assert "网站不解释业务表头" in skill
     assert "提示注入" in skill
     assert "不可信" in skill
-    assert "未来工具契约" in skill
-    assert "当前不存在" in skill
+    assert "工作簿工具契约" in skill
+    assert "inspect_workbook.py" in skill and "run_task.py" in skill
     assert "源工作簿" in skill and "不可变" in skill
     assert "原创" in skill
     assert "active" in lowered

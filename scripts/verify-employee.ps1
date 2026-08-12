@@ -141,6 +141,10 @@ function Test-AssetIsolation {
         "SOUL.md" = "employee\SOUL.md"
         "skills/etsy-performance-listing/SKILL.md" = "employee\skills\etsy-performance-listing\SKILL.md"
         "skills/etsy-performance-listing/references/output-contract.md" = "employee\skills\etsy-performance-listing\references\output-contract.md"
+        "skills/etsy-performance-listing/scripts/inspect_workbook.py" = "employee\skills\etsy-performance-listing\scripts\inspect_workbook.py"
+        "skills/etsy-performance-listing/scripts/run_task.py" = "employee\skills\etsy-performance-listing\scripts\run_task.py"
+        "skills/etsy-performance-listing/scripts/validate_output.py" = "employee\skills\etsy-performance-listing\scripts\validate_output.py"
+        "skills/etsy-performance-listing/scripts/write_workbook.py" = "employee\skills\etsy-performance-listing\scripts\write_workbook.py"
     }
     foreach ($RelativePath in $AssetPaths.Keys) {
         $ProfileAssetPath = Join-Path $ProfileHome ($RelativePath.Replace("/", "\"))
@@ -160,7 +164,12 @@ function Test-AssetIsolation {
             "etsy-performance-listing",
             "etsy-performance-listing/SKILL.md",
             "etsy-performance-listing/references",
-            "etsy-performance-listing/references/output-contract.md"
+            "etsy-performance-listing/references/output-contract.md",
+            "etsy-performance-listing/scripts",
+            "etsy-performance-listing/scripts/inspect_workbook.py",
+            "etsy-performance-listing/scripts/run_task.py",
+            "etsy-performance-listing/scripts/validate_output.py",
+            "etsy-performance-listing/scripts/write_workbook.py"
         )
         $SkillEntries = @(Get-ChildItem -LiteralPath $SkillsRoot -Recurse -Force |
             ForEach-Object {

@@ -84,6 +84,10 @@ function Get-AssetHashes {
         "SOUL.md" = (Get-FileHash -LiteralPath $SourceSoul -Algorithm SHA256).Hash
         "skills/etsy-performance-listing/SKILL.md" = (Get-FileHash -LiteralPath (Join-Path $SourceSkill "SKILL.md") -Algorithm SHA256).Hash
         "skills/etsy-performance-listing/references/output-contract.md" = (Get-FileHash -LiteralPath (Join-Path $SourceSkill "references\output-contract.md") -Algorithm SHA256).Hash
+        "skills/etsy-performance-listing/scripts/inspect_workbook.py" = (Get-FileHash -LiteralPath (Join-Path $SourceSkill "scripts\inspect_workbook.py") -Algorithm SHA256).Hash
+        "skills/etsy-performance-listing/scripts/run_task.py" = (Get-FileHash -LiteralPath (Join-Path $SourceSkill "scripts\run_task.py") -Algorithm SHA256).Hash
+        "skills/etsy-performance-listing/scripts/validate_output.py" = (Get-FileHash -LiteralPath (Join-Path $SourceSkill "scripts\validate_output.py") -Algorithm SHA256).Hash
+        "skills/etsy-performance-listing/scripts/write_workbook.py" = (Get-FileHash -LiteralPath (Join-Path $SourceSkill "scripts\write_workbook.py") -Algorithm SHA256).Hash
     }
 }
 
