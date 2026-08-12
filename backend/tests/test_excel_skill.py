@@ -5,8 +5,10 @@ import importlib.util
 import json
 import shutil
 import subprocess
+from datetime import datetime
 from io import BytesIO
 from pathlib import Path
+from zipfile import ZipFile
 
 import pytest
 from openpyxl import Workbook, load_workbook
@@ -29,6 +31,15 @@ HEADERS = (
 def load_script(name: str):
     path = SCRIPTS / f"{name}.py"
     spec = importlib.util.spec_from_file_location(name, path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_fixture_builder():
+    path = FIXTURE.with_name("build_performance_listing_fixture.py")
+    spec = importlib.util.spec_from_file_location("build_performance_listing_fixture", path)
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -106,6 +117,34 @@ def copy_fixture(tmp_path: Path) -> Path:
     destination = tmp_path / "performance-listing-template.xlsx"
     shutil.copyfile(FIXTURE, destination)
     return destination
+
+
+def test_fixture_build_is_byte_deterministic_across_save_times(tmp_path: Path, monkeypatch) -> None:
+    builder = load_fixture_builder()
+    import openpyxl.writer.excel as excel_writer
+
+    class EarlyDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2025, 2, 3, 4, 5, 6, tzinfo=tz)
+
+    class LateDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2035, 12, 13, 14, 15, 16, tzinfo=tz)
+
+    first = tmp_path / "first.xlsx"
+    second = tmp_path / "second.xlsx"
+    monkeypatch.setattr(excel_writer.datetime, "datetime", EarlyDateTime)
+    builder.build(first)
+    monkeypatch.setattr(excel_writer.datetime, "datetime", LateDateTime)
+    builder.build(second)
+
+    assert first.read_bytes() == second.read_bytes()
+    assert sha(first) == sha(second)
+    with ZipFile(first) as archive:
+        core_xml = archive.read("docProps/core.xml")
+    assert core_xml.count(b"2024-01-01T00:00:00Z") == 2
 
 
 def test_inspection_finds_moved_headers_isolates_rows_and_filters_internal_fields(tmp_path: Path, excel_modules) -> None:

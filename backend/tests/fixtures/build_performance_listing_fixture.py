@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
+from xml.etree import ElementTree
 from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
 from openpyxl import Workbook
@@ -16,17 +17,44 @@ PNG = bytes.fromhex(
     "0000000d49444154789c6360606060000000050001a5f645400000000049454e44ae426082"
 )
 FIXED_ZIP_TIME = (2024, 1, 1, 0, 0, 0)
+FIXED_CORE_TIME = "2024-01-01T00:00:00Z"
+CORE_NS = "http://schemas.openxmlformats.org/package/2006/metadata/core-properties"
+DCTERMS_NS = "http://purl.org/dc/terms/"
+
+
+def canonicalize_core_properties(content: bytes) -> bytes:
+    ElementTree.register_namespace("cp", CORE_NS)
+    ElementTree.register_namespace("dc", "http://purl.org/dc/elements/1.1/")
+    ElementTree.register_namespace("dcterms", DCTERMS_NS)
+    ElementTree.register_namespace("dcmitype", "http://purl.org/dc/dcmitype/")
+    ElementTree.register_namespace("xsi", "http://www.w3.org/2001/XMLSchema-instance")
+    root = ElementTree.fromstring(content)
+    for tag in (f"{{{DCTERMS_NS}}}created", f"{{{DCTERMS_NS}}}modified", f"{{{CORE_NS}}}lastPrinted"):
+        element = root.find(tag)
+        if element is not None:
+            element.text = FIXED_CORE_TIME
+    return ElementTree.tostring(root, encoding="utf-8", xml_declaration=True)
 
 
 def canonicalize_xlsx(path: Path) -> None:
     with ZipFile(path, "r") as source:
-        entries = [(item.filename, source.read(item.filename)) for item in source.infolist()]
+        entries = []
+        for item in source.infolist():
+            content = source.read(item.filename)
+            if item.filename == "docProps/core.xml":
+                content = canonicalize_core_properties(content)
+            entries.append((item.filename, content))
     buffer = BytesIO()
     with ZipFile(buffer, "w", compression=ZIP_DEFLATED, compresslevel=9) as destination:
         for name, content in sorted(entries):
             info = ZipInfo(name, date_time=FIXED_ZIP_TIME)
             info.compress_type = ZIP_DEFLATED
+            info.create_system = 3
             info.external_attr = 0o600 << 16
+            info.internal_attr = 0
+            info.flag_bits = 0
+            info.extra = b""
+            info.comment = b""
             destination.writestr(info, content)
     path.write_bytes(buffer.getvalue())
 
