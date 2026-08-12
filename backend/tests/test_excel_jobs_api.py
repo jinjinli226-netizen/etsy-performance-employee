@@ -3,16 +3,29 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import shutil
 import stat
+import sys
+import time
 from pathlib import Path
+from uuid import NAMESPACE_URL, uuid5
 
 import pytest
 from fastapi.testclient import TestClient
 from openpyxl import load_workbook
+from sqlalchemy import text
 
 from app.core.config import Settings
-from app.excel_jobs.runner import RunnerRequest, WorkerResult, build_employee_command
+from app.excel_jobs.runner import (
+    RunnerRequest,
+    SubprocessExcelRunner,
+    WorkerProtocolError,
+    WorkerResult,
+    build_employee_command,
+)
+from app.excel_jobs.storage import StorageError, publish_artifact
+from app.excel_jobs import storage as excel_storage
 from app.main import create_app
 from app.db.init_db import init_db
 from app.db.models import Artifact, ExcelJob, JobEvent
@@ -519,3 +532,236 @@ def test_startup_marks_persisted_queued_and_running_jobs_failed(tmp_path) -> Non
             assert detail.status_code == 200
             assert detail.json()["status"] == "failed"
             assert detail.json()["error"]["code"] == "interrupted"
+
+
+def test_publish_uses_exclusive_random_temp_and_never_overwrites_legacy_hardlink(tmp_path) -> None:
+    public_id = "00000000-0000-4000-8000-000000000123"
+    workspace = tmp_path / public_id
+    operation = workspace / "operations" / "op"
+    operation.mkdir(parents=True)
+    generated = operation / "generated.xlsx"
+    shutil.copyfile(FIXTURE, generated)
+    artifact_dir = workspace / "artifacts"
+    artifact_dir.mkdir()
+    external = tmp_path / "external-protected.bin"
+    external.write_bytes(b"must stay unchanged")
+    predictable = artifact_dir / f".{public_id}.tmp.xlsx"
+    try:
+        predictable.hardlink_to(external)
+    except OSError:
+        pytest.skip("hard links are unavailable on this filesystem")
+
+    published = publish_artifact(
+        generated,
+        workspace=workspace,
+        public_id=public_id,
+        expected_sha256=sha256(generated),
+    )
+
+    assert published.read_bytes() == FIXTURE.read_bytes()
+    assert external.read_bytes() == b"must stay unchanged"
+    assert predictable.samefile(external)
+
+
+def test_publish_rejects_preexisting_destination_without_touching_external_hardlink(tmp_path) -> None:
+    public_id = "00000000-0000-4000-8000-000000000124"
+    workspace = tmp_path / public_id
+    operation = workspace / "operations" / "op"
+    operation.mkdir(parents=True)
+    generated = operation / "generated.xlsx"
+    shutil.copyfile(FIXTURE, generated)
+    artifact_dir = workspace / "artifacts"
+    artifact_dir.mkdir()
+    external = tmp_path / "external-target.bin"
+    external.write_bytes(b"protected target")
+    destination = artifact_dir / f"etsy-listings-{public_id}.xlsx"
+    try:
+        destination.hardlink_to(external)
+    except OSError:
+        pytest.skip("hard links are unavailable on this filesystem")
+
+    with pytest.raises(StorageError, match="destination"):
+        publish_artifact(
+            generated,
+            workspace=workspace,
+            public_id=public_id,
+            expected_sha256=sha256(generated),
+        )
+
+    assert external.read_bytes() == b"protected target"
+    assert destination.samefile(external)
+
+
+def test_publish_detects_staging_replacement_and_never_deletes_attacker_file(tmp_path, monkeypatch) -> None:
+    public_id = "00000000-0000-4000-8000-000000000125"
+    workspace = tmp_path / public_id
+    operation = workspace / "operations" / "op"
+    operation.mkdir(parents=True)
+    generated = operation / "generated.xlsx"
+    shutil.copyfile(FIXTURE, generated)
+    external = tmp_path / "race-protected.bin"
+    external.write_bytes(b"race protected")
+    real_replace = os.replace
+    attacked = False
+
+    def replace_with_race(source, destination):
+        nonlocal attacked
+        source = Path(source)
+        if not attacked and source.name.startswith(".publish-"):
+            attacked = True
+            source.unlink()
+            source.hardlink_to(external)
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(excel_storage.os, "replace", replace_with_race)
+    with pytest.raises(StorageError, match="(staging file|destination) changed"):
+        publish_artifact(
+            generated,
+            workspace=workspace,
+            public_id=public_id,
+            expected_sha256=sha256(generated),
+        )
+    assert attacked
+    assert external.read_bytes() == b"race protected"
+
+
+def test_publish_target_replacement_race_never_overwrites_attacker_file(tmp_path, monkeypatch) -> None:
+    public_id = "00000000-0000-4000-8000-000000000126"
+    workspace = tmp_path / public_id
+    operation = workspace / "operations" / "op"
+    operation.mkdir(parents=True)
+    generated = operation / "generated.xlsx"
+    shutil.copyfile(FIXTURE, generated)
+    external = tmp_path / "target-race-protected.bin"
+    external.write_bytes(b"target race protected")
+    real_replace = os.replace
+    attacked = False
+
+    def replace_with_race(source, destination):
+        nonlocal attacked
+        source = Path(source)
+        destination = Path(destination)
+        if not attacked and source.name.startswith(".publish-") and destination.name == f"etsy-listings-{public_id}.xlsx":
+            attacked = True
+            destination.unlink()
+            destination.hardlink_to(external)
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(excel_storage.os, "replace", replace_with_race)
+    published = publish_artifact(
+        generated,
+        workspace=workspace,
+        public_id=public_id,
+        expected_sha256=sha256(generated),
+    )
+    destination = workspace / "artifacts" / f"etsy-listings-{public_id}.xlsx"
+    assert attacked
+    assert published == destination
+    assert not destination.samefile(external)
+    assert destination.read_bytes() == FIXTURE.read_bytes()
+    assert external.read_bytes() == b"target race protected"
+
+
+def _runner_request(tmp_path: Path, public_id: str) -> RunnerRequest:
+    return RunnerRequest(
+        public_id=public_id,
+        source_path=tmp_path / "source.xlsx",
+        operation_dir=tmp_path / "operation",
+        rules_path=tmp_path / "rules.json",
+        knowledge_path=tmp_path / "knowledge.json",
+        knowledge_export_id="kx-" + "a" * 32,
+        knowledge_payload_sha256="b" * 64,
+        knowledge_file_sha256="c" * 64,
+    )
+
+
+def test_subprocess_runner_stderr_limit_terminates_blocked_worker_promptly(tmp_path, monkeypatch) -> None:
+    script = "import sys,time;sys.stderr.write('x'*200000);sys.stderr.flush();time.sleep(30)"
+    monkeypatch.setattr(
+        "app.excel_jobs.runner.build_employee_command",
+        lambda request, repository_root: [sys.executable, "-c", script],
+    )
+    runner = SubprocessExcelRunner(
+        repository_root=tmp_path,
+        max_event_bytes=1024,
+        cancel_timeout_seconds=0.5,
+        worker_timeout_seconds=10,
+    )
+
+    async def exercise() -> None:
+        async def emit(_event):
+            return None
+
+        started = time.monotonic()
+        with pytest.raises(WorkerProtocolError, match="stderr"):
+            await runner.run(_runner_request(tmp_path, "stderr-limit"), emit)
+        assert time.monotonic() - started < 3
+        assert not runner._processes
+
+    asyncio.run(exercise())
+
+
+def test_subprocess_runner_has_bounded_overall_timeout(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(
+        "app.excel_jobs.runner.build_employee_command",
+        lambda request, repository_root: [sys.executable, "-c", "import time;time.sleep(30)"],
+    )
+    runner = SubprocessExcelRunner(
+        repository_root=tmp_path,
+        max_event_bytes=1024,
+        cancel_timeout_seconds=0.5,
+        worker_timeout_seconds=0.2,
+    )
+
+    async def exercise() -> None:
+        started = time.monotonic()
+        with pytest.raises(WorkerProtocolError, match="time limit"):
+            await runner.run(_runner_request(tmp_path, "overall-timeout"), lambda _: asyncio.sleep(0))
+        assert time.monotonic() - started < 3
+        assert not runner._processes
+
+    asyncio.run(exercise())
+
+
+def test_wakeup_subscriptions_are_independent_and_evicted(api) -> None:
+    client, _, _, app = api
+    service = app.state.excel_job_service
+    first = service.subscribe("job-a")
+    second = service.subscribe("job-a")
+    other = service.subscribe("job-b")
+    service._signal("job-a")
+    assert first.is_set() and second.is_set()
+    assert not other.is_set()
+    service.unsubscribe("job-a", first)
+    service.unsubscribe("job-a", second)
+    service.unsubscribe("job-b", other)
+    assert service._wakeups == {}
+
+    for _ in range(3):
+        job = upload(client).json()
+        wait_terminal(client, job["id"])
+        with client.stream("GET", f"/api/excel-jobs/{job['id']}/events") as response:
+            list(response.iter_lines())
+    assert service._wakeups == {}
+
+
+def test_legacy_migrated_job_is_visible_in_list_and_detail_api(tmp_path) -> None:
+    database = tmp_path / "legacy-api.db"
+    engine = create_engine_for_url(f"sqlite:///{database}")
+    with engine.begin() as connection:
+        connection.execute(text("CREATE TABLE conversations (id INTEGER PRIMARY KEY, title VARCHAR(255) NOT NULL, created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL)"))
+        connection.execute(text("CREATE TABLE excel_jobs (id INTEGER PRIMARY KEY, conversation_id INTEGER, source_filename VARCHAR(255) NOT NULL, status VARCHAR(12) NOT NULL, error TEXT, created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL)"))
+        connection.execute(text("CREATE TABLE artifacts (id INTEGER PRIMARY KEY, excel_job_id INTEGER NOT NULL, kind VARCHAR(63) NOT NULL, path TEXT NOT NULL, created_at DATETIME NOT NULL)"))
+        connection.execute(text("INSERT INTO excel_jobs VALUES (42, NULL, 'old.xlsx', 'running', NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"))
+    engine.dispose()
+    settings = Settings(data_dir=tmp_path / "data", database_url=f"sqlite:///{database}")
+    expected_id = str(uuid5(NAMESPACE_URL, "etsy-performance-employee:legacy-excel-job:42"))
+    with TestClient(create_app(settings=settings, excel_runner=FakeExcelRunner())) as client:
+        listing = client.get("/api/excel-jobs")
+        assert listing.status_code == 200
+        assert listing.json()["total"] == 1
+        assert listing.json()["items"][0]["id"] == expected_id
+        detail = client.get(f"/api/excel-jobs/{expected_id}")
+        assert detail.status_code == 200
+        assert detail.json()["status"] == "failed"
+        assert detail.json()["error"]["code"] == "legacy_migrated"

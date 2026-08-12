@@ -85,10 +85,18 @@ async def _bounded_stream(stream: asyncio.StreamReader, *, max_bytes: int) -> by
 class SubprocessExcelRunner:
     _EVENTS = {"started", "row_started", "row_completed", "row_failed", "completed", "failed"}
 
-    def __init__(self, *, repository_root: Path, max_event_bytes: int, cancel_timeout_seconds: float) -> None:
+    def __init__(
+        self,
+        *,
+        repository_root: Path,
+        max_event_bytes: int,
+        cancel_timeout_seconds: float,
+        worker_timeout_seconds: float = 900,
+    ) -> None:
         self.repository_root = repository_root.resolve()
         self.max_event_bytes = max_event_bytes
         self.cancel_timeout_seconds = cancel_timeout_seconds
+        self.worker_timeout_seconds = worker_timeout_seconds
         self._processes: dict[str, asyncio.subprocess.Process] = {}
         self._lock = asyncio.Lock()
 
@@ -110,16 +118,17 @@ class SubprocessExcelRunner:
                 raise WorkerProtocolError("A worker is already running for this job.")
             self._processes[request.public_id] = process
         assert process.stdout is not None and process.stderr is not None
-        stderr_task = asyncio.create_task(_bounded_stream(process.stderr, max_bytes=self.max_event_bytes))
         completed: WorkerResult | None = None
-        try:
+
+        async def consume_stdout() -> None:
+            nonlocal completed
             while True:
                 try:
                     line = await process.stdout.readline()
                 except (ValueError, asyncio.LimitOverrunError) as exc:
                     raise WorkerProtocolError("A worker event exceeded its line limit.") from exc
                 if not line:
-                    break
+                    return
                 if len(line) > self.max_event_bytes:
                     raise WorkerProtocolError("A worker event exceeded its line limit.")
                 try:
@@ -133,8 +142,27 @@ class SubprocessExcelRunner:
                         raise WorkerProtocolError("The worker emitted an invalid completion event.")
                     completed = WorkerResult(Path(event["output_path"]), event["output_sha256"])
                 await emit(event)
-            return_code = await process.wait()
-            await stderr_task
+
+        stdout_task = asyncio.create_task(consume_stdout(), name=f"excel-stdout-{request.public_id}")
+        stderr_task = asyncio.create_task(
+            _bounded_stream(process.stderr, max_bytes=self.max_event_bytes),
+            name=f"excel-stderr-{request.public_id}",
+        )
+        wait_task = asyncio.create_task(process.wait(), name=f"excel-wait-{request.public_id}")
+        protocol_tasks = (stdout_task, stderr_task, wait_task)
+        try:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*protocol_tasks),
+                    timeout=self.worker_timeout_seconds,
+                )
+            except TimeoutError as exc:
+                raise WorkerProtocolError("The worker exceeded its time limit.") from exc
+            except WorkerProtocolError:
+                raise
+            except (OSError, UnicodeError, ValueError) as exc:
+                raise WorkerProtocolError("A worker output stream could not be read safely.") from exc
+            return_code = wait_task.result()
             if return_code != 0:
                 raise RuntimeError("Excel worker failed.")
             if completed is None:
@@ -143,13 +171,24 @@ class SubprocessExcelRunner:
         except BaseException:
             if process.returncode is None:
                 await self._terminate(process)
-            if not stderr_task.done():
-                stderr_task.cancel()
-            await asyncio.gather(stderr_task, return_exceptions=True)
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*protocol_tasks, return_exceptions=True),
+                    timeout=self.cancel_timeout_seconds,
+                )
+            except TimeoutError:
+                for task in protocol_tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*protocol_tasks, return_exceptions=True)
             raise
         finally:
             async with self._lock:
                 self._processes.pop(request.public_id, None)
+            transport = getattr(process, "_transport", None)
+            if transport is not None:
+                transport.close()
+                await asyncio.sleep(0)
 
     async def _terminate(self, process: asyncio.subprocess.Process) -> None:
         if process.returncode is not None:

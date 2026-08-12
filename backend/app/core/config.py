@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     max_excel_upload_bytes: int = 50 * 1024 * 1024
     max_worker_event_bytes: int = 64 * 1024
     excel_cancel_timeout_seconds: float = 5.0
+    excel_worker_timeout_seconds: float = 900.0
 
     @property
     def resolved_database_url(self) -> str:

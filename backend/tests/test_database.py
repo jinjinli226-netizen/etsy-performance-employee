@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC
+from uuid import NAMESPACE_URL, uuid5
 
 import pytest
 from sqlalchemy import inspect, text
@@ -42,7 +43,10 @@ def test_persists_and_reloads_core_records_with_relationships(session_factory) -
 
         job = ExcelJob(
             conversation=conversation,
+            public_id="00000000-0000-4000-8000-000000000010",
             source_filename="listings.xlsx",
+            source_sha256="a" * 64,
+            source_size_bytes=1,
             status=JobStatus.NEEDS_REVIEW,
         )
         job.artifacts.append(Artifact(kind="review_workbook", path="artifacts/review.xlsx"))
@@ -179,7 +183,13 @@ def test_init_db_creates_all_required_tables(tmp_path) -> None:
 @pytest.mark.parametrize(
     ("model"),
     [
-        ExcelJob(source_filename="invalid.xlsx", status="not_a_status"),
+        ExcelJob(
+            public_id="00000000-0000-4000-8000-000000000011",
+            source_filename="invalid.xlsx",
+            source_sha256="b" * 64,
+            source_size_bytes=1,
+            status="not_a_status",
+        ),
         KnowledgeCandidate(
             title="Invalid",
             proposal={},
@@ -294,7 +304,7 @@ def test_init_db_migrates_task2_sqlite_schema_and_preserves_data(tmp_path) -> No
         with engine.connect() as connection:
             assert connection.execute(
                 text("SELECT version FROM schema_migrations ORDER BY version")
-            ).scalars().all() == [1, 2]
+            ).scalars().all() == [1, 2, 3]
             index_names = {
                 row[1] for row in connection.execute(text("PRAGMA index_list('messages')"))
             }
@@ -316,11 +326,46 @@ def test_init_db_migrates_legacy_excel_jobs_and_preserves_rows(tmp_path) -> None
         init_db(engine)
         init_db(engine)
         with engine.connect() as connection:
-            assert connection.execute(text("SELECT source_filename, status FROM excel_jobs WHERE id=7")).one() == ("legacy.xlsx", "failed")
+            expected_public_id = str(uuid5(NAMESPACE_URL, "etsy-performance-employee:legacy-excel-job:7"))
+            assert connection.execute(
+                text(
+                    "SELECT public_id, source_filename, source_sha256, source_size_bytes, "
+                    "status, error_code, progress_percent FROM excel_jobs WHERE id=7"
+                )
+            ).one() == (
+                expected_public_id,
+                "legacy.xlsx",
+                "legacy-unavailable",
+                0,
+                "failed",
+                "legacy_migrated",
+                100,
+            )
             assert connection.execute(text("SELECT kind, path FROM artifacts WHERE id=8")).one() == ("legacy", "legacy/output.xlsx")
-            assert connection.execute(text("SELECT version FROM schema_migrations ORDER BY version")).scalars().all() == [1, 2]
+            assert connection.execute(text("SELECT version FROM schema_migrations ORDER BY version")).scalars().all() == [1, 2, 3]
             assert {row[1] for row in connection.execute(text("PRAGMA table_info('excel_jobs')"))} >= {"public_id", "source_sha256", "source_size_bytes", "error_code", "error_message", "progress_percent"}
             assert {row[1] for row in connection.execute(text("PRAGMA table_info('artifacts')"))} >= {"filename", "sha256", "size_bytes"}
             assert "job_events" in {row[0] for row in connection.execute(text("SELECT name FROM sqlite_master WHERE type='table'"))}
+            assert connection.execute(
+                text("SELECT event_type FROM job_events WHERE excel_job_id=7")
+            ).scalar_one() == "failed"
+            with pytest.raises(IntegrityError):
+                connection.execute(
+                    text(
+                        "INSERT INTO excel_jobs "
+                        "(public_id, source_filename, source_sha256, source_size_bytes, status, progress_percent, created_at, updated_at) "
+                        "VALUES ('bad', '', 'fake', -1, 'not_a_status', 101, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+                    )
+                )
+            for clause in (
+                "public_id=NULL",
+                "source_filename=''",
+                "source_sha256='fake'",
+                "source_size_bytes=-1",
+                "status='bogus'",
+                "progress_percent=101",
+            ):
+                with pytest.raises(IntegrityError):
+                    connection.execute(text(f"UPDATE excel_jobs SET {clause} WHERE id=7"))
     finally:
         engine.dispose()

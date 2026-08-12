@@ -113,13 +113,13 @@ class ExcelJob(TimestampMixin, Base):
     __tablename__ = "excel_jobs"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    public_id: Mapped[str | None] = mapped_column(String(36), unique=True, index=True)
+    public_id: Mapped[str] = mapped_column(String(36), unique=True, index=True, nullable=False)
     conversation_id: Mapped[int | None] = mapped_column(
         ForeignKey("conversations.id", ondelete="SET NULL")
     )
     source_filename: Mapped[str] = mapped_column(String(255), nullable=False)
-    source_sha256: Mapped[str | None] = mapped_column(String(64))
-    source_size_bytes: Mapped[int | None] = mapped_column(BigInteger)
+    source_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
     status: Mapped[JobStatus] = mapped_column(
         strict_enum(JobStatus, "ck_excel_jobs_status"),
         default=JobStatus.QUEUED,

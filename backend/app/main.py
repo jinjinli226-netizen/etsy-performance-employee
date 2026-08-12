@@ -46,6 +46,7 @@ def create_app(
             repository_root=Path(__file__).resolve().parents[2],
             max_event_bytes=runtime_settings.max_worker_event_bytes,
             cancel_timeout_seconds=runtime_settings.excel_cancel_timeout_seconds,
+            worker_timeout_seconds=runtime_settings.excel_worker_timeout_seconds,
         )
         app.state.excel_job_service = ExcelJobService(factory, runtime_excel_runner, runtime_settings)
         app.state.excel_job_service.reconcile_interrupted_jobs()

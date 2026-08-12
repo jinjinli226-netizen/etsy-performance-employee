@@ -91,24 +91,28 @@ async def excel_job_events(public_id: UUID, request: Request):
 
     async def stream():
         cursor = last_id
-        wakeup = service(request).wakeup(str(public_id))
-        while True:
-            wakeup.clear()
-            events, terminal = await asyncio.to_thread(
-                service(request).events_after, str(public_id), cursor
-            )
-            for event in events:
-                cursor = event.id
-                payload = {"type": event.event_type, **event.payload}
-                yield f"id: {event.id}\nevent: {event.event_type}\ndata: {json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}\n\n"
-            if events:
-                continue
-            if terminal:
-                break
-            try:
-                await asyncio.wait_for(wakeup.wait(), timeout=15)
-            except TimeoutError:
-                yield ": keepalive\n\n"
+        runtime_service = service(request)
+        wakeup = runtime_service.subscribe(str(public_id))
+        try:
+            while True:
+                wakeup.clear()
+                events, terminal = await asyncio.to_thread(
+                    runtime_service.events_after, str(public_id), cursor
+                )
+                for event in events:
+                    cursor = event.id
+                    payload = {"type": event.event_type, **event.payload}
+                    yield f"id: {event.id}\nevent: {event.event_type}\ndata: {json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}\n\n"
+                if events:
+                    continue
+                if terminal:
+                    break
+                try:
+                    await asyncio.wait_for(wakeup.wait(), timeout=15)
+                except TimeoutError:
+                    yield ": keepalive\n\n"
+        finally:
+            runtime_service.unsubscribe(str(public_id), wakeup)
 
     return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 

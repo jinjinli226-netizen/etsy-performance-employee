@@ -78,7 +78,7 @@ class ExcelJobService:
         self.root = (settings.data_dir / "excel-jobs").resolve()
         self._tasks: dict[str, asyncio.Task] = {}
         self._lock = asyncio.Lock()
-        self._wakeups: dict[str, asyncio.Event] = {}
+        self._wakeups: dict[str, set[asyncio.Event]] = {}
 
     def reconcile_interrupted_jobs(self) -> None:
         with self.factory() as session:
@@ -160,8 +160,18 @@ class ExcelJobService:
             ).all()
             return list(events), job.status in TERMINAL
 
-    def wakeup(self, public_id: str) -> asyncio.Event:
-        return self._wakeups.setdefault(public_id, asyncio.Event())
+    def subscribe(self, public_id: str) -> asyncio.Event:
+        wakeup = asyncio.Event()
+        self._wakeups.setdefault(public_id, set()).add(wakeup)
+        return wakeup
+
+    def unsubscribe(self, public_id: str, wakeup: asyncio.Event) -> None:
+        subscribers = self._wakeups.get(public_id)
+        if subscribers is None:
+            return
+        subscribers.discard(wakeup)
+        if not subscribers:
+            self._wakeups.pop(public_id, None)
 
     async def cancel(self, public_id: str) -> JobView:
         with self.factory() as session:
@@ -406,8 +416,7 @@ class ExcelJobService:
         )
 
     def _signal(self, public_id: str) -> None:
-        event = self._wakeups.get(public_id)
-        if event is not None:
+        for event in tuple(self._wakeups.get(public_id, ())):
             event.set()
 
 

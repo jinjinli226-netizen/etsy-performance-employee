@@ -5,11 +5,13 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
 import stat
 import zipfile
 import ctypes
 from dataclasses import dataclass
+from typing import BinaryIO
 from pathlib import Path
 from uuid import UUID
 
@@ -93,7 +95,7 @@ def _is_reparse_point(path: Path) -> bool:
     if os.name != "nt":
         return False
     attributes = ctypes.windll.kernel32.GetFileAttributesW(str(path))
-    return attributes != INVALID_FILE_ATTRIBUTES and bool(attributes & FILE_ATTRIBUTE_REPARSE_POINT)
+    return attributes not in (-1, INVALID_FILE_ATTRIBUTES) and bool(attributes & FILE_ATTRIBUTE_REPARSE_POINT)
 
 
 def _validate_regular_unique_file(path: Path) -> None:
@@ -104,8 +106,10 @@ def _validate_regular_unique_file(path: Path) -> None:
         raise StorageError("invalid_artifact", "The artifact must not share storage with another file.")
 
 
-def _validate_xlsx_package(path: Path) -> None:
+def _validate_xlsx_package(path: Path | BinaryIO) -> None:
     try:
+        if hasattr(path, "seek"):
+            path.seek(0)
         with zipfile.ZipFile(path) as archive:
             infos = archive.infolist()
             if len(infos) > MAX_ZIP_ENTRIES:
@@ -122,6 +126,8 @@ def _validate_xlsx_package(path: Path) -> None:
                     raise StorageError("unsafe_workbook", "The workbook expands beyond the safe limit.")
                 if info.file_size > 10 * 1024 * 1024 and info.compress_size and info.file_size / info.compress_size > 200:
                     raise StorageError("unsafe_workbook", "The workbook contains a suspicious archive entry.")
+        if hasattr(path, "seek"):
+            path.seek(0)
         workbook = load_workbook(path, read_only=True, data_only=False, keep_links=False)
         try:
             for worksheet in workbook.worksheets:
@@ -266,28 +272,189 @@ def validate_artifact(path: Path, *, operation_dir: Path, source_path: Path, sou
     return file_sha256(artifact), artifact.stat().st_size
 
 
+def _identity(metadata: os.stat_result) -> tuple[int, int]:
+    return metadata.st_dev, metadata.st_ino
+
+
+def _validate_open_file(path: Path, metadata: os.stat_result, *, code: str = "invalid_artifact") -> None:
+    try:
+        lexical = path.lstat()
+    except OSError as exc:
+        raise StorageError(code, "The artifact path changed during publishing.") from exc
+    if (
+        path.is_symlink()
+        or _is_reparse_point(path)
+        or not stat.S_ISREG(lexical.st_mode)
+        or not stat.S_ISREG(metadata.st_mode)
+        or lexical.st_nlink != 1
+        or metadata.st_nlink != 1
+        or _identity(lexical) != _identity(metadata)
+    ):
+        raise StorageError(code, "The artifact path changed during publishing.")
+
+
+def _open_regular_readonly(path: Path) -> tuple[int, os.stat_result]:
+    before = path.lstat()
+    if path.is_symlink() or _is_reparse_point(path) or not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+        raise StorageError("invalid_artifact", "The artifact must be a private regular file.")
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise StorageError("invalid_artifact", "The artifact could not be opened safely.") from exc
+    try:
+        opened = os.fstat(descriptor)
+        _validate_open_file(path, opened)
+        if _identity(before) != _identity(opened):
+            raise StorageError("invalid_artifact", "The artifact path changed during opening.")
+        return descriptor, opened
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _exclusive_file(path: Path) -> tuple[int, os.stat_result]:
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags, 0o600)
+    opened = os.fstat(descriptor)
+    _validate_open_file(path, opened)
+    return descriptor, opened
+
+
+def _unlink_if_identity(path: Path, expected: tuple[int, int]) -> None:
+    try:
+        current = path.lstat()
+        if _identity(current) == expected and not path.is_symlink() and not _is_reparse_point(path):
+            path.unlink()
+    except OSError:
+        pass
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+        os.fsync(descriptor)
+    except OSError:
+        pass
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
 def publish_artifact(path: Path, *, workspace: Path, public_id: str, expected_sha256: str) -> Path:
     operation = path.parent.resolve()
     source = safe_path(path, operation, must_exist=True)
     _validate_regular_unique_file(source)
     artifact_dir = workspace / "artifacts"
     artifact_dir.mkdir(exist_ok=True)
+    artifact_dir = safe_path(artifact_dir, workspace, must_exist=True)
     destination = artifact_dir / f"etsy-listings-{public_id}.xlsx"
     safe_path(destination, workspace)
-    temporary = artifact_dir / f".{public_id}.tmp.xlsx"
-    safe_path(temporary, workspace)
+    if destination.exists() or destination.is_symlink() or _is_reparse_point(destination):
+        raise StorageError("invalid_artifact", "The artifact destination already exists.")
+
+    temporary: Path | None = None
+    temporary_identity: tuple[int, int] | None = None
+    source_descriptor: int | None = None
+    temporary_descriptor: int | None = None
+    destination_reservation_descriptor: int | None = None
+    destination_reservation_identity: tuple[int, int] | None = None
+    destination_identity: tuple[int, int] | None = None
+    published_ok = False
     try:
-        shutil.copyfile(source, temporary)
-        _validate_regular_unique_file(temporary)
-        if file_sha256(temporary) != expected_sha256:
-            raise StorageError("invalid_artifact", "The published artifact digest changed during copying.")
-        _validate_xlsx_package(temporary)
+        for _ in range(32):
+            candidate = artifact_dir / f".publish-{secrets.token_hex(16)}.tmp"
+            safe_path(candidate, workspace)
+            try:
+                temporary_descriptor, created = _exclusive_file(candidate)
+                temporary = candidate
+                temporary_identity = _identity(created)
+                break
+            except FileExistsError:
+                continue
+        if temporary is None or temporary_descriptor is None or temporary_identity is None:
+            raise StorageError("invalid_artifact", "A private artifact staging file could not be created.")
+
+        source_descriptor, source_metadata = _open_regular_readonly(source)
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(source_descriptor, UPLOAD_CHUNK_BYTES)
+            if not chunk:
+                break
+            digest.update(chunk)
+            view = memoryview(chunk)
+            while view:
+                written = os.write(temporary_descriptor, view)
+                view = view[written:]
+        if _identity(os.fstat(source_descriptor)) != _identity(source_metadata):
+            raise StorageError("invalid_artifact", "The artifact source changed during copying.")
+        _validate_open_file(source, os.fstat(source_descriptor))
+        os.fsync(temporary_descriptor)
+        os.close(temporary_descriptor)
+        temporary_descriptor = None
+
+        verify_descriptor, verified_metadata = _open_regular_readonly(temporary)
+        try:
+            if _identity(verified_metadata) != temporary_identity:
+                raise StorageError("invalid_artifact", "The artifact staging file changed during publishing.")
+            with os.fdopen(os.dup(verify_descriptor), "rb") as verify_stream:
+                staged_digest = hashlib.sha256()
+                for chunk in iter(lambda: verify_stream.read(UPLOAD_CHUNK_BYTES), b""):
+                    staged_digest.update(chunk)
+                if staged_digest.hexdigest() != expected_sha256 or digest.hexdigest() != expected_sha256:
+                    raise StorageError("invalid_artifact", "The published artifact digest changed during copying.")
+                _validate_xlsx_package(verify_stream)
+            _validate_open_file(temporary, os.fstat(verify_descriptor))
+        finally:
+            os.close(verify_descriptor)
+
+        try:
+            destination_reservation_descriptor, destination_reservation = _exclusive_file(destination)
+        except FileExistsError as exc:
+            raise StorageError("invalid_artifact", "The artifact destination already exists.") from exc
+        destination_reservation_identity = _identity(destination_reservation)
+        os.fsync(destination_reservation_descriptor)
+        os.close(destination_reservation_descriptor)
+        destination_reservation_descriptor = None
+        if _identity(destination.lstat()) != destination_reservation_identity:
+            raise StorageError("invalid_artifact", "The artifact destination changed during publishing.")
+        if _identity(temporary.lstat()) != temporary_identity:
+            raise StorageError("invalid_artifact", "The artifact staging file changed during publishing.")
+
+        # Replace only the exclusive reservation that this operation created.
         os.replace(temporary, destination)
+        destination_identity = temporary_identity
+        if _identity(destination.lstat()) != temporary_identity:
+            raise StorageError("invalid_artifact", "The artifact destination changed during publishing.")
         published = safe_path(destination, workspace, must_exist=True)
-        _validate_regular_unique_file(published)
-        if file_sha256(published) != expected_sha256:
-            raise StorageError("invalid_artifact", "The published artifact failed its integrity check.")
-        _validate_xlsx_package(published)
+        published_descriptor, published_metadata = _open_regular_readonly(published)
+        try:
+            if _identity(published_metadata) != temporary_identity:
+                raise StorageError("invalid_artifact", "The artifact staging file changed during publishing.")
+            with os.fdopen(os.dup(published_descriptor), "rb") as published_stream:
+                published_digest = hashlib.sha256()
+                for chunk in iter(lambda: published_stream.read(UPLOAD_CHUNK_BYTES), b""):
+                    published_digest.update(chunk)
+                if published_digest.hexdigest() != expected_sha256:
+                    raise StorageError("invalid_artifact", "The published artifact failed its integrity check.")
+                _validate_xlsx_package(published_stream)
+            _validate_open_file(published, os.fstat(published_descriptor))
+        finally:
+            os.close(published_descriptor)
+        _fsync_directory(artifact_dir)
+        published_ok = True
         return published
     finally:
-        temporary.unlink(missing_ok=True)
+        for descriptor in (source_descriptor, temporary_descriptor, destination_reservation_descriptor):
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+        if temporary is not None and temporary_identity is not None:
+            _unlink_if_identity(temporary, temporary_identity)
+        if not published_ok and destination_identity is not None:
+            _unlink_if_identity(destination, destination_identity)
+        if not published_ok and destination_reservation_identity is not None:
+            _unlink_if_identity(destination, destination_reservation_identity)
