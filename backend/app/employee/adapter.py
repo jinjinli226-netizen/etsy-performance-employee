@@ -4,6 +4,7 @@ import asyncio
 import os
 import re
 import shutil
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -54,6 +55,23 @@ class HermesCancelledError(asyncio.CancelledError):
 _SESSION_LINE = re.compile(r"(?im)^\s*session_id:\s*([A-Za-z0-9][A-Za-z0-9._:-]{0,255})\s*$")
 
 
+def resolve_hermes_profiles_root(*, platform_name: str | None = None) -> Path:
+    """Resolve Hermes' named-profile root without importing the Hermes package."""
+    explicit_home = os.environ.get("HERMES_HOME")
+    if explicit_home:
+        return (Path(explicit_home).expanduser() / "profiles").resolve()
+
+    current_platform = (platform_name or sys.platform).lower()
+    if current_platform.startswith("win"):
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        if not local_app_data:
+            raise EmployeeUnavailableError("The Hermes profile location is unavailable.")
+        hermes_home = Path(local_app_data) / "hermes"
+    else:
+        hermes_home = Path.home() / ".hermes"
+    return (hermes_home / "profiles").resolve()
+
+
 class SubprocessHermesAdapter:
     def __init__(
         self,
@@ -70,16 +88,9 @@ class SubprocessHermesAdapter:
         self.timeout_seconds = timeout_seconds
         self.data_root = data_root.resolve()
         self.max_turns = max_turns
-        if profiles_root is None:
-            configured_home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
-            default_home = Path.home() / ".hermes"
-            hermes_root = (
-                configured_home
-                if configured_home.resolve() != default_home.resolve()
-                else default_home
-            )
-            profiles_root = hermes_root / "profiles"
-        self.profiles_root = profiles_root.resolve()
+        self.profiles_root = (
+            profiles_root.resolve() if profiles_root else resolve_hermes_profiles_root()
+        )
 
     def check_available(self) -> None:
         """Verify local prerequisites without starting Hermes or contacting a model."""

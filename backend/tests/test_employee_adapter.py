@@ -12,6 +12,7 @@ from app.employee.adapter import (
     HermesProcessError,
     HermesTimeoutError,
     SubprocessHermesAdapter,
+    resolve_hermes_profiles_root,
 )
 from tests.fakes.fake_hermes import FakeProcess
 
@@ -44,6 +45,53 @@ def test_check_available_rejects_missing_profile(tmp_path, monkeypatch) -> None:
 
     with pytest.raises(EmployeeUnavailableError, match="profile"):
         adapter(tmp_path).check_available()
+
+
+def test_windows_profiles_root_uses_local_app_data_and_existing_profile(
+    tmp_path, monkeypatch
+) -> None:
+    local_app_data = tmp_path / "LocalAppData"
+    expected_root = local_app_data / "hermes" / "profiles"
+    (expected_root / "etsy-performance-us").mkdir(parents=True)
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.setenv("LOCALAPPDATA", str(local_app_data))
+    monkeypatch.setattr("shutil.which", lambda executable: str(tmp_path / "hermes.exe"))
+
+    root = resolve_hermes_profiles_root(platform_name="windows")
+    real = SubprocessHermesAdapter(
+        executable="hermes",
+        profile="etsy-performance-us",
+        data_root=tmp_path / "data",
+        profiles_root=root,
+    )
+
+    assert root == expected_root.resolve()
+    real.check_available()
+
+
+def test_windows_profiles_root_missing_profile_is_unavailable(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "LocalAppData"))
+    monkeypatch.setattr("shutil.which", lambda executable: str(tmp_path / "hermes.exe"))
+    real = SubprocessHermesAdapter(
+        executable="hermes",
+        profile="etsy-performance-us",
+        data_root=tmp_path / "data",
+        profiles_root=resolve_hermes_profiles_root(platform_name="windows"),
+    )
+
+    with pytest.raises(EmployeeUnavailableError, match="profile"):
+        real.check_available()
+
+
+def test_explicit_hermes_home_override_wins_on_windows(tmp_path, monkeypatch) -> None:
+    override = tmp_path / "override-home"
+    monkeypatch.setenv("HERMES_HOME", str(override))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "ignored-local"))
+
+    assert resolve_hermes_profiles_root(platform_name="windows") == (
+        override / "profiles"
+    ).resolve()
 
 
 @pytest.mark.anyio
