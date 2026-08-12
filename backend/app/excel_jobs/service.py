@@ -189,9 +189,12 @@ class ExcelJobService:
                 raise JobConflictError("No completed artifact is available for this job.")
             artifact = job.artifacts[0]
             workspace = self.root / public_id
-            path = safe_path(Path(artifact.path), workspace, must_exist=True)
-            if artifact.sha256 is None or file_sha256(path) != artifact.sha256:
-                raise JobConflictError("The completed artifact failed its integrity check.")
+            try:
+                path = safe_path(Path(artifact.path), workspace, must_exist=True)
+                if artifact.sha256 is None or file_sha256(path) != artifact.sha256:
+                    raise JobConflictError("The completed artifact failed its integrity check.")
+            except (FileNotFoundError, OSError, StorageError) as exc:
+                raise JobConflictError("The completed artifact is missing or unsafe.") from exc
             return path, artifact.filename or "etsy-listings.xlsx"
 
     async def shutdown(self) -> None:
@@ -250,7 +253,11 @@ class ExcelJobService:
             if result.output_sha256 != digest:
                 raise StorageError("invalid_artifact", "The artifact digest did not match the worker report.")
             published = await asyncio.to_thread(
-                publish_artifact, result.output_path, workspace=workspace, public_id=public_id
+                publish_artifact,
+                result.output_path,
+                workspace=workspace,
+                public_id=public_id,
+                expected_sha256=digest,
             )
             with self.factory() as session:
                 job = self._get(session, public_id)
@@ -282,7 +289,7 @@ class ExcelJobService:
         except StorageError as exc:
             code = exc.code if _SAFE_CODE.fullmatch(exc.code) else "invalid_artifact"
             self._fail(public_id, code, _safe_storage_message(code))
-        except (JobConflictError, OSError, RuntimeError, ValueError):
+        except Exception:
             try:
                 source_changed = (
                     'source' in locals()
@@ -310,20 +317,6 @@ class ExcelJobService:
         kind = event["event"]
         if kind not in {"started", "row_started", "row_completed", "row_failed", "completed", "failed"}:
             raise WorkerProtocolError("Unknown worker event.")
-        if kind.startswith("row_"):
-            row_id = event.get("row_id")
-            row_number = event.get("row_number")
-            if not isinstance(row_id, str) or len(row_id) > 128:
-                raise WorkerProtocolError("Invalid row event.")
-            payload["row_id"] = row_id
-            if row_number is not None:
-                if isinstance(row_number, bool) or not isinstance(row_number, int) or not 1 <= row_number <= 20_000:
-                    raise WorkerProtocolError("Invalid row event.")
-                payload["row_number"] = row_number
-        await asyncio.to_thread(self._persist_worker_event_sync, public_id, kind, event)
-        self._signal(public_id)
-
-    def _persist_worker_event_sync(self, public_id: str, kind: str, event: dict) -> None:
         payload: dict = {"status": "running"}
         if kind.startswith("row_"):
             row_id = event.get("row_id")
@@ -335,6 +328,10 @@ class ExcelJobService:
                 if isinstance(row_number, bool) or not isinstance(row_number, int) or not 1 <= row_number <= 20_000:
                     raise WorkerProtocolError("Invalid row event.")
                 payload["row_number"] = row_number
+        await asyncio.to_thread(self._persist_worker_event_sync, public_id, kind, payload)
+        self._signal(public_id)
+
+    def _persist_worker_event_sync(self, public_id: str, kind: str, payload: dict) -> None:
         with self.factory() as session:
             job = self._get(session, public_id)
             if job.status is not JobStatus.RUNNING:

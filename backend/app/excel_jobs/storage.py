@@ -8,6 +8,7 @@ import re
 import shutil
 import stat
 import zipfile
+import ctypes
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import UUID
@@ -29,6 +30,8 @@ MAX_ROWS = 20_000
 MAX_COLUMNS = 500
 UPLOAD_CHUNK_BYTES = 1024 * 1024
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+INVALID_FILE_ATTRIBUTES = 0xFFFFFFFF
 
 
 class StorageError(RuntimeError):
@@ -72,15 +75,33 @@ def _within(path: Path, parent: Path) -> bool:
 
 def safe_path(path: Path, parent: Path, *, must_exist: bool = False) -> Path:
     parent_resolved = parent.resolve(strict=True)
+    lexical = Path(os.path.abspath(path))
+    if not _within(lexical, parent_resolved) or lexical == parent_resolved:
+        raise StorageError("unsafe_path", "The operation path is outside its job workspace.")
+    current = lexical if must_exist else lexical.parent
+    while current != parent_resolved:
+        if current.exists() and (current.is_symlink() or _is_reparse_point(current)):
+            raise StorageError("unsafe_path", "Links and reparse points are not allowed in job workspaces.")
+        current = current.parent
     resolved = path.resolve(strict=must_exist)
     if not _within(resolved, parent_resolved) or resolved == parent_resolved:
         raise StorageError("unsafe_path", "The operation path is outside its job workspace.")
-    current = resolved if must_exist else resolved.parent
-    while current != parent_resolved:
-        if current.exists() and current.is_symlink():
-            raise StorageError("unsafe_path", "Symbolic links are not allowed in job workspaces.")
-        current = current.parent
     return resolved
+
+
+def _is_reparse_point(path: Path) -> bool:
+    if os.name != "nt":
+        return False
+    attributes = ctypes.windll.kernel32.GetFileAttributesW(str(path))
+    return attributes != INVALID_FILE_ATTRIBUTES and bool(attributes & FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def _validate_regular_unique_file(path: Path) -> None:
+    if path.is_symlink() or _is_reparse_point(path) or not path.is_file():
+        raise StorageError("invalid_artifact", "The artifact must be a regular file.")
+    metadata = path.stat(follow_symlinks=False)
+    if metadata.st_nlink != 1:
+        raise StorageError("invalid_artifact", "The artifact must not share storage with another file.")
 
 
 def _validate_xlsx_package(path: Path) -> None:
@@ -218,6 +239,7 @@ def ensure_default_rules(workspace: Path) -> Path:
 
 def validate_artifact(path: Path, *, operation_dir: Path, source_path: Path, source_sha256: str) -> tuple[str, int]:
     artifact = safe_path(path, operation_dir, must_exist=True)
+    _validate_regular_unique_file(artifact)
     try:
         same_source_file = artifact.samefile(source_path)
     except OSError:
@@ -244,12 +266,28 @@ def validate_artifact(path: Path, *, operation_dir: Path, source_path: Path, sou
     return file_sha256(artifact), artifact.stat().st_size
 
 
-def publish_artifact(path: Path, *, workspace: Path, public_id: str) -> Path:
+def publish_artifact(path: Path, *, workspace: Path, public_id: str, expected_sha256: str) -> Path:
     operation = path.parent.resolve()
-    safe_path(path, operation, must_exist=True)
+    source = safe_path(path, operation, must_exist=True)
+    _validate_regular_unique_file(source)
     artifact_dir = workspace / "artifacts"
     artifact_dir.mkdir(exist_ok=True)
     destination = artifact_dir / f"etsy-listings-{public_id}.xlsx"
     safe_path(destination, workspace)
-    os.replace(path, destination)
-    return safe_path(destination, workspace, must_exist=True)
+    temporary = artifact_dir / f".{public_id}.tmp.xlsx"
+    safe_path(temporary, workspace)
+    try:
+        shutil.copyfile(source, temporary)
+        _validate_regular_unique_file(temporary)
+        if file_sha256(temporary) != expected_sha256:
+            raise StorageError("invalid_artifact", "The published artifact digest changed during copying.")
+        _validate_xlsx_package(temporary)
+        os.replace(temporary, destination)
+        published = safe_path(destination, workspace, must_exist=True)
+        _validate_regular_unique_file(published)
+        if file_sha256(published) != expected_sha256:
+            raise StorageError("invalid_artifact", "The published artifact failed its integrity check.")
+        _validate_xlsx_package(published)
+        return published
+    finally:
+        temporary.unlink(missing_ok=True)

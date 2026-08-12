@@ -101,6 +101,8 @@ async def excel_job_events(public_id: UUID, request: Request):
                 cursor = event.id
                 payload = {"type": event.event_type, **event.payload}
                 yield f"id: {event.id}\nevent: {event.event_type}\ndata: {json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}\n\n"
+            if events:
+                continue
             if terminal:
                 break
             try:

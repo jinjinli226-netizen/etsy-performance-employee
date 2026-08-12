@@ -15,7 +15,7 @@ from app.core.config import Settings
 from app.excel_jobs.runner import RunnerRequest, WorkerResult, build_employee_command
 from app.main import create_app
 from app.db.init_db import init_db
-from app.db.models import ExcelJob
+from app.db.models import Artifact, ExcelJob, JobEvent
 from app.db.session import create_engine_for_url, create_session_factory
 from app.excel_jobs.schemas import JobStatus
 
@@ -51,6 +51,21 @@ class FakeExcelRunner:
 
     async def shutdown(self) -> None:
         return None
+
+
+class RealProtocolRunner(FakeExcelRunner):
+    async def run(self, request: RunnerRequest, emit) -> WorkerResult:
+        self.calls.append(request)
+        await emit({"event": "started"})
+        await emit({"event": "row_started", "row_id": "row-1", "row_number": 3})
+        await emit({"event": "row_completed", "row_id": "row-1", "row_number": 3})
+        await emit({"event": "row_started", "row_id": "row-2", "row_number": 4})
+        await emit({"event": "row_completed", "row_id": "row-2", "row_number": 4})
+        output = request.operation_dir / "generated.xlsx"
+        shutil.copyfile(request.source_path, output)
+        result = WorkerResult(output, sha256(output))
+        await emit({"event": "completed", "output_path": str(output), "output_sha256": result.output_sha256})
+        return result
 
 
 def sha256(path: Path) -> str:
@@ -191,6 +206,42 @@ def test_malformed_progress_event_fails_job_safely(tmp_path) -> None:
         assert terminal["error"]["code"] == "invalid_worker_event"
 
 
+def test_real_multi_row_worker_protocol_reaches_terminal_and_persists_events(tmp_path) -> None:
+    settings = Settings(data_dir=tmp_path / "data", database_url=f"sqlite:///{tmp_path / 'api.db'}")
+    with TestClient(create_app(settings=settings, excel_runner=RealProtocolRunner())) as client:
+        job = upload(client).json()
+        terminal = wait_terminal(client, job["id"])
+        assert terminal["status"] == "completed"
+        with client.stream("GET", f"/api/excel-jobs/{job['id']}/events") as response:
+            event_types = [line[7:] for line in response.iter_lines() if line.startswith("event: ")]
+        assert event_types == [
+            "queued", "running", "worker_started", "worker_row_started",
+            "worker_row_completed", "worker_row_started", "worker_row_completed",
+            "worker_completed", "completed",
+        ]
+
+
+def test_event_persist_failure_is_caught_and_job_becomes_failed(tmp_path, monkeypatch) -> None:
+    settings = Settings(data_dir=tmp_path / "data", database_url=f"sqlite:///{tmp_path / 'api.db'}")
+    app = create_app(settings=settings, excel_runner=RealProtocolRunner())
+    with TestClient(app) as client:
+        original = app.state.excel_job_service._persist_worker_event_sync
+        calls = 0
+
+        def fail_once(public_id, kind, event):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("database write failed")
+            return original(public_id, kind, event)
+
+        monkeypatch.setattr(app.state.excel_job_service, "_persist_worker_event_sync", fail_once)
+        job = upload(client).json()
+        terminal = wait_terminal(client, job["id"])
+        assert terminal["status"] == "failed"
+        assert terminal["error"]["code"] == "worker_failed"
+
+
 def test_sse_replays_persisted_events_after_last_event_id(api) -> None:
     client, _, _, _ = api
     job = upload(client).json()
@@ -210,6 +261,36 @@ def test_sse_replays_persisted_events_after_last_event_id(api) -> None:
     ) as response:
         replay = list(response.iter_lines())
     assert [int(line[4:]) for line in replay if line.startswith("id: ")] == [ids[-1]]
+
+
+def test_sse_replays_more_than_two_pages_before_terminal_event(tmp_path) -> None:
+    database = tmp_path / "many-events.db"
+    engine = create_engine_for_url(f"sqlite:///{database}")
+    init_db(engine)
+    factory = create_session_factory(engine)
+    public_id = "00000000-0000-4000-8000-000000000099"
+    with factory() as session:
+        job = ExcelJob(
+            public_id=public_id, source_filename="events.xlsx", source_sha256="a" * 64,
+            source_size_bytes=1, status=JobStatus.COMPLETED, progress_percent=100,
+        )
+        job.events.extend(JobEvent(event_type="progress", payload={"sequence": index}) for index in range(2505))
+        job.events.append(JobEvent(event_type="completed", payload={"status": "completed"}))
+        session.add(job)
+        session.commit()
+    engine.dispose()
+    settings = Settings(data_dir=tmp_path / "data", database_url=f"sqlite:///{database}")
+    with TestClient(create_app(settings=settings, excel_runner=FakeExcelRunner())) as client:
+        with client.stream("GET", f"/api/excel-jobs/{public_id}/events") as response:
+            lines = list(response.iter_lines())
+        ids = [int(line[4:]) for line in lines if line.startswith("id: ")]
+        assert len(ids) == 2506
+        assert any(line == "event: completed" for line in lines[-5:])
+        with client.stream(
+            "GET", f"/api/excel-jobs/{public_id}/events", headers={"Last-Event-ID": str(ids[-3])}
+        ) as response:
+            replay = [int(line[4:]) for line in response.iter_lines() if line.startswith("id: ")]
+        assert replay == ids[-2:]
 
 
 def test_running_cancel_is_idempotent_and_preserves_source(tmp_path) -> None:
@@ -354,6 +435,67 @@ def test_worker_hardlink_to_source_is_not_a_new_artifact(tmp_path) -> None:
         terminal = wait_terminal(client, job["id"])
         assert terminal["status"] == "failed"
         assert terminal["error"]["code"] == "invalid_artifact"
+
+
+def test_worker_cross_job_hardlink_is_rejected(tmp_path) -> None:
+    external = tmp_path / "other-job-artifact.xlsx"
+    shutil.copyfile(FIXTURE, external)
+
+    class CrossJobHardlinkRunner(FakeExcelRunner):
+        async def run(self, request, emit):
+            self.calls.append(request)
+            await emit({"event": "started"})
+            output = request.operation_dir / "generated.xlsx"
+            try:
+                output.hardlink_to(external)
+            except OSError:
+                pytest.skip("hard links are unavailable on this filesystem")
+            return WorkerResult(output, sha256(output))
+
+    settings = Settings(data_dir=tmp_path / "data", database_url=f"sqlite:///{tmp_path / 'api.db'}")
+    with TestClient(create_app(settings=settings, excel_runner=CrossJobHardlinkRunner())) as client:
+        job = upload(client).json()
+        terminal = wait_terminal(client, job["id"])
+        assert terminal["status"] == "failed"
+        assert terminal["error"]["code"] == "invalid_artifact"
+        assert external.exists()
+
+
+def test_worker_leaf_symlink_artifact_is_rejected(tmp_path) -> None:
+    external = tmp_path / "outside.xlsx"
+    shutil.copyfile(FIXTURE, external)
+    probe = tmp_path / "symlink-probe.xlsx"
+    try:
+        probe.symlink_to(external)
+        probe.unlink()
+    except OSError:
+        pytest.skip("symbolic links are unavailable on this filesystem")
+
+    class SymlinkRunner(FakeExcelRunner):
+        async def run(self, request, emit):
+            self.calls.append(request)
+            await emit({"event": "started"})
+            output = request.operation_dir / "generated.xlsx"
+            output.symlink_to(external)
+            return WorkerResult(output, sha256(output))
+
+    settings = Settings(data_dir=tmp_path / "data", database_url=f"sqlite:///{tmp_path / 'api.db'}")
+    with TestClient(create_app(settings=settings, excel_runner=SymlinkRunner())) as client:
+        job = upload(client).json()
+        terminal = wait_terminal(client, job["id"])
+        assert terminal["status"] == "failed"
+        assert terminal["error"]["code"] == "unsafe_path"
+        assert external.exists()
+
+
+def test_missing_persisted_artifact_download_is_safe_conflict(api) -> None:
+    client, _, _, app = api
+    job = upload(client).json()
+    terminal = wait_terminal(client, job["id"])
+    artifact_path = Path(app.state.excel_job_service.download(job["id"])[0])
+    artifact_path.unlink()
+    response = client.get(f"/api/excel-jobs/{job['id']}/download")
+    assert response.status_code in {409, 410}
 
 
 def test_startup_marks_persisted_queued_and_running_jobs_failed(tmp_path) -> None:
