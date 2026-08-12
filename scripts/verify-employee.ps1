@@ -279,7 +279,7 @@ if ($null -ne $Manifest) {
         Add-Failure "Provisioning manifest identity or schema is invalid."
     }
     $HasBaseUrl = [bool]$Manifest.hasBaseUrl
-    $ProviderRequiresBaseUrl = ([string]$Manifest.provider).ToLowerInvariant() -notin @("codex")
+    $ProviderRequiresBaseUrl = ([string]$Manifest.provider).ToLowerInvariant() -notin @("openai-codex")
     if ($ProviderRequiresBaseUrl -and -not $HasBaseUrl) {
         Add-Failure "A custom provider manifest must include a validated base URL."
     }

@@ -698,7 +698,7 @@ def test_fake_hermes_provision_accepts_codex_without_base_url_and_xhigh(
         "memory.user_profile_enabled": "true",
         "memory.write_approval": "true",
         "skills.write_approval": "true",
-        "model.provider": "codex",
+        "model.provider": "openai-codex",
         "model.default": "gpt-5.6-sol",
         "agent.reasoning_effort": "xhigh",
     }
@@ -733,6 +733,7 @@ def test_fake_hermes_provision_accepts_codex_without_base_url_and_xhigh(
 
     assert result.returncode == 0, result.stdout + result.stderr
     manifest = json.loads((profile_home / MANIFEST_NAME).read_text(encoding="utf-8-sig"))
+    assert manifest["provider"] == "openai-codex"
     assert manifest["hasBaseUrl"] is False
     assert manifest["baseUrl"] is None
     assert "config|set|model.base_url" not in command_log.read_text(encoding="utf-8")
@@ -772,9 +773,9 @@ def test_verifier_accepts_exactly_unset_base_url_for_codex(tmp_path: Path) -> No
     hermes_home, profile_home, fake_hermes, values = create_verifier_fixture(tmp_path)
     manifest_path = profile_home / MANIFEST_NAME
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest.update({"provider": "codex", "baseUrl": None, "hasBaseUrl": False})
+    manifest.update({"provider": "openai-codex", "baseUrl": None, "hasBaseUrl": False})
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-    values["model.provider"] = "codex"
+    values["model.provider"] = "openai-codex"
     values.pop("model.base_url")
     write_fake_hermes(fake_hermes, values)
 
@@ -789,9 +790,9 @@ def test_verifier_rejects_base_url_present_when_manifest_requires_absence(
     hermes_home, profile_home, fake_hermes, values = create_verifier_fixture(tmp_path)
     manifest_path = profile_home / MANIFEST_NAME
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest.update({"provider": "codex", "baseUrl": None, "hasBaseUrl": False})
+    manifest.update({"provider": "openai-codex", "baseUrl": None, "hasBaseUrl": False})
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-    values["model.provider"] = "codex"
+    values["model.provider"] = "openai-codex"
     write_fake_hermes(fake_hermes, values)
 
     result = run_verifier(hermes_home, fake_hermes)
@@ -821,9 +822,9 @@ def test_verifier_does_not_treat_arbitrary_config_get_failure_as_unset(
     hermes_home, profile_home, fake_hermes, values = create_verifier_fixture(tmp_path)
     manifest_path = profile_home / MANIFEST_NAME
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest.update({"provider": "codex", "baseUrl": None, "hasBaseUrl": False})
+    manifest.update({"provider": "openai-codex", "baseUrl": None, "hasBaseUrl": False})
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-    values["model.provider"] = "codex"
+    values["model.provider"] = "openai-codex"
     values.pop("model.base_url")
     write_fake_hermes(fake_hermes, values, missing_config_output="configuration unavailable")
 

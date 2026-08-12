@@ -23,9 +23,12 @@ $Workspace = Join-Path $ProfileHome "workspace"
 $VerifyScript = Join-Path $PSScriptRoot "verify-employee.ps1"
 $ManifestPath = Join-Path $ProfileHome "provisioning-manifest.json"
 $NormalizedBaseUrl = $null
-$NoBaseUrlProviders = @("codex")
+$NoBaseUrlProviders = @("openai-codex")
 
 function Assert-Parameters {
+    if ($Provider -ceq "codex") {
+        $script:Provider = "openai-codex"
+    }
     if ($ProfileId -notmatch '^[a-z0-9]+(?:-[a-z0-9]+)*$') {
         throw "Invalid Profile ID format."
     }
