@@ -184,8 +184,16 @@ try {
 
     Copy-Item -LiteralPath $SourceSoul -Destination (Join-Path $ProfileHome "SOUL.md") -Force
     $SkillDestinationRoot = Join-Path $ProfileHome "skills"
-    [void](New-Item -ItemType Directory -Path $SkillDestinationRoot -Force)
-    Copy-Item -LiteralPath $SourceSkill -Destination $SkillDestinationRoot -Recurse -Force
+    $SkillDestination = Join-Path $SkillDestinationRoot "etsy-performance-listing"
+    $ReferenceDestination = Join-Path $SkillDestination "references"
+    $ScriptDestination = Join-Path $SkillDestination "scripts"
+    [void](New-Item -ItemType Directory -Path $ReferenceDestination -Force)
+    [void](New-Item -ItemType Directory -Path $ScriptDestination -Force)
+    Copy-Item -LiteralPath (Join-Path $SourceSkill "SKILL.md") -Destination (Join-Path $SkillDestination "SKILL.md") -Force
+    Copy-Item -LiteralPath (Join-Path $SourceSkill "references\output-contract.md") -Destination (Join-Path $ReferenceDestination "output-contract.md") -Force
+    foreach ($ScriptName in @("inspect_workbook.py", "run_task.py", "validate_output.py", "write_workbook.py")) {
+        Copy-Item -LiteralPath (Join-Path $SourceSkill "scripts\$ScriptName") -Destination (Join-Path $ScriptDestination $ScriptName) -Force
+    }
 
     # Hermes v0.18.2 `config set` has no stdin-only value mode. Passing a key as
     # a native-process argument exposes it to process inspection, so this script

@@ -349,6 +349,9 @@ def test_provisioner_encodes_isolation_and_safe_secret_handling() -> None:
     assert "manual recovery" in lowered
     assert '& $VerifyScript -HermesCommand $HermesCommand' in script
     assert MANIFEST_NAME in script
+    assert 'Copy-Item -LiteralPath $SourceSkill -Destination $SkillDestinationRoot -Recurse' not in script
+    for script_name in ("inspect_workbook.py", "run_task.py", "validate_output.py", "write_workbook.py"):
+        assert script_name in script
     assert "assetHashes" in script and "defaultBaseline" in script
     assert "keyConfigured" in script
     assert 'ValidateSet("minimal", "low", "medium", "high", "xhigh", "max", "ultra")' in script
@@ -375,6 +378,7 @@ def test_verifier_is_read_only_and_checks_isolation() -> None:
     assert "gateway" in lowered
     assert "BaselinePath" in script and "Get-FileHash" in script
     assert "ManifestPath" in script and MANIFEST_NAME in script
+    assert "PSObject.Properties" in script
     assert "InitialProvision" in script
     for safe_model_field in (
         "model.provider",
@@ -392,6 +396,25 @@ def test_verifier_is_read_only_and_checks_isolation() -> None:
     assert "Remove-Item" not in script
     assert "Invoke-Expression" not in script
     assert "--yolo" not in lowered
+
+
+def test_verifier_reports_old_manifest_missing_script_hashes_without_strictmode_crash(tmp_path: Path) -> None:
+    hermes_home, profile_home, fake_hermes, values = create_verifier_fixture(tmp_path)
+    manifest_path = profile_home / MANIFEST_NAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["assetHashes"] = {
+        key: value for key, value in manifest["assetHashes"].items() if "/scripts/" not in key
+    }
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    write_fake_hermes(fake_hermes, values)
+
+    result = run_verifier(hermes_home, fake_hermes)
+
+    assert result.returncode == 1
+    combined = result.stdout + result.stderr
+    assert "Employee asset hash missing" in combined
+    assert "PropertyNotFoundStrict" not in combined
+    assert "property" not in combined.casefold() or "missing" in combined.casefold()
 
 
 @pytest.mark.parametrize("path", [PROVISION_PATH, VERIFY_PATH])

@@ -89,6 +89,9 @@ def write_workbook(
     output_dir: str | Path,
     manifest: dict[str, Any],
     row_results: dict[str, dict[str, Any]],
+    *,
+    rules: dict[str, Any],
+    expected_rule_version: str,
 ) -> dict[str, Any]:
     source = Path(source_path).resolve(strict=True)
     destination_dir = Path(output_dir).resolve()
@@ -96,6 +99,13 @@ def write_workbook(
         raise WorkbookWriteError("unsupported_workbook_type", "Only .xlsx workbooks are supported.")
     if _sha256(source) != manifest.get("source_sha256"):
         raise WorkbookWriteError("source_hash_mismatch", "The source workbook changed after inspection.")
+    if not isinstance(expected_rule_version, str) or not expected_rule_version.strip():
+        raise WorkbookWriteError("invalid_rules", "An expected rule version is required.")
+    active_rules = dict(rules)
+    configured_version = active_rules.get("rule_version")
+    if configured_version is not None and configured_version != expected_rule_version:
+        raise WorkbookWriteError("invalid_rules", "The configured and expected rule versions do not match.")
+    active_rules["rule_version"] = expected_rule_version
     destination_dir.mkdir(parents=True, exist_ok=True)
     final = destination_dir / f"{source.stem}-generated-{manifest['source_sha256'][:12]}.xlsx"
     if final.exists():
@@ -103,23 +113,48 @@ def write_workbook(
     rows = manifest.get("rows")
     if not isinstance(rows, list):
         raise WorkbookWriteError("manifest_mismatch", "The manifest row list is invalid.")
-    manifest_rows = {item.get("row_id"): item for item in rows if isinstance(item, dict)}
+    row_ids = [item.get("row_id") for item in rows if isinstance(item, dict)]
+    row_numbers = [item.get("row_number") for item in rows if isinstance(item, dict)]
+    if len(row_ids) != len(rows) or len(set(row_ids)) != len(row_ids) or len(set(row_numbers)) != len(row_numbers):
+        raise WorkbookWriteError("manifest_mismatch", "The manifest contains duplicate or invalid row identities.")
+    manifest_rows = {item["row_id"]: item for item in rows}
     if not set(row_results).issubset(manifest_rows):
         raise WorkbookWriteError("unknown_row", "A generated result does not belong to this manifest.")
+    validator = _load_sibling("validate_output")
+    validated_results: dict[str, dict[str, Any]] = {}
+    for row_id, result in row_results.items():
+        try:
+            validated_results[row_id] = validator.validate_generated(result, active_rules)
+        except validator.OutputValidationError as exc:
+            raise WorkbookWriteError("invalid_result", "A generated result failed strict output validation.", details=exc.as_dict()["error"]["details"]) from exc
     temp_path: Path | None = None
     try:
         fd, temp_name = tempfile.mkstemp(prefix=".listing-", suffix=".xlsx", dir=destination_dir)
         os.close(fd)
         temp_path = Path(temp_name)
         shutil.copyfile(source, temp_path)
+        if _sha256(temp_path) != manifest.get("source_sha256"):
+            raise WorkbookWriteError("copy_hash_mismatch", "The temporary workbook copy does not match the inspected source.")
+        inspect = _load_sibling("inspect_workbook")
+        with tempfile.TemporaryDirectory(prefix="listing-reinspect-", dir=destination_dir) as reinspection_dir:
+            derived = inspect.inspect_workbook(temp_path, reinspection_dir)
+        identity_keys = ("row_id", "row_number", "context_hash", "context", "candidate_fields")
+        if derived.get("sheet") != manifest.get("sheet") or derived.get("header_row") != manifest.get("header_row") or derived.get("output_columns") != manifest.get("output_columns"):
+            raise WorkbookWriteError("manifest_mismatch", "The manifest header binding does not match the copied workbook.")
+        derived_rows = derived.get("rows", [])
+        if len(derived_rows) != len(rows):
+            raise WorkbookWriteError("manifest_mismatch", "The manifest row set does not match the copied workbook.")
+        for expected, actual in zip(rows, derived_rows, strict=True):
+            if any(expected.get(key) != actual.get(key) for key in identity_keys):
+                raise WorkbookWriteError("manifest_mismatch", "A manifest row identity or context does not match the copied workbook.")
         workbook = load_workbook(temp_path, data_only=False, keep_links=True, read_only=False)
         ws, columns = _validate_manifest_mapping(workbook, manifest)
         changed: list[str] = []
-        for row_id in sorted(row_results):
+        for row_id in sorted(validated_results):
             row_number = manifest_rows[row_id].get("row_number")
             if not isinstance(row_number, int) or row_number <= manifest["header_row"]:
                 raise WorkbookWriteError("manifest_mismatch", "The manifest contains an invalid product row.")
-            result = row_results[row_id]
+            result = validated_results[row_id]
             for header, key in HEADER_TO_KEY.items():
                 if key not in result:
                     raise WorkbookWriteError("invalid_result", f"The generated result is missing {key}.")
@@ -150,6 +185,8 @@ def main() -> int:
     parser.add_argument("output_dir")
     parser.add_argument("manifest")
     parser.add_argument("results")
+    parser.add_argument("--rules", required=True)
+    parser.add_argument("--expected-rule-version", required=True)
     args = parser.parse_args()
     try:
         report = write_workbook(
@@ -157,6 +194,8 @@ def main() -> int:
             args.output_dir,
             json.loads(Path(args.manifest).read_text(encoding="utf-8")),
             json.loads(Path(args.results).read_text(encoding="utf-8")),
+            rules=json.loads(Path(args.rules).read_text(encoding="utf-8")),
+            expected_rule_version=args.expected_rule_version,
         )
         print(json.dumps(report, ensure_ascii=False))
         return 0

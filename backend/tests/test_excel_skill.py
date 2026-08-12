@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import shutil
 import subprocess
 from io import BytesIO
 from pathlib import Path
@@ -15,6 +16,7 @@ from openpyxl.styles import PatternFill
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = ROOT / "employee" / "skills" / "etsy-performance-listing" / "scripts"
+FIXTURE = Path(__file__).parent / "fixtures" / "performance-listing-template.xlsx"
 HEADERS = (
     "head titles",
     "13 tags",
@@ -100,6 +102,12 @@ def sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def copy_fixture(tmp_path: Path) -> Path:
+    destination = tmp_path / "performance-listing-template.xlsx"
+    shutil.copyfile(FIXTURE, destination)
+    return destination
+
+
 def test_inspection_finds_moved_headers_isolates_rows_and_filters_internal_fields(tmp_path: Path, excel_modules) -> None:
     inspect, _, _, _ = excel_modules
     path = make_book(
@@ -126,6 +134,19 @@ def test_inspection_finds_moved_headers_isolates_rows_and_filters_internal_field
     wb.save(path)
     semantic_manifest = inspect.inspect_workbook(path, tmp_path / "operation-semantic")
     assert "Costume style" in {field["header"] for field in semantic_manifest["rows"][0]["candidate_fields"]}
+
+
+def test_tracked_fixture_contains_instruction_two_products_and_two_images(tmp_path: Path, excel_modules) -> None:
+    inspect, _, _, _ = excel_modules
+    source = copy_fixture(tmp_path)
+    manifest = inspect.inspect_workbook(source, tmp_path / "operation")
+
+    assert FIXTURE.is_file()
+    assert [row["row_number"] for row in manifest["rows"]] == [5, 6]
+    assert sum(len(row["image_paths"]) for row in manifest["rows"]) == 2
+    workbook = load_workbook(source, data_only=False)
+    assert workbook["Products"]["D10"].value == "=1+1"
+    assert workbook["Products"]["B5"].hyperlink.target == "https://example.invalid/synthetic-product"
 
 
 def test_inspection_extracts_multiple_embedded_images_with_generated_names(tmp_path: Path, excel_modules) -> None:
@@ -222,13 +243,20 @@ def test_validation_is_strict_configurable_and_blocks_excel_injection(excel_modu
 
 def test_writer_preserves_workbook_and_changes_only_five_target_cells(tmp_path: Path, excel_modules) -> None:
     inspect, _, writer, _ = excel_modules
-    source = make_book(tmp_path / "source.xlsx", image_rows=(5,))
+    source = copy_fixture(tmp_path)
     before_hash = sha(source)
     manifest = inspect.inspect_workbook(source, tmp_path / "operation")
     before = load_workbook(source, data_only=False)
     result = valid_result()
 
-    report = writer.write_workbook(source, tmp_path / "out", manifest, {manifest["rows"][0]["row_id"]: result})
+    report = writer.write_workbook(
+        source,
+        tmp_path / "out",
+        manifest,
+        {manifest["rows"][0]["row_id"]: result},
+        rules={"rule_version": "rules-v1"},
+        expected_rule_version="rules-v1",
+    )
 
     output = Path(report["output_path"])
     assert source.is_file() and sha(source) == before_hash and output != source
@@ -236,10 +264,25 @@ def test_writer_preserves_workbook_and_changes_only_five_target_cells(tmp_path: 
     assert after["Products"]["D10"].value == "=1+1"
     assert after["Products"]["B5"].hyperlink.target == before["Products"]["B5"].hyperlink.target
     assert after["Products"]["B5"].fill.fgColor.rgb == before["Products"]["B5"].fill.fgColor.rgb
-    assert len(after["Products"]._images) == 1
+    assert len(after["Products"]._images) == 2
     assert len(report["changed_cells"]) == 5
     assert report["changed_cells"] == sorted(report["changed_cells"])
     assert report["output_sha256"] == sha(output)
+
+    target_cells = set(report["changed_cells"])
+    for sheet_name in before.sheetnames:
+        before_sheet = before[sheet_name]
+        after_sheet = after[sheet_name]
+        assert before_sheet.max_row == after_sheet.max_row
+        assert before_sheet.max_column == after_sheet.max_column
+        for row in before_sheet.iter_rows():
+            for cell in row:
+                address = f"{sheet_name}!{cell.coordinate}"
+                if address not in target_cells:
+                    peer = after_sheet[cell.coordinate]
+                    assert peer.value == cell.value, address
+                    assert peer.style_id == cell.style_id, address
+                    assert (peer.hyperlink.target if peer.hyperlink else None) == (cell.hyperlink.target if cell.hyperlink else None), address
 
 
 def test_writer_is_atomic_on_manifest_or_existing_destination_failure(tmp_path: Path, excel_modules) -> None:
@@ -249,8 +292,63 @@ def test_writer_is_atomic_on_manifest_or_existing_destination_failure(tmp_path: 
     manifest["source_sha256"] = "0" * 64
     out = tmp_path / "out"
     with pytest.raises(writer.WorkbookWriteError):
-        writer.write_workbook(source, out, manifest, {})
+        writer.write_workbook(source, out, manifest, {}, rules={"rule_version": "rules-v1"}, expected_rule_version="rules-v1")
     assert not out.exists() or not list(out.glob("*.xlsx"))
+
+
+def test_writer_checks_temporary_copy_hash_before_opening(tmp_path: Path, excel_modules, monkeypatch) -> None:
+    inspect, _, writer, _ = excel_modules
+    source = copy_fixture(tmp_path)
+    manifest = inspect.inspect_workbook(source, tmp_path / "operation")
+
+    def corrupt_copy(source_path, destination_path):
+        Path(destination_path).write_bytes(b"not the inspected workbook")
+
+    monkeypatch.setattr(writer.shutil, "copyfile", corrupt_copy)
+    with pytest.raises(writer.WorkbookWriteError) as raised:
+        writer.write_workbook(source, tmp_path / "out", manifest, {}, rules={"rule_version": "rules-v1"}, expected_rule_version="rules-v1")
+    assert raised.value.code == "copy_hash_mismatch"
+    assert not list((tmp_path / "out").glob("*.xlsx"))
+
+
+@pytest.mark.parametrize("tamper", ["row_id", "row_number", "candidate_fields", "context_hash", "duplicate"])
+def test_writer_rejects_tampered_or_duplicate_manifest_rows(tmp_path: Path, excel_modules, tamper: str) -> None:
+    inspect, _, writer, _ = excel_modules
+    source = copy_fixture(tmp_path)
+    manifest = inspect.inspect_workbook(source, tmp_path / "operation")
+    row = manifest["rows"][0]
+    if tamper == "row_id":
+        row["row_id"] = "f" * 64
+    elif tamper == "row_number":
+        row["row_number"] = 6
+    elif tamper == "candidate_fields":
+        row["candidate_fields"][0]["value"] = "TAMPERED"
+    elif tamper == "context_hash":
+        row["context_hash"] = "0" * 64
+    else:
+        manifest["rows"].append(dict(row))
+
+    with pytest.raises(writer.WorkbookWriteError) as raised:
+        writer.write_workbook(source, tmp_path / "out", manifest, {}, rules={"rule_version": "rules-v1"}, expected_rule_version="rules-v1")
+    assert raised.value.code == "manifest_mismatch"
+
+
+def test_writer_strictly_validates_results_and_expected_rule_version(tmp_path: Path, excel_modules) -> None:
+    inspect, _, writer, _ = excel_modules
+    source = copy_fixture(tmp_path)
+    manifest = inspect.inspect_workbook(source, tmp_path / "operation")
+    row_id = manifest["rows"][0]["row_id"]
+    invalid = valid_result()
+    invalid["extra"] = "forbidden"
+    with pytest.raises(writer.WorkbookWriteError) as raised:
+        writer.write_workbook(source, tmp_path / "out", manifest, {row_id: invalid}, rules={"rule_version": "rules-v1"}, expected_rule_version="rules-v1")
+    assert raised.value.code == "invalid_result"
+
+    wrong_version = valid_result()
+    wrong_version["rule_version"] = "rules-old"
+    with pytest.raises(writer.WorkbookWriteError) as raised:
+        writer.write_workbook(source, tmp_path / "out-2", manifest, {row_id: wrong_version}, rules={"rule_version": "rules-v1"}, expected_rule_version="rules-v1")
+    assert raised.value.code == "invalid_result"
 
 
 class FakeHermes:
@@ -293,7 +391,7 @@ def test_run_task_retries_malformed_json_keeps_rows_isolated_and_uses_one_image(
         source,
         tmp_path / "job",
         knowledge_path=knowledge,
-        rules={"tag_count": 13},
+        rules={"tag_count": 13, "rule_version": "rules-v1"},
         command_runner=fake,
         emit=events.append,
     )
@@ -312,6 +410,13 @@ def test_run_task_retries_malformed_json_keeps_rows_isolated_and_uses_one_image(
         assert "competitor.invalid" not in prompt
         assert "INACTIVE SECRET" not in prompt
         assert "Use occasion-specific words." in prompt
+        assert '"type":"object"' in prompt
+        assert '"additionalProperties":false' in prompt
+        assert '"confidence":{"type":"number","minimum":0,"maximum":1}' in prompt
+        assert '"minItems":13,"maxItems":13' in prompt
+        assert '"const":"rules-v1"' in prompt
+        assert '"pattern":"^(?![=+@-])"' in prompt
+        assert '"maxLength":20' in prompt
     assert "SKU-2" not in fake.calls[0][1] and "SKU-1" not in fake.calls[-1][1]
 
 
@@ -321,20 +426,41 @@ def test_run_task_emits_row_failure_and_leaves_no_partial_output(tmp_path: Path,
     fake = FakeHermes(["bad", "still bad"])
     events: list[dict[str, object]] = []
     with pytest.raises(run.TaskError):
-        run.run_task(source, tmp_path / "job", knowledge_path=None, rules={}, command_runner=fake, emit=events.append)
+        run.run_task(source, tmp_path / "job", knowledge_path=None, rules={"rule_version": "rules-v1"}, command_runner=fake, emit=events.append)
     assert [event["event"] for event in events][-2:] == ["row_failed", "failed"]
     assert not list((tmp_path / "job").glob("*.xlsx"))
 
 
-def test_run_task_does_not_retry_well_formed_but_invalid_output(tmp_path: Path, excel_modules) -> None:
+def test_run_task_repairs_well_formed_but_invalid_output_once(tmp_path: Path, excel_modules) -> None:
     _, _, _, run = excel_modules
     source = make_book(tmp_path / "source.xlsx")
     invalid = valid_result()
     invalid["head_titles"] = "=unsafe"
     fake = FakeHermes([json.dumps(invalid), json.dumps(valid_result())])
 
-    with pytest.raises(run.TaskError) as raised:
-        run.run_task(source, tmp_path / "job", knowledge_path=None, rules={}, command_runner=fake, emit=lambda event: None)
+    report = run.run_task(source, tmp_path / "job", knowledge_path=None, rules={"rule_version": "rules-v1"}, command_runner=fake, emit=lambda event: None)
 
+    assert Path(report["output_path"]).is_file()
+    assert len(fake.calls) == 2
+    assert "head_titles" in fake.calls[1][1]
+    assert "formula prefix" in fake.calls[1][1]
+    assert "SECRET" not in fake.calls[1][1]
+
+
+def test_run_task_limits_schema_repair_to_one_retry(tmp_path: Path, excel_modules) -> None:
+    _, _, _, run = excel_modules
+    source = make_book(tmp_path / "source.xlsx")
+    invalid = valid_result()
+    invalid["head_titles"] = "=unsafe"
+    fake = FakeHermes([json.dumps(invalid), json.dumps(invalid), json.dumps(valid_result())])
+    with pytest.raises(run.TaskError) as raised:
+        run.run_task(source, tmp_path / "job", knowledge_path=None, rules={"rule_version": "rules-v1"}, command_runner=fake, emit=lambda event: None)
     assert raised.value.code == "invalid_model_output"
-    assert len(fake.calls) == 1
+    assert len(fake.calls) == 2
+
+
+def test_product_note_containing_instruction_or_template_is_not_instruction_row(tmp_path: Path, excel_modules) -> None:
+    inspect, _, _, _ = excel_modules
+    source = make_book(tmp_path / "product-note.xlsx", rows=(("SKU-1", "Costume instruction card and template-inspired print", 10, "air"),))
+    manifest = inspect.inspect_workbook(source, tmp_path / "operation")
+    assert [row["row_number"] for row in manifest["rows"]] == [5]

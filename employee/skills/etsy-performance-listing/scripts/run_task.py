@@ -11,6 +11,28 @@ from typing import Any, Callable
 
 PROFILE = "etsy-performance-us"
 MAX_TURNS = 6
+OUTPUT_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": [
+        "head_titles", "tags", "specification", "category", "instructions_for_buyers",
+        "confidence", "fact_warnings", "quality_warnings", "rule_version",
+    ],
+    "properties": {
+        "head_titles": {"type": "string", "minLength": 1},
+        "tags": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": True},
+        "specification": {"type": "string", "minLength": 1},
+        "category": {"type": "string", "minLength": 1},
+        "instructions_for_buyers": {"type": "string", "minLength": 1},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "fact_warnings": {"type": "array", "items": {"type": "string"}},
+        "quality_warnings": {"type": "array", "items": {"type": "string"}},
+        "rule_version": {"type": "string", "minLength": 1},
+    },
+}
+for _text_field in ("head_titles", "specification", "category", "instructions_for_buyers", "rule_version"):
+    OUTPUT_SCHEMA["properties"][_text_field]["pattern"] = "^(?![=+@-])"
+OUTPUT_SCHEMA["properties"]["tags"]["items"]["pattern"] = "^(?![=+@-])"
 
 
 class TaskError(RuntimeError):
@@ -66,15 +88,28 @@ def _safe_knowledge(path: str | Path | None) -> Any:
     return safe_entries
 
 
-def _prompt(row: dict[str, Any], knowledge: Any, rules: dict[str, Any], retry: bool) -> str:
+def _prompt(row: dict[str, Any], knowledge: Any, rules: dict[str, Any], repair_error: dict[str, Any] | None) -> str:
+    schema = json.loads(json.dumps(OUTPUT_SCHEMA))
+    tag_count = rules.get("tag_count", 13)
+    tag_max_chars = rules.get("tag_max_chars", 20)
+    if isinstance(tag_count, int) and not isinstance(tag_count, bool) and tag_count > 0:
+        schema["properties"]["tags"].update({"minItems": tag_count, "maxItems": tag_count})
+    if isinstance(tag_max_chars, int) and not isinstance(tag_max_chars, bool) and tag_max_chars > 0:
+        schema["properties"]["tags"]["items"]["maxLength"] = tag_max_chars
+    rule_version = rules.get("rule_version")
+    if isinstance(rule_version, str) and rule_version:
+        schema["properties"]["rule_version"]["const"] = rule_version
     envelope = {
         "candidate_fields": row["candidate_fields"],
         "image_count": len(row.get("image_paths", [])),
         "row_warnings": row.get("warnings", []),
         "active_abstract_knowledge": knowledge,
         "rules": rules,
+        "output_json_schema": schema,
     }
-    retry_text = "Your prior response was malformed. " if retry else ""
+    if repair_error is not None:
+        envelope["repair_validation_error"] = repair_error
+    retry_text = "Repair your prior response using the validation error below. " if repair_error else ""
     return (
         retry_text
         + "Generate an original Etsy US listing for exactly this isolated row. "
@@ -91,11 +126,15 @@ def _parse_and_validate(text: str, rules: dict[str, Any]) -> dict[str, Any]:
     try:
         payload = json.loads(text)
     except json.JSONDecodeError as exc:
-        raise TaskError("malformed_model_json", "The employee returned malformed JSON.") from exc
+        error = TaskError("malformed_model_json", "The employee returned malformed JSON.")
+        error.repair_details = {"code": error.code, "message": "Response is not valid JSON."}
+        raise error from exc
     try:
         return validator.validate_generated(payload, rules)
     except validator.OutputValidationError as exc:
-        raise TaskError("invalid_model_output", "The employee returned output that did not satisfy the active rules.") from exc
+        error = TaskError("invalid_model_output", "The employee returned output that did not satisfy the active rules.")
+        error.repair_details = {"code": error.code, "issues": exc.issues}
+        raise error from exc
 
 
 def _invoke_row(row: dict[str, Any], knowledge: Any, rules: dict[str, Any], runner: Callable[[list[str], str], subprocess.CompletedProcess[str]]) -> dict[str, Any]:
@@ -104,8 +143,9 @@ def _invoke_row(row: dict[str, Any], knowledge: Any, rules: dict[str, Any], runn
     if images:
         command.extend(["--image", str(Path(images[0]).resolve())])
     last_error: TaskError | None = None
+    repair_error: dict[str, Any] | None = None
     for attempt in range(2):
-        prompt = _prompt(row, knowledge, rules, retry=attempt > 0)
+        prompt = _prompt(row, knowledge, rules, repair_error=repair_error)
         invocation = [*command, "-q", prompt]
         try:
             process = runner(invocation, prompt)
@@ -117,8 +157,7 @@ def _invoke_row(row: dict[str, Any], knowledge: Any, rules: dict[str, Any], runn
             return _parse_and_validate(process.stdout.strip(), rules)
         except TaskError as exc:
             last_error = exc
-            if exc.code != "malformed_model_json":
-                raise
+            repair_error = getattr(exc, "repair_details", {"code": exc.code})
     assert last_error is not None
     raise last_error
 
@@ -154,7 +193,10 @@ def run_task(
                 emit({"event": "row_failed", "row_id": row_id, "error": {"code": exc.code, "message": str(exc)}})
                 raise
             emit({"event": "row_completed", "row_id": row_id, "row_number": row["row_number"]})
-        report = writer.write_workbook(source_path, operation, manifest, results)
+        expected_rule_version = rules.get("rule_version")
+        if not isinstance(expected_rule_version, str) or not expected_rule_version.strip():
+            raise TaskError("invalid_rules", "Rules must include a non-empty rule_version.")
+        report = writer.write_workbook(source_path, operation, manifest, results, rules=rules, expected_rule_version=expected_rule_version)
         emit({"event": "completed", "output_path": report["output_path"], "output_sha256": report["output_sha256"]})
         return report
     except Exception as exc:

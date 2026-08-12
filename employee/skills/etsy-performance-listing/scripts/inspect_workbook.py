@@ -176,12 +176,15 @@ def _is_internal(header: object) -> bool:
     return False
 
 
-def _is_instruction_only(values: list[Any]) -> bool:
-    texts = [normalize_header(value) for value in values if value not in (None, "")]
+def _is_instruction_only(fields: list[dict[str, Any]]) -> bool:
+    texts = [normalize_header(field.get("value")) for field in fields if field.get("value") not in (None, "")]
     if not texts:
         return True
     combined = " ".join(texts).casefold()
-    return any(marker in combined for marker in _INSTRUCTION_MARKERS)
+    first = texts[0].casefold()
+    strong_phrase = any(marker in combined for marker in ("please fill", "fill in", "do not edit", "example only", "请填", "填写", "勿改"))
+    explicit_label = first in {"instruction", "instructions", "说明", "模板", "示例"}
+    return strong_phrase and explicit_label
 
 
 def _extract_images(ws, product_rows: set[int], operation_dir: Path) -> dict[int, list[str]]:
@@ -239,11 +242,12 @@ def inspect_workbook(source_path: str | Path, operation_dir: str | Path) -> dict
             if _is_internal(header):
                 continue
             candidate_fields.append({"header": normalize_header(header), "value": _json_value(cell.value), "type": _cell_type(cell)})
-        if not meaningful or not candidate_fields or _is_instruction_only(meaningful):
+        if not meaningful or not candidate_fields or _is_instruction_only(candidate_fields):
             continue
         context = json.dumps(candidate_fields, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        row_id = hashlib.sha256(f"{source_sha}:{ws.title}:{row_no}:{context}".encode("utf-8")).hexdigest()
-        rows.append({"row_id": row_id, "row_number": row_no, "candidate_fields": candidate_fields, "image_paths": [], "warnings": []})
+        context_hash = hashlib.sha256(context.encode("utf-8")).hexdigest()
+        row_id = hashlib.sha256(f"{source_sha}:{ws.title}:{row_no}:{context_hash}".encode("utf-8")).hexdigest()
+        rows.append({"row_id": row_id, "row_number": row_no, "context_hash": context_hash, "context": context, "candidate_fields": candidate_fields, "image_paths": [], "warnings": []})
     images = _extract_images(ws, {item["row_number"] for item in rows}, operation)
     for item in rows:
         item["image_paths"] = images[item["row_number"]]

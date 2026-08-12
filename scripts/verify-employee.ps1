@@ -151,7 +151,12 @@ function Test-AssetIsolation {
         $RepositoryAssetPath = Join-Path $RepositoryRoot $AssetPaths[$RelativePath]
         $ProfileHash = Get-FileHashOrMissing -Path $ProfileAssetPath
         $RepositoryHash = Get-FileHashOrMissing -Path $RepositoryAssetPath
-        $ManifestHash = [string]$Manifest.assetHashes.$RelativePath
+        $ManifestProperty = $Manifest.assetHashes.PSObject.Properties[$RelativePath]
+        if ($null -eq $ManifestProperty) {
+            Add-Failure "Employee asset hash missing for $RelativePath."
+            continue
+        }
+        $ManifestHash = [string]$ManifestProperty.Value
         if ($ProfileHash -eq "NOT_FOUND" -or $RepositoryHash -eq "NOT_FOUND" -or
             $ProfileHash -ne $RepositoryHash -or $ProfileHash -ne $ManifestHash) {
             Add-Failure "Employee asset hash mismatch for $RelativePath."
