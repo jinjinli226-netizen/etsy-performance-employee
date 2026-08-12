@@ -240,3 +240,61 @@ def test_session_scope_rolls_back_failed_transaction(session_factory) -> None:
 
     with session_factory() as session:
         assert session.query(Conversation).filter_by(title="Rolled back").count() == 0
+
+
+def test_init_db_migrates_task2_sqlite_schema_and_preserves_data(tmp_path) -> None:
+    engine = create_engine_for_url(f"sqlite:///{tmp_path / 'task2.db'}")
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "CREATE TABLE conversations ("
+                    "id INTEGER PRIMARY KEY, title VARCHAR(255) NOT NULL, "
+                    "created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL)"
+                )
+            )
+            connection.execute(
+                text(
+                    "CREATE TABLE messages ("
+                    "id INTEGER PRIMARY KEY, conversation_id INTEGER NOT NULL, "
+                    "role VARCHAR(9) NOT NULL, content TEXT NOT NULL, created_at DATETIME NOT NULL, "
+                    "FOREIGN KEY(conversation_id) REFERENCES conversations(id) ON DELETE CASCADE)"
+                )
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO conversations VALUES "
+                    "(1, 'Old conversation', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+                )
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO messages VALUES "
+                    "(1, 1, 'user', 'Preserve me', CURRENT_TIMESTAMP)"
+                )
+            )
+
+        init_db(engine)
+        init_db(engine)
+        factory = create_session_factory(engine)
+        with factory() as session:
+            conversation = session.get(Conversation, 1)
+            message = session.get(Message, 1)
+            assert conversation is not None
+            assert conversation.title == "Old conversation"
+            assert conversation.employee_session_id is None
+            assert message is not None
+            assert message.content == "Preserve me"
+            assert message.operation_id is None
+            assert message.operation_status is None
+
+        with engine.connect() as connection:
+            assert connection.execute(
+                text("SELECT version FROM schema_migrations ORDER BY version")
+            ).scalars().all() == [1]
+            index_names = {
+                row[1] for row in connection.execute(text("PRAGMA index_list('messages')"))
+            }
+            assert "ix_messages_operation_id" in index_names
+    finally:
+        engine.dispose()

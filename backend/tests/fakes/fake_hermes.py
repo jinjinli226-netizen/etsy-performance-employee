@@ -11,11 +11,13 @@ class FakeProcess:
         stderr: bytes = b"\nsession_id: fake-session-1\n",
         returncode: int = 0,
         wait_forever: bool = False,
+        pid: int = 4321,
     ) -> None:
         self._stdout = stdout
         self._stderr = stderr
         self.returncode = None if wait_forever else returncode
         self.wait_forever = wait_forever
+        self.pid = pid
         self.terminated = False
         self.killed = False
         self._released = asyncio.Event()

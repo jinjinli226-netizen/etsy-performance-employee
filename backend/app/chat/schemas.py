@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from enum import StrEnum
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class MessageRole(StrEnum):
@@ -27,6 +27,13 @@ class MessageRead(MessageCreate):
 
 class ConversationCreate(BaseModel):
     title: str = Field(min_length=1, max_length=255)
+
+    @field_validator("title")
+    @classmethod
+    def reject_blank_title(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("title cannot be blank")
+        return value
 
 
 class ConversationRead(ConversationCreate):

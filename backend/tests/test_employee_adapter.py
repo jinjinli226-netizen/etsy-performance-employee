@@ -30,6 +30,7 @@ def adapter(tmp_path: Path, *, timeout: float = 1) -> SubprocessHermesAdapter:
         data_root=tmp_path,
         max_turns=7,
         profiles_root=tmp_path / "profiles",
+        platform_name="linux",
     )
 
 
@@ -240,3 +241,41 @@ async def test_cancellation_terminates_child_and_propagates_typed_cancel(tmp_pat
     with pytest.raises(HermesCancelledError):
         await task
     assert process.terminated
+
+
+@pytest.mark.anyio
+async def test_windows_cleanup_uses_exact_owned_pid_tree_command(tmp_path, monkeypatch) -> None:
+    parent = FakeProcess(wait_forever=True, pid=8765)
+    taskkill = FakeProcess()
+    captured = {}
+
+    async def fake_exec(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        parent.returncode = -9
+        parent._released.set()
+        return taskkill
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    await SubprocessHermesAdapter._stop(parent, platform_name="win32")
+
+    assert captured["args"] == ("taskkill.exe", "/PID", "8765", "/T", "/F")
+    assert "shell" not in captured["kwargs"]
+    assert not parent.terminated
+
+
+@pytest.mark.anyio
+async def test_windows_taskkill_failure_falls_back_to_parent_terminate(
+    tmp_path, monkeypatch
+) -> None:
+    parent = FakeProcess(wait_forever=True, pid=8765)
+
+    async def fake_exec(*args, **kwargs):
+        return FakeProcess(returncode=1)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    await SubprocessHermesAdapter._stop(parent, platform_name="win32")
+
+    assert parent.terminated

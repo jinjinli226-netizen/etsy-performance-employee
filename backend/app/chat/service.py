@@ -44,6 +44,7 @@ class ChatService:
         self.active_conversations: set[int] = set()
         self._guard = asyncio.Lock()
         self._tasks: set[asyncio.Task] = set()
+        self.operation_broker_limit = 100
 
     def create_conversation(self, title: str) -> Conversation:
         with self.session_factory() as session:
@@ -51,6 +52,35 @@ class ChatService:
             session.add(conversation)
             session.commit()
             return conversation
+
+    def reconcile_interrupted_operations(self) -> int:
+        """Mark operations left running by a previous process as failed, once."""
+        with self.session_factory() as session:
+            interrupted = list(
+                session.scalars(
+                    select(Message).where(
+                        Message.role == "user",
+                        Message.operation_id.is_not(None),
+                        Message.operation_status == "running",
+                    )
+                )
+            )
+            for message in interrupted:
+                message.operation_status = "failed"
+                session.add(
+                    Message(
+                        conversation_id=message.conversation_id,
+                        role="system",
+                        content=(
+                            "The app restarted before the employee completed the request. "
+                            "Please retry."
+                        ),
+                        operation_id=message.operation_id,
+                        operation_status="failed",
+                    )
+                )
+            session.commit()
+            return len(interrupted)
 
     def list_conversations(self, limit: int, offset: int) -> tuple[list[Conversation], int]:
         with self.session_factory() as session:
@@ -209,6 +239,19 @@ class ChatService:
         finally:
             self.active_conversations.discard(operation.conversation_id)
             operation.done.set()
+            self._evict_terminal_operations()
+
+    def _evict_terminal_operations(self) -> None:
+        overflow = len(self.operations) - self.operation_broker_limit
+        if overflow <= 0:
+            return
+        completed_ids = [
+            operation_id
+            for operation_id, stored in self.operations.items()
+            if stored.done.is_set()
+        ]
+        for operation_id in completed_ids[:overflow]:
+            self.operations.pop(operation_id, None)
 
     def _persist_terminal_failure(self, operation: Operation, *, status: str) -> None:
         """Persist and publish a terminal event without an await cancellation point."""
@@ -265,4 +308,7 @@ class ChatService:
         if operation.event is None:
             yield {"type": "progress", "status": "running", "operation_id": operation_id}
             await operation.done.wait()
-        yield operation.event
+        try:
+            yield operation.event
+        finally:
+            self.operations.pop(operation_id, None)

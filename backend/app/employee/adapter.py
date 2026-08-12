@@ -82,12 +82,14 @@ class SubprocessHermesAdapter:
         data_root: Path,
         max_turns: int = 12,
         profiles_root: Path | None = None,
+        platform_name: str | None = None,
     ) -> None:
         self.executable = executable
         self.profile = profile
         self.timeout_seconds = timeout_seconds
         self.data_root = data_root.resolve()
         self.max_turns = max_turns
+        self.platform_name = platform_name or sys.platform
         self.profiles_root = (
             profiles_root.resolve() if profiles_root else resolve_hermes_profiles_root()
         )
@@ -146,10 +148,10 @@ class SubprocessHermesAdapter:
                 process.communicate(), timeout=self.timeout_seconds
             )
         except TimeoutError as exc:
-            await self._stop(process)
+            await self._stop(process, platform_name=self.platform_name)
             raise HermesTimeoutError("The employee timed out; please retry.") from exc
         except asyncio.CancelledError as exc:
-            await self._stop(process)
+            await self._stop(process, platform_name=self.platform_name)
             raise HermesCancelledError("The employee request was cancelled.") from exc
 
         if process.returncode != 0:
@@ -162,9 +164,28 @@ class SubprocessHermesAdapter:
         return EmployeeReply(text=text, session_id=session_match.group(1))
 
     @staticmethod
-    async def _stop(process) -> None:
+    async def _stop(process, *, platform_name: str | None = None) -> None:
         if process.returncode is not None:
             return
+        if (platform_name or sys.platform).lower().startswith("win"):
+            try:
+                taskkill = await asyncio.create_subprocess_exec(
+                    "taskkill.exe",
+                    "/PID",
+                    str(process.pid),
+                    "/T",
+                    "/F",
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                if await taskkill.wait() == 0:
+                    try:
+                        await asyncio.wait_for(process.wait(), timeout=2)
+                        return
+                    except TimeoutError:
+                        pass
+            except OSError:
+                pass
         process.terminate()
         try:
             await asyncio.wait_for(process.wait(), timeout=2)

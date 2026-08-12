@@ -36,6 +36,7 @@ def create_app(
         app.state.engine = engine
         app.state.session_factory = factory
         app.state.chat_service = ChatService(factory, runtime_employee)
+        app.state.chat_service.reconcile_interrupted_operations()
         try:
             yield
         finally:

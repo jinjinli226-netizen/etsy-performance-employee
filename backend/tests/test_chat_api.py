@@ -9,6 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.core.config import Settings
+from app.db.models import Conversation, Message
 from app.employee.adapter import (
     EmployeeReply,
     EmployeeUnavailableError,
@@ -85,6 +86,14 @@ def test_create_list_and_get_empty_messages(api) -> None:
     assert messages.status_code == 200
     assert messages.json() == []
     assert client.get("/api/conversations/999/messages").status_code == 404
+
+
+def test_create_conversation_rejects_whitespace_only_title(api) -> None:
+    client, _, _ = api
+    response = client.post("/api/conversations", json={"title": "   \t"})
+
+    assert response.status_code == 422
+    assert client.get("/api/conversations").json()["total"] == 0
 
 
 def test_send_persists_messages_emits_final_and_resumes_session(api) -> None:
@@ -347,3 +356,72 @@ def test_real_adapter_preflight_returns_503_without_model_call(
 def test_missing_operation_is_404(api) -> None:
     client, _, _ = api
     assert client.get("/api/events/not-found").status_code == 404
+
+
+def test_startup_reconciles_running_operation_once_and_sse_replays(tmp_path) -> None:
+    settings = Settings(
+        data_dir=tmp_path / "data",
+        database_url=f"sqlite:///{tmp_path / 'interrupted.db'}",
+    )
+    first_app = create_app(settings=settings, employee=FakeHermes())
+    with TestClient(first_app) as client:
+        factory = client.app.state.session_factory
+        with factory() as session:
+            conversation = Conversation(title="Interrupted")
+            session.add(conversation)
+            session.flush()
+            session.add(
+                Message(
+                    conversation_id=conversation.id,
+                    role="user",
+                    content="unfinished",
+                    operation_id="interrupted-op",
+                    operation_status="running",
+                )
+            )
+            session.commit()
+
+    second_app = create_app(settings=settings, employee=FakeHermes())
+    with TestClient(second_app) as client:
+        events = wait_for_final(client, "interrupted-op")
+        assert events[-1]["status"] == "failed"
+        stored = client.get("/api/conversations/1/messages").json()
+        assert [(row["role"], row["content"]) for row in stored] == [
+            ("user", "unfinished"),
+            ("system", "The app restarted before the employee completed the request. Please retry."),
+        ]
+
+    third_app = create_app(settings=settings, employee=FakeHermes())
+    with TestClient(third_app) as client:
+        stored = client.get("/api/conversations/1/messages").json()
+        assert len(stored) == 2
+
+
+def test_completed_operation_is_evicted_from_broker_and_replays_from_db(api) -> None:
+    client, _, _ = api
+    conversation_id = create_conversation(client)
+    sent = client.post(
+        f"/api/conversations/{conversation_id}/messages", json={"content": "complete"}
+    )
+    operation_id = sent.json()["operation_id"]
+    assert wait_for_final(client, operation_id)[-1]["status"] == "completed"
+
+    assert operation_id not in client.app.state.chat_service.operations
+    assert wait_for_final(client, operation_id)[-1]["status"] == "completed"
+
+
+def test_unconsumed_terminal_operation_brokers_are_bounded(api) -> None:
+    client, _, _ = api
+    service = client.app.state.chat_service
+    service.operation_broker_limit = 2
+
+    for number in range(3):
+        conversation_id = create_conversation(client, f"Conversation {number}")
+        sent = client.post(
+            f"/api/conversations/{conversation_id}/messages",
+            json={"content": f"message {number}"},
+        )
+        assert sent.status_code == 202
+
+    client.get("/api/conversations")
+    assert len(service.operations) <= 2
