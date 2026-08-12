@@ -29,10 +29,28 @@ function Add-Failure {
 function Invoke-HermesCapture {
     param([Parameter(Mandatory = $true)][string[]]$Arguments)
 
-    $Lines = @(& $HermesCommand @Arguments 2>&1)
-    return [pscustomobject]@{
-        ExitCode = $LASTEXITCODE
-        Output = (($Lines | ForEach-Object { [string]$_ }) -join [Environment]::NewLine)
+    $PreviousErrorActionPreference = $ErrorActionPreference
+    $HadNativePreference = Test-Path Variable:PSNativeCommandUseErrorActionPreference
+    if ($HadNativePreference) {
+        $PreviousNativePreference = $PSNativeCommandUseErrorActionPreference
+    }
+    try {
+        $ErrorActionPreference = "Continue"
+        if ($HadNativePreference) {
+            $PSNativeCommandUseErrorActionPreference = $false
+        }
+        $Lines = @(& $HermesCommand @Arguments 2>&1)
+        $ExitCode = $LASTEXITCODE
+        return [pscustomobject]@{
+            ExitCode = $ExitCode
+            Output = (($Lines | ForEach-Object { [string]$_ }) -join [Environment]::NewLine)
+        }
+    }
+    finally {
+        $ErrorActionPreference = $PreviousErrorActionPreference
+        if ($HadNativePreference) {
+            $PSNativeCommandUseErrorActionPreference = $PreviousNativePreference
+        }
     }
 }
 

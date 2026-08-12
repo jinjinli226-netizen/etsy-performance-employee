@@ -136,6 +136,7 @@ def write_fake_hermes(
     provision_profile_home: Path | None = None,
     command_log: Path | None = None,
     missing_config_output: str | None = None,
+    missing_config_to_stderr: bool = False,
 ) -> None:
     escaped_values = ((key, value.replace("'", "''")) for key, value in values.items())
     literal_values = "\n".join(
@@ -170,6 +171,11 @@ def write_fake_hermes(
         log_block = f"Add-Content -LiteralPath '{escaped_log}' -Value ($args -join '|')\n"
     missing_output = missing_config_output or "Config key not set: model.base_url"
     escaped_missing_output = missing_output.replace("'", "''")
+    missing_output_command = f"Write-Output '{escaped_missing_output}'"
+    if missing_config_to_stderr:
+        missing_output_command = (
+            f"[Console]::Error.WriteLine('{escaped_missing_output}')"
+        )
     path.write_text(
         "$Values = @{\n"
         f"{literal_values}\n"
@@ -179,7 +185,7 @@ def write_fake_hermes(
         f"{doctor_block}"
         "$Key = $args[$args.Count - 1]\n"
         "if ($Values.ContainsKey($Key)) { Write-Output $Values[$Key]; exit 0 }\n"
-        f"Write-Output '{escaped_missing_output}'\n"
+        f"{missing_output_command}\n"
         "exit 1\n",
         encoding="utf-8-sig",
     )
@@ -832,6 +838,33 @@ def test_verifier_does_not_treat_arbitrary_config_get_failure_as_unset(
 
     assert result.returncode == 1
     assert "could not verify" in (result.stdout + result.stderr).lower()
+
+
+def test_verifier_captures_expected_unset_from_native_stderr(tmp_path: Path) -> None:
+    hermes_home, profile_home, _, values = create_verifier_fixture(tmp_path)
+    manifest_path = profile_home / MANIFEST_NAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest.update(
+        {"provider": "openai-codex", "baseUrl": None, "hasBaseUrl": False}
+    )
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    values["model.provider"] = "openai-codex"
+    values.pop("model.base_url")
+
+    delegate = tmp_path / "fake-hermes-delegate.ps1"
+    write_fake_hermes(delegate, values, missing_config_to_stderr=True)
+    native_wrapper = tmp_path / "fake-hermes.cmd"
+    native_wrapper.write_text(
+        "@echo off\n"
+        f'powershell.exe -NoProfile -NonInteractive -File "{delegate}" %*\n'
+        "exit /b %ERRORLEVEL%\n",
+        encoding="utf-8",
+    )
+
+    result = run_verifier(hermes_home, native_wrapper)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "NativeCommandError" not in (result.stdout + result.stderr)
 
 
 @pytest.mark.parametrize(
