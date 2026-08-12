@@ -6,11 +6,12 @@ from pathlib import Path
 import pytest
 
 from app.employee.adapter import (
-    SubprocessHermesAdapter,
+    EmployeeUnavailableError,
     HermesCancelledError,
     HermesMalformedReplyError,
     HermesProcessError,
     HermesTimeoutError,
+    SubprocessHermesAdapter,
 )
 from tests.fakes.fake_hermes import FakeProcess
 
@@ -27,7 +28,22 @@ def adapter(tmp_path: Path, *, timeout: float = 1) -> SubprocessHermesAdapter:
         timeout_seconds=timeout,
         data_root=tmp_path,
         max_turns=7,
+        profiles_root=tmp_path / "profiles",
     )
+
+
+def test_check_available_rejects_missing_executable(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("shutil.which", lambda executable: None)
+
+    with pytest.raises(EmployeeUnavailableError, match="unavailable"):
+        adapter(tmp_path).check_available()
+
+
+def test_check_available_rejects_missing_profile(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("shutil.which", lambda executable: str(tmp_path / "hermes.exe"))
+
+    with pytest.raises(EmployeeUnavailableError, match="profile"):
+        adapter(tmp_path).check_available()
 
 
 @pytest.mark.anyio

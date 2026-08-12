@@ -24,6 +24,7 @@ from app.chat.service import (
     ConversationNotFoundError,
 )
 from app.db.models import Attachment, Conversation
+from app.employee.adapter import EmployeeUnavailableError
 
 router = APIRouter(prefix="/api")
 
@@ -91,6 +92,8 @@ async def send_message(conversation_id: int, payload: ChatSendRequest, request: 
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except ConversationBusyError as exc:
         raise HTTPException(status_code=409, detail="Conversation is already processing") from exc
+    except EmployeeUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     return OperationAccepted(operation_id=operation_id, status="running")
 
 

@@ -86,6 +86,7 @@ class ChatService:
             prompt, image_path, session_id = self._prepare_send(
                 conversation_id, content, attachment_ids
             )
+            self.employee.check_available()
             operation_id = str(uuid4())
             with self.session_factory() as session:
                 session.add(
@@ -130,10 +131,13 @@ class ChatService:
             ):
                 raise AttachmentScopeError("Every attachment must belong to this conversation")
 
-            image_path = next(
-                (Path(item.path) for item in attachments if item.media_type.startswith("image/")),
-                None,
-            )
+            image_attachments = [
+                item for item in attachments if item.media_type.startswith("image/")
+            ]
+            if len(image_attachments) > 1:
+                raise AttachmentScopeError("At most one image attachment is allowed per message")
+
+            image_path = Path(image_attachments[0].path) if image_attachments else None
             prompt_attachments = [
                 item for item in attachments if image_path is None or Path(item.path) != image_path
             ]
@@ -197,32 +201,45 @@ class ChatService:
                 "operation_id": operation.id,
                 "message_id": assistant_id,
             }
+        except asyncio.CancelledError:
+            self._persist_terminal_failure(operation, status="cancelled")
+            raise
         except Exception:
-            with self.session_factory() as session:
-                user_message = session.scalar(
-                    select(Message).where(Message.operation_id == operation.id)
-                )
-                if user_message:
-                    user_message.operation_status = "failed"
-                failure = Message(
-                    conversation_id=operation.conversation_id,
-                    role="system",
-                    content="The employee could not complete the request. Please retry.",
-                    operation_id=operation.id,
-                    operation_status="failed",
-                )
-                session.add(failure)
-                session.commit()
-                failure_id = failure.id
-            operation.event = {
-                "type": "final",
-                "status": "failed",
-                "operation_id": operation.id,
-                "message_id": failure_id,
-            }
+            self._persist_terminal_failure(operation, status="failed")
         finally:
             self.active_conversations.discard(operation.conversation_id)
             operation.done.set()
+
+    def _persist_terminal_failure(self, operation: Operation, *, status: str) -> None:
+        """Persist and publish a terminal event without an await cancellation point."""
+        # This synchronous transaction is intentional: once cancellation is observed,
+        # no second cancellation can interrupt the durable terminal state or publication.
+        with self.session_factory() as session:
+            user_message = session.scalar(
+                select(Message).where(Message.operation_id == operation.id)
+            )
+            if user_message:
+                user_message.operation_status = status
+            failure = Message(
+                conversation_id=operation.conversation_id,
+                role="system",
+                content=(
+                    "The employee request was cancelled. Please retry."
+                    if status == "cancelled"
+                    else "The employee could not complete the request. Please retry."
+                ),
+                operation_id=operation.id,
+                operation_status=status,
+            )
+            session.add(failure)
+            session.commit()
+            failure_id = failure.id
+        operation.event = {
+            "type": "final",
+            "status": status,
+            "operation_id": operation.id,
+            "message_id": failure_id,
+        }
 
     async def operation_events(self, operation_id: str):
         operation = self.operations.get(operation_id)

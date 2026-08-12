@@ -2,13 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app.core.config import Settings
-from app.employee.adapter import EmployeeReply, HermesAdapter
+from app.employee.adapter import (
+    EmployeeReply,
+    EmployeeUnavailableError,
+    HermesAdapter,
+    HermesCancelledError,
+)
 from app.main import create_app
 
 
@@ -17,6 +23,11 @@ class FakeHermes(HermesAdapter):
         self.calls: list[dict] = []
         self.release = asyncio.Event()
         self.block = False
+        self.available = True
+
+    def check_available(self) -> None:
+        if not self.available:
+            raise EmployeeUnavailableError("The employee service is unavailable.")
 
     async def send(self, prompt, session_id, image_path, source):
         self.calls.append(
@@ -152,6 +163,28 @@ def test_attachment_upload_is_scoped_and_only_image_is_passed_as_image(api) -> N
     assert ".xlsx" in call["prompt"]
 
 
+def test_send_rejects_more_than_one_image_before_persisting_or_running(api) -> None:
+    client, fake, _ = api
+    conversation_id = create_conversation(client)
+    image_ids = []
+    for name in ("front.png", "back.png"):
+        uploaded = client.post(
+            "/api/attachments",
+            data={"conversation_id": str(conversation_id)},
+            files={"file": (name, b"image", "image/png")},
+        )
+        image_ids.append(uploaded.json()["id"])
+
+    response = client.post(
+        f"/api/conversations/{conversation_id}/messages",
+        json={"content": "Review both", "attachment_ids": image_ids},
+    )
+
+    assert response.status_code == 422
+    assert fake.calls == []
+    assert client.get(f"/api/conversations/{conversation_id}/messages").json() == []
+
+
 @pytest.mark.parametrize(
     ("filename", "size", "media_type"),
     [
@@ -239,6 +272,76 @@ def test_failed_operation_is_persisted_and_allows_retry(api) -> None:
     )
     assert retry.status_code == 202
     assert wait_for_final(client, retry.json()["operation_id"])[-1]["status"] == "completed"
+
+
+def test_cancelled_operation_is_persisted_and_replayed_after_restart(tmp_path) -> None:
+    settings = Settings(
+        data_dir=tmp_path / "data",
+        database_url=f"sqlite:///{tmp_path / 'cancel.db'}",
+    )
+    fake = FakeHermes()
+
+    async def cancel(*args, **kwargs):
+        raise HermesCancelledError("cancelled")
+
+    fake.send = cancel
+    app = create_app(settings=settings, employee=fake)
+    with TestClient(app) as client:
+        conversation_id = create_conversation(client)
+        sent = client.post(
+            f"/api/conversations/{conversation_id}/messages", json={"content": "cancel me"}
+        )
+        operation_id = sent.json()["operation_id"]
+        assert wait_for_final(client, operation_id)[-1]["status"] == "cancelled"
+
+    restarted = create_app(settings=settings, employee=FakeHermes())
+    with TestClient(restarted) as client:
+        replay = wait_for_final(client, operation_id)
+        assert replay == [
+            {
+                "type": "final",
+                "status": "cancelled",
+                "operation_id": operation_id,
+                "message_id": replay[0]["message_id"],
+            }
+        ]
+
+
+def test_send_returns_503_when_employee_preflight_is_unavailable(api) -> None:
+    client, fake, _ = api
+    conversation_id = create_conversation(client)
+    fake.available = False
+
+    response = client.post(
+        f"/api/conversations/{conversation_id}/messages", json={"content": "hello"}
+    )
+
+    assert response.status_code == 503
+    assert client.get(f"/api/conversations/{conversation_id}/messages").json() == []
+
+
+@pytest.mark.parametrize("missing", ["executable", "profile"])
+def test_real_adapter_preflight_returns_503_without_model_call(
+    tmp_path, monkeypatch, missing
+) -> None:
+    hermes_home = tmp_path / "hermes-home"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    settings = Settings(
+        data_dir=tmp_path / "data",
+        database_url=f"sqlite:///{tmp_path / 'preflight.db'}",
+        hermes_executable="definitely-missing-hermes" if missing == "executable" else sys.executable,
+        hermes_profile="missing-profile",
+    )
+    app = create_app(settings=settings)
+
+    with TestClient(app) as client:
+        conversation_id = create_conversation(client)
+        response = client.post(
+            f"/api/conversations/{conversation_id}/messages", json={"content": "hello"}
+        )
+
+        assert response.status_code == 503
+        assert client.get(f"/api/conversations/{conversation_id}/messages").json() == []
 
 
 def test_missing_operation_is_404(api) -> None:

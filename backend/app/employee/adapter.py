@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import re
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -14,6 +16,8 @@ class EmployeeReply:
 
 
 class HermesAdapter(Protocol):
+    def check_available(self) -> None: ...
+
     async def send(
         self,
         prompt: str,
@@ -28,6 +32,10 @@ class HermesAdapterError(RuntimeError):
 
 
 class HermesProcessError(HermesAdapterError):
+    pass
+
+
+class EmployeeUnavailableError(HermesAdapterError):
     pass
 
 
@@ -55,12 +63,32 @@ class SubprocessHermesAdapter:
         timeout_seconds: float = 180,
         data_root: Path,
         max_turns: int = 12,
+        profiles_root: Path | None = None,
     ) -> None:
         self.executable = executable
         self.profile = profile
         self.timeout_seconds = timeout_seconds
         self.data_root = data_root.resolve()
         self.max_turns = max_turns
+        if profiles_root is None:
+            configured_home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+            default_home = Path.home() / ".hermes"
+            hermes_root = (
+                configured_home
+                if configured_home.resolve() != default_home.resolve()
+                else default_home
+            )
+            profiles_root = hermes_root / "profiles"
+        self.profiles_root = profiles_root.resolve()
+
+    def check_available(self) -> None:
+        """Verify local prerequisites without starting Hermes or contacting a model."""
+        if shutil.which(self.executable) is None:
+            raise EmployeeUnavailableError("The employee service is unavailable.")
+        if self.profile not in {"default", "custom"}:
+            profile_dir = (self.profiles_root / self.profile).resolve()
+            if not profile_dir.is_relative_to(self.profiles_root) or not profile_dir.is_dir():
+                raise EmployeeUnavailableError("The configured employee profile is unavailable.")
 
     async def send(
         self,
