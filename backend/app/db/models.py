@@ -19,6 +19,17 @@ def enum_values(enum_class: type[EnumType]) -> list[str]:
     return [member.value for member in enum_class]
 
 
+def strict_enum(enum_class: type[EnumType], constraint_name: str) -> Enum:
+    return Enum(
+        enum_class,
+        values_callable=enum_values,
+        native_enum=False,
+        validate_strings=True,
+        create_constraint=True,
+        name=constraint_name,
+    )
+
+
 def utc_now() -> datetime:
     return datetime.now(UTC)
 
@@ -72,7 +83,7 @@ class Message(Base):
         ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False
     )
     role: Mapped[MessageRole] = mapped_column(
-        Enum(MessageRole, values_callable=enum_values), nullable=False
+        strict_enum(MessageRole, "ck_messages_role"), nullable=False
     )
     content: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now, nullable=False)
@@ -104,7 +115,9 @@ class ExcelJob(TimestampMixin, Base):
     )
     source_filename: Mapped[str] = mapped_column(String(255), nullable=False)
     status: Mapped[JobStatus] = mapped_column(
-        Enum(JobStatus, values_callable=enum_values), default=JobStatus.QUEUED, nullable=False
+        strict_enum(JobStatus, "ck_excel_jobs_status"),
+        default=JobStatus.QUEUED,
+        nullable=False,
     )
     error: Mapped[str | None] = mapped_column(Text)
 
@@ -135,13 +148,16 @@ class KnowledgeCandidate(TimestampMixin, Base):
     title: Mapped[str] = mapped_column(String(255), nullable=False)
     proposal: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     status: Mapped[KnowledgeStatus] = mapped_column(
-        Enum(KnowledgeStatus, values_callable=enum_values),
+        strict_enum(KnowledgeStatus, "ck_knowledge_candidates_status"),
         default=KnowledgeStatus.PROPOSED,
         nullable=False,
     )
 
     rule_versions: Mapped[list[RuleVersion]] = relationship(
-        back_populates="candidate", cascade="all, delete-orphan", order_by="RuleVersion.id"
+        back_populates="candidate", order_by="RuleVersion.id"
+    )
+    sourced_patterns: Mapped[list[KnowledgePattern]] = relationship(
+        back_populates="source_candidate", order_by="KnowledgePattern.id"
     )
 
 
@@ -149,12 +165,22 @@ class KnowledgePattern(TimestampMixin, Base):
     __tablename__ = "knowledge_patterns"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    source_candidate_id: Mapped[int | None] = mapped_column(
+        ForeignKey("knowledge_candidates.id", ondelete="SET NULL")
+    )
     name: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
     pattern: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     status: Mapped[KnowledgeStatus] = mapped_column(
-        Enum(KnowledgeStatus, values_callable=enum_values),
+        strict_enum(KnowledgeStatus, "ck_knowledge_patterns_status"),
         default=KnowledgeStatus.PROPOSED,
         nullable=False,
+    )
+
+    source_candidate: Mapped[KnowledgeCandidate | None] = relationship(
+        back_populates="sourced_patterns"
+    )
+    rule_versions: Mapped[list[RuleVersion]] = relationship(
+        back_populates="pattern", cascade="all, delete-orphan", order_by="RuleVersion.id"
     )
 
 
@@ -162,17 +188,21 @@ class RuleVersion(Base):
     __tablename__ = "rule_versions"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    knowledge_candidate_id: Mapped[int] = mapped_column(
-        ForeignKey("knowledge_candidates.id", ondelete="CASCADE"), nullable=False
+    pattern_id: Mapped[int] = mapped_column(
+        ForeignKey("knowledge_patterns.id", ondelete="CASCADE"), nullable=False
+    )
+    knowledge_candidate_id: Mapped[int | None] = mapped_column(
+        ForeignKey("knowledge_candidates.id", ondelete="SET NULL")
     )
     version: Mapped[str] = mapped_column(String(127), nullable=False, unique=True)
     rules: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     status: Mapped[KnowledgeStatus] = mapped_column(
-        Enum(KnowledgeStatus, values_callable=enum_values), nullable=False
+        strict_enum(KnowledgeStatus, "ck_rule_versions_status"), nullable=False
     )
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now, nullable=False)
 
-    candidate: Mapped[KnowledgeCandidate] = relationship(back_populates="rule_versions")
+    pattern: Mapped[KnowledgePattern] = relationship(back_populates="rule_versions")
+    candidate: Mapped[KnowledgeCandidate | None] = relationship(back_populates="rule_versions")
 
 
 class FeedbackEvent(Base):

@@ -88,6 +88,20 @@ def test_generated_listing_fields_has_exact_business_contract() -> None:
     assert other.fact_warnings == []
 
 
+def test_generated_listing_fields_rejects_unexpected_employee_output() -> None:
+    with pytest.raises(ValidationError):
+        GeneratedListingFields(
+            head_titles="Title",
+            tags=[],
+            specification="Spec",
+            category="Category",
+            instructions_for_buyers="Instructions",
+            confidence=0.5,
+            rule_version="rules-1",
+            invented_claim="Handmade in Italy",
+        )
+
+
 @pytest.mark.parametrize("confidence", [-0.01, 1.01])
 def test_generated_listing_fields_rejects_confidence_outside_unit_interval(
     confidence: float,

@@ -16,6 +16,8 @@ class JobStatus(StrEnum):
 
 
 class GeneratedListingFields(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     head_titles: str
     tags: list[str]
     specification: str
