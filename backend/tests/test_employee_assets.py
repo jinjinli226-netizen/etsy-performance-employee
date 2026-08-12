@@ -562,16 +562,41 @@ def test_employee_owned_state_is_only_rejected_during_initial_provision(
     assert "initial memories" in (initial_result.stdout + initial_result.stderr).lower()
 
 
-@pytest.mark.parametrize("legacy_name", ["MEMORY.md", "USER.md", "state.db"])
-def test_root_legacy_state_is_always_rejected(tmp_path: Path, legacy_name: str) -> None:
+@pytest.mark.parametrize("state_name", ["MEMORY.md", "USER.md", "state.db"])
+def test_later_employee_owned_root_state_after_manifest_is_allowed(
+    tmp_path: Path, state_name: str
+) -> None:
     hermes_home, profile_home, fake_hermes, values = create_verifier_fixture(tmp_path)
-    (profile_home / legacy_name).write_text("copied legacy state", encoding="utf-8")
+    (profile_home / state_name).write_text("employee-owned state", encoding="utf-8")
+    write_fake_hermes(fake_hermes, values)
+
+    later_result = run_verifier(hermes_home, fake_hermes)
+    initial_result = run_verifier(hermes_home, fake_hermes, initial_provision=True)
+
+    assert later_result.returncode == 0, later_result.stdout + later_result.stderr
+    assert initial_result.returncode == 1
+    assert state_name in (initial_result.stdout + initial_result.stderr)
+
+
+def test_later_state_predating_manifest_is_rejected(tmp_path: Path) -> None:
+    hermes_home, profile_home, fake_hermes, values = create_verifier_fixture(tmp_path)
+    state_file = profile_home / "state.db"
+    state_file.write_text("copied old state", encoding="utf-8")
+    timestamp_script = (
+        f"$item = Get-Item -LiteralPath '{state_file}'; "
+        "$past = [DateTime]::UtcNow.AddHours(-2); "
+        "$item.CreationTimeUtc = $past; $item.LastWriteTimeUtc = $past"
+    )
+    subprocess.run(
+        [powershell_executable(), "-NoProfile", "-NonInteractive", "-Command", timestamp_script],
+        check=True,
+    )
     write_fake_hermes(fake_hermes, values)
 
     result = run_verifier(hermes_home, fake_hermes)
 
     assert result.returncode == 1
-    assert legacy_name in (result.stdout + result.stderr)
+    assert "predates" in (result.stdout + result.stderr).lower()
 
 
 @pytest.mark.parametrize(

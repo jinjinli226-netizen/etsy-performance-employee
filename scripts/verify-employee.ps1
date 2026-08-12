@@ -234,25 +234,60 @@ function Test-StructuredConfigIsolation {
     }
 }
 
-function Test-RootLegacyStateIsolation {
-    foreach ($ForbiddenName in @("MEMORY.md", "USER.md", "state.db")) {
-        if (Test-Path -LiteralPath (Join-Path $ProfileHome $ForbiddenName) -PathType Leaf) {
-            Add-Failure "Unexpected root legacy state file exists: $ForbiddenName."
+function Test-StateIsolation {
+    param([Parameter(Mandatory = $true)][string]$BoundManifestPath)
+
+    $RootStateFiles = @()
+    foreach ($StateName in @("MEMORY.md", "USER.md", "state.db")) {
+        $StatePath = Join-Path $ProfileHome $StateName
+        if (Test-Path -LiteralPath $StatePath -PathType Leaf) {
+            $RootStateFiles += Get-Item -LiteralPath $StatePath -Force
         }
     }
-}
-
-function Test-InitialStateIsolation {
-    if (-not $InitialProvision) {
-        return
+    if ($InitialProvision) {
+        foreach ($StateFile in $RootStateFiles) {
+            Add-Failure "Unexpected initial employee state file exists: $($StateFile.Name)."
+        }
     }
+
+    $EmployeeStateFiles = @($RootStateFiles)
     foreach ($StateDirectoryName in @("memories", "sessions", "logs")) {
         $StateDirectory = Join-Path $ProfileHome $StateDirectoryName
         if (Test-Path -LiteralPath $StateDirectory -PathType Container) {
+            $DirectoryItem = Get-Item -LiteralPath $StateDirectory -Force
+            if (($DirectoryItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                Add-Failure "Employee state path must not be a reparse point: $StateDirectoryName."
+                continue
+            }
             $StateFiles = @(Get-ChildItem -LiteralPath $StateDirectory -Recurse -Force -File -ErrorAction SilentlyContinue)
-            if ($StateFiles.Count -gt 0) {
+            $ReparseEntries = @(Get-ChildItem -LiteralPath $StateDirectory -Recurse -Force -ErrorAction SilentlyContinue |
+                Where-Object { ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 })
+            if ($ReparseEntries.Count -gt 0) {
+                Add-Failure "Employee state paths must not contain reparse points."
+            }
+            if ($InitialProvision -and $StateFiles.Count -gt 0) {
                 Add-Failure "Initial $StateDirectoryName directory contains files."
             }
+            $EmployeeStateFiles += $StateFiles
+        }
+    }
+
+    if ($InitialProvision -or $EmployeeStateFiles.Count -eq 0) {
+        return
+    }
+    $ManifestItem = Get-Item -LiteralPath $BoundManifestPath -Force
+    if (($ManifestItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        Add-Failure "The provisioning manifest must not be a reparse point."
+        return
+    }
+    $EarliestAllowedUtc = $ManifestItem.CreationTimeUtc.Subtract([TimeSpan]::FromSeconds(2))
+    foreach ($StateFile in $EmployeeStateFiles) {
+        if (($StateFile.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            Add-Failure "Employee state files must not be reparse points."
+        }
+        elseif ($StateFile.CreationTimeUtc -lt $EarliestAllowedUtc -or
+            $StateFile.LastWriteTimeUtc -lt $EarliestAllowedUtc) {
+            Add-Failure "Employee state file predates the bound provisioning manifest."
         }
     }
 }
@@ -337,8 +372,7 @@ if ($null -ne $Manifest) {
     Test-AssetIsolation -Manifest $Manifest
     Test-EnvironmentIsolation
     Test-StructuredConfigIsolation -KeyConfigured ([bool]$Manifest.keyConfigured)
-    Test-RootLegacyStateIsolation
-    Test-InitialStateIsolation
+    Test-StateIsolation -BoundManifestPath $ManifestPath
 
     $CurrentDefaultHashes = Get-DefaultHashes
     foreach ($Name in @("SOUL.md", "config.yaml", ".env")) {
