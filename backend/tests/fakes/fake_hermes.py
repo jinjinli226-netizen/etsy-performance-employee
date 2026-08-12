@@ -12,6 +12,7 @@ class FakeProcess:
         returncode: int = 0,
         wait_forever: bool = False,
         pid: int = 4321,
+        wait_hangs_after_kill: bool = False,
     ) -> None:
         self._stdout = stdout
         self._stderr = stderr
@@ -20,6 +21,7 @@ class FakeProcess:
         self.pid = pid
         self.terminated = False
         self.killed = False
+        self.wait_hangs_after_kill = wait_hangs_after_kill
         self._released = asyncio.Event()
 
     async def communicate(self) -> tuple[bytes, bytes]:
@@ -38,6 +40,8 @@ class FakeProcess:
         self._released.set()
 
     async def wait(self) -> int:
+        if self.wait_hangs_after_kill:
+            await asyncio.Event().wait()
         if self.wait_forever and not (self.terminated or self.killed):
             await self._released.wait()
         return self.returncode

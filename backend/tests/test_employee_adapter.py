@@ -279,3 +279,79 @@ async def test_windows_taskkill_failure_falls_back_to_parent_terminate(
     await SubprocessHermesAdapter._stop(parent, platform_name="win32")
 
     assert parent.terminated
+
+
+@pytest.mark.anyio
+async def test_windows_taskkill_and_child_wait_hangs_are_bounded_on_timeout(
+    tmp_path, monkeypatch
+) -> None:
+    parent = FakeProcess(
+        wait_forever=True,
+        wait_hangs_after_kill=True,
+        pid=8765,
+    )
+    taskkill = FakeProcess(wait_forever=True, wait_hangs_after_kill=True)
+    calls = []
+
+    async def fake_exec(*args, **kwargs):
+        calls.append(args)
+        if args[0] == "hermes":
+            return parent
+        return taskkill
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    real = SubprocessHermesAdapter(
+        executable="hermes",
+        profile="etsy-performance-us",
+        timeout_seconds=0.01,
+        data_root=tmp_path,
+        profiles_root=tmp_path / "profiles",
+        platform_name="win32",
+        cleanup_timeout_seconds=0.01,
+    )
+
+    with pytest.raises(HermesTimeoutError):
+        await asyncio.wait_for(real.send("Hello", None, None, "app"), timeout=0.15)
+
+    assert calls[1] == ("taskkill.exe", "/PID", "8765", "/T", "/F")
+    assert taskkill.killed
+    assert parent.killed
+
+
+@pytest.mark.anyio
+async def test_windows_hanging_cleanup_preserves_cancellation_within_bound(
+    tmp_path, monkeypatch
+) -> None:
+    parent = FakeProcess(
+        wait_forever=True,
+        wait_hangs_after_kill=True,
+        pid=9876,
+    )
+    taskkill = FakeProcess(wait_forever=True, wait_hangs_after_kill=True)
+    calls = []
+
+    async def fake_exec(*args, **kwargs):
+        calls.append(args)
+        if args[0] == "hermes":
+            return parent
+        return taskkill
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    real = SubprocessHermesAdapter(
+        executable="hermes",
+        profile="etsy-performance-us",
+        data_root=tmp_path,
+        profiles_root=tmp_path / "profiles",
+        platform_name="win32",
+        cleanup_timeout_seconds=0.01,
+    )
+    send = asyncio.create_task(real.send("Hello", None, None, "app"))
+    await asyncio.sleep(0)
+    send.cancel()
+
+    with pytest.raises(HermesCancelledError):
+        await asyncio.wait_for(send, timeout=0.15)
+
+    assert calls[1] == ("taskkill.exe", "/PID", "9876", "/T", "/F")
+    assert taskkill.killed
+    assert parent.killed

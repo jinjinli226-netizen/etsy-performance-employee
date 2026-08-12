@@ -53,6 +53,7 @@ class HermesCancelledError(asyncio.CancelledError):
 
 
 _SESSION_LINE = re.compile(r"(?im)^\s*session_id:\s*([A-Za-z0-9][A-Za-z0-9._:-]{0,255})\s*$")
+DEFAULT_CLEANUP_TIMEOUT_SECONDS = 2.0
 
 
 def resolve_hermes_profiles_root(*, platform_name: str | None = None) -> Path:
@@ -83,6 +84,7 @@ class SubprocessHermesAdapter:
         max_turns: int = 12,
         profiles_root: Path | None = None,
         platform_name: str | None = None,
+        cleanup_timeout_seconds: float = DEFAULT_CLEANUP_TIMEOUT_SECONDS,
     ) -> None:
         self.executable = executable
         self.profile = profile
@@ -90,6 +92,7 @@ class SubprocessHermesAdapter:
         self.data_root = data_root.resolve()
         self.max_turns = max_turns
         self.platform_name = platform_name or sys.platform
+        self.cleanup_timeout_seconds = cleanup_timeout_seconds
         self.profiles_root = (
             profiles_root.resolve() if profiles_root else resolve_hermes_profiles_root()
         )
@@ -148,10 +151,18 @@ class SubprocessHermesAdapter:
                 process.communicate(), timeout=self.timeout_seconds
             )
         except TimeoutError as exc:
-            await self._stop(process, platform_name=self.platform_name)
+            await self._stop(
+                process,
+                platform_name=self.platform_name,
+                cleanup_timeout_seconds=self.cleanup_timeout_seconds,
+            )
             raise HermesTimeoutError("The employee timed out; please retry.") from exc
         except asyncio.CancelledError as exc:
-            await self._stop(process, platform_name=self.platform_name)
+            await self._stop(
+                process,
+                platform_name=self.platform_name,
+                cleanup_timeout_seconds=self.cleanup_timeout_seconds,
+            )
             raise HermesCancelledError("The employee request was cancelled.") from exc
 
         if process.returncode != 0:
@@ -164,9 +175,15 @@ class SubprocessHermesAdapter:
         return EmployeeReply(text=text, session_id=session_match.group(1))
 
     @staticmethod
-    async def _stop(process, *, platform_name: str | None = None) -> None:
+    async def _stop(
+        process,
+        *,
+        platform_name: str | None = None,
+        cleanup_timeout_seconds: float = DEFAULT_CLEANUP_TIMEOUT_SECONDS,
+    ) -> None:
         if process.returncode is not None:
             return
+        force_parent_kill = False
         if (platform_name or sys.platform).lower().startswith("win"):
             try:
                 taskkill = await asyncio.create_subprocess_exec(
@@ -178,17 +195,41 @@ class SubprocessHermesAdapter:
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.DEVNULL,
                 )
-                if await taskkill.wait() == 0:
+                try:
+                    taskkill_returncode = await asyncio.wait_for(
+                        taskkill.wait(), timeout=cleanup_timeout_seconds
+                    )
+                except TimeoutError:
+                    taskkill.kill()
                     try:
-                        await asyncio.wait_for(process.wait(), timeout=2)
+                        await asyncio.wait_for(
+                            taskkill.wait(), timeout=cleanup_timeout_seconds
+                        )
+                    except TimeoutError:
+                        pass
+                    taskkill_returncode = None
+                    force_parent_kill = True
+                if taskkill_returncode == 0:
+                    try:
+                        await asyncio.wait_for(
+                            process.wait(), timeout=cleanup_timeout_seconds
+                        )
                         return
                     except TimeoutError:
                         pass
             except OSError:
                 pass
-        process.terminate()
-        try:
-            await asyncio.wait_for(process.wait(), timeout=2)
-        except TimeoutError:
+        if force_parent_kill:
             process.kill()
-            await process.wait()
+        elif process.returncode is None:
+            process.terminate()
+        try:
+            await asyncio.wait_for(process.wait(), timeout=cleanup_timeout_seconds)
+        except TimeoutError:
+            if process.returncode is None:
+                process.kill()
+            try:
+                await asyncio.wait_for(process.wait(), timeout=cleanup_timeout_seconds)
+            except TimeoutError:
+                # The OS may fail to report child exit; cleanup must remain bounded.
+                return
