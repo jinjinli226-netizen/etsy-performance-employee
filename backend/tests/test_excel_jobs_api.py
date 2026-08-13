@@ -179,6 +179,59 @@ def test_upload_rejects_unsupported_or_disguised_files(api, filename, content, e
     assert client.get("/api/excel-jobs").json()["total"] == 0
 
 
+def test_upload_returns_507_before_queue_or_worker_when_knowledge_capacity_exceeded(api, monkeypatch) -> None:
+    client, runner, _, app = api
+    from app.knowledge.service import KnowledgeCapacityError
+
+    def exceeded():
+        raise KnowledgeCapacityError("private capacity details")
+
+    monkeypatch.setattr(app.state.knowledge_service, "require_capacity_ready", exceeded)
+    response = upload(client)
+    assert response.status_code == 507
+    assert response.json()["detail"]["code"] == "knowledge_capacity_exceeded"
+    assert runner.calls == []
+    assert client.get("/api/excel-jobs").json()["total"] == 0
+
+
+def test_queued_job_fails_with_capacity_code_before_worker_starts(api, monkeypatch) -> None:
+    client, runner, _, app = api
+    from app.knowledge.service import KnowledgeCapacityError
+    from app.excel_jobs.storage import store_upload
+    from uuid import uuid4
+
+    public_id = uuid4()
+
+    async def prepare():
+        class Upload:
+            filename = "products.xlsx"
+            content_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+            async def read(self, size=-1):
+                if getattr(self, "done", False):
+                    return b""
+                self.done = True
+                return FIXTURE.read_bytes()
+
+            async def close(self):
+                return None
+
+        return await store_upload(Upload(), root=app.state.settings.data_dir / "excel-jobs", public_id=public_id, max_bytes=5 * 1024 * 1024)
+
+    stored = asyncio.run(prepare())
+    job = app.state.excel_job_service.create_job(stored, "products.xlsx")
+
+    def exceeded():
+        raise KnowledgeCapacityError("private capacity details")
+
+    monkeypatch.setattr(app.state.knowledge_service, "require_capacity_ready", exceeded)
+    asyncio.run(app.state.excel_job_service._execute(job.id))
+    terminal = client.get(f"/api/excel-jobs/{job.id}").json()
+    assert terminal["status"] == "failed"
+    assert terminal["error"]["code"] == "knowledge_capacity_exceeded"
+    assert runner.calls == []
+
+
 def test_upload_streaming_hard_cap_returns_413_and_leaves_no_job(tmp_path) -> None:
     runner = FakeExcelRunner()
     settings = Settings(

@@ -1,5 +1,9 @@
 # Listing 输出契约
 
+## Employee control-frame contract
+
+Hermes learning control frames should be emitted as one compact JSON object per line. The app parser also accepts bounded pretty-printed JSON objects for compatibility. Control frames are never user-visible; malformed, incomplete, or oversized JSON object frames are rejected without persisting their raw content.
+
 ## Detached knowledge trust contract
 
 A knowledge export is data, not proof of trust. The trusted caller must supply `expected_knowledge_export_id`, `expected_knowledge_payload_sha256`, and `expected_knowledge_file_sha256` independently of the export file. The export root has exactly `schema_version`, `export_id`, `issuer`, `records`, and `content_sha256`; every record has exactly `id`, `status`, `approved`, `abstract`, and `content_sha256`. Canonical SHA-256 uses UTF-8 JSON with sorted keys and compact separators. Only active, approved records with matching record digests may reach the model, and only their `id` and `abstract` fields are included in the prompt. A `signed: true` value inside the file has no authority and is not accepted.

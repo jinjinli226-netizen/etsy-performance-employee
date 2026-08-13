@@ -30,6 +30,11 @@ def service(request: Request) -> KnowledgeService:
     return request.app.state.knowledge_service
 
 
+@router.get("/capacity")
+def knowledge_capacity(request: Request):
+    return service(request).capacity_status()
+
+
 @router.get("", response_model=PatternPage)
 def list_active_patterns(
     request: Request,
@@ -89,9 +94,9 @@ def reject_candidate(candidate_id: int, request: Request):
 
 
 @router.post("/patterns/{pattern_id}/rollback", response_model=PatternTransitionRead)
-def rollback_pattern(pattern_id: int, request: Request):
+def rollback_pattern(pattern_id: int, request: Request, expected_rule_version: str | None = Query(None, min_length=1, max_length=127)):
     try:
-        return service(request).rollback_pattern(pattern_id, actor="owner")
+        return service(request).rollback_pattern(pattern_id, actor="owner", expected_rule_version=expected_rule_version)
     except KnowledgeNotFoundError as exc:
         raise HTTPException(404, "Knowledge pattern not found") from exc
     except KnowledgeConflictError as exc:

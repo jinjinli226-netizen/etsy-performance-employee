@@ -192,6 +192,16 @@ def test_guard_capacity_rejects_new_evidence_without_breaking_existing_export(kn
     assert json.loads(trust.path.read_text(encoding="utf-8"))["records"][0]["id"] == first.public_id
 
 
+def test_new_multibyte_evidence_cannot_push_ready_capacity_to_exceeded(knowledge) -> None:
+    service, factory, _ = knowledge
+    payload = evidence_payload(1)
+    with pytest.raises(KnowledgeCapacityError):
+        service.ingest_evidence(EvidenceInput(**{**payload.model_dump(), "snapshot": "舞" * 20_000}))
+    assert service.capacity_status()["status"] == "ready"
+    with factory() as session:
+        assert session.query(CompetitorEvidence).count() == 0
+
+
 def test_cross_instance_concurrent_approve_is_idempotent(knowledge) -> None:
     service, factory, _ = knowledge
     candidate = service.ingest_candidate(
@@ -225,15 +235,30 @@ def test_cross_instance_different_candidates_same_kind_are_serialized(knowledge)
     def approve(pair):
         active, candidate_id = pair
         barrier.wait()
-        return active.approve_candidate(candidate_id, actor="owner").public_id
+        try:
+            return "ok", active.approve_candidate(candidate_id, actor="owner").public_id
+        except KnowledgeConflictError:
+            return "conflict", None
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         results = list(pool.map(approve, ((service, first.id), (other, second.id))))
-    assert len(set(results)) == 1
+    assert sorted(result[0] for result in results) == ["conflict", "ok"]
     with factory() as session:
         assert session.query(KnowledgePattern).count() == 1
-        assert session.query(RuleVersion).count() == 2
+        assert session.query(RuleVersion).count() == 1
         assert session.query(RuleVersion).filter_by(status=KnowledgeStatus.ACTIVE).count() == 1
+
+
+def test_serial_candidate_approval_rejects_stale_base_rule(knowledge) -> None:
+    service, _, _ = knowledge
+    first = service.ingest_candidate(candidate_payload([], confidence=0.4, kind="stale_kind"), actor="employee", trace_id="stale-1")
+    second = service.ingest_candidate(
+        candidate_payload([], confidence=0.4, kind="stale_kind", abstract="Put audience before occasion and garment type."),
+        actor="employee", trace_id="stale-2",
+    )
+    service.approve_candidate(first.id, actor="owner")
+    with pytest.raises(KnowledgeConflictError, match="stale"):
+        service.approve_candidate(second.id, actor="owner")
 
 
 def test_generation_uses_only_valid_immutable_active_rule_snapshot(knowledge) -> None:
@@ -523,6 +548,22 @@ def test_knowledge_api_is_safe_paginated_and_uses_precise_status_codes(knowledge
         assert client.post("/api/knowledge/candidates/999/approve").status_code == 404
         assert client.post(f"/api/knowledge/candidates/{candidate.id}/reject").status_code == 409
         assert client.post("/api/knowledge/patterns/999/rollback").status_code == 404
+        capacity = client.get("/api/knowledge/capacity")
+        assert capacity.status_code == 200
+        assert capacity.json() == {"status": "ready", "evidence_count": 0, "record_limit": 500, "oversized_count": 0}
+
+
+def test_rollback_rejects_stale_expected_rule_version(knowledge) -> None:
+    service, _, _ = knowledge
+    first = service.ingest_candidate(candidate_payload([], confidence=0.4, kind="rollback_cas", abstract="Put occasion before garment type."), actor="employee", trace_id="1")
+    pattern = service.approve_candidate(first.id, actor="owner")
+    current = service.generation_patterns()[0]["rule_version"]
+    with pytest.raises(KnowledgeConflictError, match="stale"):
+        service.rollback_pattern(pattern.id, actor="owner", expected_rule_version="stale-version")
+    second = service.ingest_candidate(candidate_payload([], confidence=0.4, kind="rollback_cas", abstract="Put audience before occasion and garment type."), actor="employee", trace_id="2")
+    service.approve_candidate(second.id, actor="owner")
+    with pytest.raises(KnowledgeConflictError, match="stale"):
+        service.rollback_pattern(pattern.id, actor="owner", expected_rule_version=current)
 
 
 def test_evidence_api_requires_server_capability_and_never_returns_raw(tmp_path: Path) -> None:
@@ -546,11 +587,84 @@ def test_v5_migration_is_idempotent_and_enforces_raw_sql_constraints(tmp_path: P
     init_db(engine)
     init_db(engine)
     with engine.begin() as connection:
-        assert connection.execute(text("SELECT version FROM schema_migrations ORDER BY version")).scalars().all() == [1, 2, 3, 4, 5, 6]
+        assert connection.execute(text("SELECT version FROM schema_migrations ORDER BY version")).scalars().all() == [1, 2, 3, 4, 5, 6, 7]
         with pytest.raises(IntegrityError):
             connection.execute(text("INSERT INTO competitor_evidence (public_id, canonical_url, source_key, title, snapshot, tags, source_timestamp, content_hash, created_at) VALUES ('bad','http://evil.test','x','t','s','[]',CURRENT_TIMESTAMP,'bad',CURRENT_TIMESTAMP)"))
         with pytest.raises(IntegrityError):
             connection.execute(text("INSERT INTO knowledge_candidates (title, proposal, status, public_id, kind, abstract_summary, confidence, evidence_ids, source_timestamps, revision, created_at, updated_at) VALUES ('x','{}','proposed','bad','x','x',2,'[]','{}',0,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)"))
+    engine.dispose()
+
+
+def test_v7_preserves_legacy_over_capacity_evidence_and_reports_safe_status(tmp_path: Path) -> None:
+    engine = create_engine_for_url(f"sqlite:///{tmp_path / 'legacy-capacity.db'}")
+    init_db(engine)
+    with engine.begin() as connection:
+        connection.execute(text("DELETE FROM schema_migrations WHERE version=7"))
+        connection.execute(text("DROP TABLE knowledge_capacity_state"))
+        rows = [
+            {
+                "id": index + 1,
+                "public_id": f"ev-{index + 1:032x}",
+                "url": f"https://www.etsy.com/listing/{index + 1}",
+                "source": f"etsy-listing:{index + 1}",
+                "title": "Legacy title",
+                "snapshot": "x" * (20_001 if index == 0 else 1),
+                "digest": f"{index + 1:064x}",
+                "snapshot_hash": f"{index + 2:064x}",
+            }
+            for index in range(501)
+        ]
+        connection.execute(text(
+            "INSERT INTO competitor_evidence "
+            "(id,public_id,canonical_url,source_key,title,snapshot,tags,source_timestamp,content_hash,snapshot_hash,created_at) "
+            "VALUES (:id,:public_id,:url,:source,:title,:snapshot,'[]',CURRENT_TIMESTAMP,:digest,:snapshot_hash,CURRENT_TIMESTAMP)"
+        ), rows)
+    init_db(engine)
+    factory = create_session_factory(engine)
+    service = KnowledgeService(factory, export_dir=tmp_path / "trust")
+    status = service.capacity_status()
+    assert status == {"status": "exceeded", "evidence_count": 501, "record_limit": 500, "oversized_count": 1}
+    with factory() as session:
+        assert session.query(CompetitorEvidence).count() == 501
+    with pytest.raises(KnowledgeCapacityError):
+        service.require_capacity_ready()
+    with engine.begin() as connection:
+        connection.execute(text("DELETE FROM competitor_evidence WHERE id > 1"))
+        connection.execute(text("UPDATE competitor_evidence SET snapshot='x' WHERE id=1"))
+    assert service.capacity_status()["status"] == "ready"
+    assert service.export_evidence_guard(tmp_path / "guard.json").path.exists()
+    engine.dispose()
+
+
+def test_v7_marks_legacy_compact_guard_over_eight_mib_without_deleting_rows(tmp_path: Path) -> None:
+    engine = create_engine_for_url(f"sqlite:///{tmp_path / 'legacy-compact.db'}")
+    init_db(engine)
+    words = [f"w{index:05d}" for index in range(1900)]
+    with engine.begin() as connection:
+        connection.execute(text("DELETE FROM schema_migrations WHERE version=7"))
+        connection.execute(text("DROP TABLE knowledge_capacity_state"))
+        rows = []
+        for index in range(100):
+            snapshot = " ".join(f"{word}x{index}" for word in words)
+            assert len(snapshot.encode("utf-8")) <= 20_000
+            rows.append({
+                "id": index + 1, "public_id": f"ev-{index + 1:032x}",
+                "url": f"https://www.etsy.com/listing/{index + 1}", "source": f"etsy-listing:{index + 1}",
+                "snapshot": snapshot, "digest": f"{index + 1:064x}", "snapshot_hash": f"{index + 2:064x}",
+            })
+        connection.execute(text(
+            "INSERT INTO competitor_evidence "
+            "(id,public_id,canonical_url,source_key,title,snapshot,tags,source_timestamp,content_hash,snapshot_hash,created_at) "
+            "VALUES (:id,:public_id,:url,:source,'Legacy title',:snapshot,'[]',CURRENT_TIMESTAMP,:digest,:snapshot_hash,CURRENT_TIMESTAMP)"
+        ), rows)
+    init_db(engine)
+    factory = create_session_factory(engine)
+    service = KnowledgeService(factory, export_dir=tmp_path / "trust")
+    assert service.capacity_status()["status"] == "exceeded"
+    with engine.begin() as connection:
+        stored = connection.execute(text("SELECT status, evidence_count FROM knowledge_capacity_state WHERE id=1")).one()
+        assert stored == ("exceeded", 100)
+        assert connection.execute(text("SELECT count(*) FROM competitor_evidence")).scalar_one() == 100
     engine.dispose()
 
 

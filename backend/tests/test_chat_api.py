@@ -280,6 +280,46 @@ def test_valid_learning_control_frame_accepts_bounded_snapshot_and_is_not_visibl
     assert parsed.control_errors == []
 
 
+def test_control_parser_decodes_unicode_event_and_pretty_multiline_frames() -> None:
+    raw = (
+        "Visible before\n"
+        "{\n"
+        '  "event": "learning\\u005fbatch",\n'
+        '  "payload": {"evidence_items": [], "candidates": []}\n'
+        "}\n"
+        "Visible after"
+    )
+    parsed = parse_final_envelopes(raw)
+    assert parsed.visible_text == "Visible before\nVisible after"
+    assert parsed.envelopes == [{"event": "learning_batch", "payload": {"evidence_items": [], "candidates": []}}]
+    assert parsed.control_errors == []
+
+
+def test_control_parser_keeps_valid_noncontrol_json_but_strips_invalid_object_block() -> None:
+    raw = (
+        'Visible\n{"example":{"answer":42}}\n'
+        '{\n  "event": "learning_batch",\n  "payload": {"evidence_items": [], BAD}\n}\n'
+        "Visible after"
+    )
+    parsed = parse_final_envelopes(raw)
+    assert parsed.visible_text == 'Visible\n{"example":{"answer":42}}\nVisible after'
+    assert parsed.envelopes == []
+    assert parsed.control_errors == ["envelope_invalid"]
+
+
+def test_unclosed_json_block_is_bounded_and_does_not_swallow_following_visible_text() -> None:
+    parsed = parse_final_envelopes('{"event":"learning_batch","payload":{\nVisible after')
+    assert parsed.visible_text == "Visible after"
+    assert parsed.control_errors == ["envelope_invalid"]
+
+
+def test_oversized_pretty_control_block_is_removed_as_one_frame() -> None:
+    raw = '{\n  "event":"learning_batch",\n  "payload":{"evidence_items":[],"candidates":[],"extra":"' + ("x" * 132_000) + '"}\n}\nVisible after'
+    parsed = parse_final_envelopes(raw)
+    assert parsed.visible_text == "Visible after"
+    assert parsed.control_errors == ["envelope_invalid"]
+
+
 def test_learning_batch_is_atomic_when_second_candidate_is_invalid(api) -> None:
     client, fake, _ = api
     conversation_id = create_conversation(client)

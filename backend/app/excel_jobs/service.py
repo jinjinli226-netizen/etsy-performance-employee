@@ -32,7 +32,7 @@ from app.excel_jobs.storage import (
     safe_path,
     validate_artifact,
 )
-from app.knowledge.service import KnowledgeService
+from app.knowledge.service import KnowledgeCapacityError, KnowledgeService
 from app.knowledge.service import KnowledgeValidationError
 
 
@@ -114,6 +114,8 @@ class ExcelJobService:
                         pass
 
     def create_job(self, stored: StoredSource, source_filename: str) -> JobView:
+        if self.knowledge_service is not None:
+            self.knowledge_service.require_capacity_ready()
         public_id = stored.workspace.name
         with self.factory() as session:
             job = ExcelJob(
@@ -222,6 +224,8 @@ class ExcelJobService:
         workspace = self.root / public_id
         operation: Path | None = None
         try:
+            if self.knowledge_service is not None:
+                self.knowledge_service.require_capacity_ready()
             with self.factory() as session:
                 job = self._get(session, public_id)
                 if job.status is not JobStatus.QUEUED:
@@ -317,6 +321,8 @@ class ExcelJobService:
         except StorageError as exc:
             code = exc.code if _SAFE_CODE.fullmatch(exc.code) else "invalid_artifact"
             self._fail(public_id, code, _safe_storage_message(code))
+        except KnowledgeCapacityError:
+            self._fail(public_id, "knowledge_capacity_exceeded", "Knowledge evidence capacity must be resolved before generation.")
         except KnowledgeValidationError:
             self._fail(public_id, "originality_failed", "The generated workbook was too similar to protected evidence.")
         except Exception:

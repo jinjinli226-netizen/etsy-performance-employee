@@ -341,7 +341,7 @@ def test_init_db_migrates_task2_sqlite_schema_and_preserves_data(tmp_path) -> No
         with engine.connect() as connection:
             assert connection.execute(
                 text("SELECT version FROM schema_migrations ORDER BY version")
-            ).scalars().all() == [1, 2, 3, 4, 5, 6]
+            ).scalars().all() == [1, 2, 3, 4, 5, 6, 7]
             index_names = {
                 row[1] for row in connection.execute(text("PRAGMA index_list('messages')"))
             }
@@ -379,7 +379,7 @@ def test_init_db_migrates_legacy_excel_jobs_and_preserves_rows(tmp_path) -> None
                 100,
             )
             assert connection.execute(text("SELECT kind, path FROM artifacts WHERE id=8")).one() == ("legacy", "legacy/output.xlsx")
-            assert connection.execute(text("SELECT version FROM schema_migrations ORDER BY version")).scalars().all() == [1, 2, 3, 4, 5, 6]
+            assert connection.execute(text("SELECT version FROM schema_migrations ORDER BY version")).scalars().all() == [1, 2, 3, 4, 5, 6, 7]
             assert {row[1] for row in connection.execute(text("PRAGMA table_info('excel_jobs')"))} >= {"public_id", "source_sha256", "source_size_bytes", "error_code", "error_message", "progress_percent"}
             assert {row[1] for row in connection.execute(text("PRAGMA table_info('artifacts')"))} >= {"filename", "sha256", "size_bytes"}
             assert "job_events" in {row[0] for row in connection.execute(text("SELECT name FROM sqlite_master WHERE type='table'"))}
@@ -437,6 +437,6 @@ def test_uuid_contract_upgrade_archives_ids_accepted_by_older_v3(tmp_path) -> No
             ).one() == (expected, "failed", "legacy_migrated")
             assert connection.execute(
                 text("SELECT version FROM schema_migrations ORDER BY version")
-            ).scalars().all() == [1, 2, 3, 4, 5, 6]
+            ).scalars().all() == [1, 2, 3, 4, 5, 6, 7]
     finally:
         engine.dispose()

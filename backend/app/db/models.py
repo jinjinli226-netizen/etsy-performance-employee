@@ -198,6 +198,7 @@ class KnowledgeCandidate(TimestampMixin, Base):
         CheckConstraint("public_id IS NULL OR (public_id GLOB 'kc-[0-9a-f][0-9a-f]*' AND length(public_id)=35)", name="ck_candidate_public_id"),
         CheckConstraint("confidence IS NULL OR (confidence >= 0 AND confidence <= 1)", name="ck_candidate_confidence"),
         CheckConstraint("revision >= 0", name="ck_candidate_revision"),
+        CheckConstraint("base_pattern_revision IS NULL OR base_pattern_revision >= 0", name="ck_candidate_base_revision"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -212,6 +213,8 @@ class KnowledgeCandidate(TimestampMixin, Base):
     conversation_id: Mapped[int | None] = mapped_column(ForeignKey("conversations.id", ondelete="SET NULL"))
     message_id: Mapped[int | None] = mapped_column(ForeignKey("messages.id", ondelete="SET NULL"))
     trace_id: Mapped[str | None] = mapped_column(String(127), index=True)
+    base_active_rule_public_id: Mapped[str | None] = mapped_column(String(36))
+    base_pattern_revision: Mapped[int | None] = mapped_column(Integer)
     revision: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     status: Mapped[KnowledgeStatus] = mapped_column(
         strict_enum(KnowledgeStatus, "ck_knowledge_candidates_status"),

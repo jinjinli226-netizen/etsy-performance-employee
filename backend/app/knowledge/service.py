@@ -13,7 +13,7 @@ from typing import Callable
 from urllib.parse import urlsplit
 from uuid import uuid4
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.db.models import AuditEvent, CompetitorEvidence, FeedbackEvent, KnowledgeCandidate, KnowledgePattern, RuleVersion
@@ -122,7 +122,46 @@ class KnowledgeService:
         with self._lock, self._write_session() as session:
             return self._ingest_evidence_in_session(session, payload)
 
+    def capacity_status(self) -> dict[str, int | str]:
+        with self.session_factory() as session:
+            evidence = list(session.scalars(select(CompetitorEvidence).order_by(CompetitorEvidence.public_id)))
+            oversized = sum(
+                len(item.snapshot.encode("utf-8")) > 20_000
+                or len(item.title.encode("utf-8")) > 500
+                for item in evidence
+            )
+            status = "ready"
+            if len(evidence) > self.max_guard_records or oversized:
+                status = "exceeded"
+            else:
+                try:
+                    self._guard_envelope(evidence)
+                except KnowledgeCapacityError:
+                    status = "exceeded"
+            payload = {
+                "status": status,
+                "evidence_count": len(evidence),
+                "record_limit": self.max_guard_records,
+                "oversized_count": oversized,
+            }
+            session.execute(text(
+                "INSERT INTO knowledge_capacity_state "
+                "(id,status,evidence_count,record_limit,oversized_count,updated_at) "
+                "VALUES (1,:status,:evidence_count,:record_limit,:oversized_count,CURRENT_TIMESTAMP) "
+                "ON CONFLICT(id) DO UPDATE SET status=excluded.status, "
+                "evidence_count=excluded.evidence_count, record_limit=excluded.record_limit, "
+                "oversized_count=excluded.oversized_count, updated_at=CURRENT_TIMESTAMP"
+            ), payload)
+            session.commit()
+            return payload
+
+    def require_capacity_ready(self) -> None:
+        if self.capacity_status()["status"] != "ready":
+            raise KnowledgeCapacityError("knowledge capacity exceeded")
+
     def _ingest_evidence_in_session(self, session: Session, payload: EvidenceInput) -> CompetitorEvidence:
+        if len(payload.snapshot.encode("utf-8")) > 20_000 or len(payload.title.encode("utf-8")) > 500:
+            raise KnowledgeCapacityError("evidence guard capacity exceeded")
         parsed = urlsplit(payload.url)
         listing_id = parsed.path.split("/")[2]
         canonical = f"https://www.etsy.com/listing/{listing_id}"
@@ -207,6 +246,7 @@ class KnowledgeService:
         similarity = self._raw_similarity(payload.abstract, evidence)
         if not similarity.passed:
             raise KnowledgeValidationError("candidate is overly similar to raw evidence")
+        base_rule, base_revision = self._active_token(session, payload.kind)
         candidate = KnowledgeCandidate(
             public_id="kc-" + uuid4().hex,
             title=payload.abstract[:255],
@@ -219,6 +259,8 @@ class KnowledgeService:
             conversation_id=conversation_id,
             message_id=message_id,
             trace_id=trace_id[:127],
+            base_active_rule_public_id=base_rule,
+            base_pattern_revision=base_revision,
             status=KnowledgeStatus.PROPOSED,
         )
         session.add(candidate)
@@ -355,6 +397,12 @@ class KnowledgeService:
         existing = session.scalar(select(KnowledgePattern).where(KnowledgePattern.kind == candidate.kind))
         if candidate.status is KnowledgeStatus.ACTIVE and existing:
             return existing
+        current_rule, current_revision = self._active_token(session, candidate.kind or "")
+        if (
+            current_rule != candidate.base_active_rule_public_id
+            or current_revision != candidate.base_pattern_revision
+        ):
+            raise KnowledgeConflictError("candidate is stale and must be rebased")
         ids = candidate.evidence_ids or []
         evidence = list(session.scalars(select(CompetitorEvidence).where(CompetitorEvidence.public_id.in_(ids)))) if ids else []
         passed, reason = self._constraints_pass(candidate, evidence)
@@ -411,6 +459,19 @@ class KnowledgeService:
         _audit(session, actor=actor, action="candidate_activated", entity_type="candidate", entity_id=candidate.public_id or str(candidate.id), previous=previous, new=KnowledgeStatus.ACTIVE.value, trace_id=candidate.trace_id)
         return pattern
 
+    @staticmethod
+    def _active_token(session: Session, kind: str) -> tuple[str | None, int | None]:
+        pattern = session.scalar(select(KnowledgePattern).where(KnowledgePattern.kind == kind))
+        if pattern is None:
+            return None, None
+        version = session.scalar(
+            select(RuleVersion).where(
+                RuleVersion.pattern_id == pattern.id,
+                RuleVersion.status == KnowledgeStatus.ACTIVE,
+            )
+        )
+        return (version.public_id if version is not None else None), pattern.revision
+
     def record_accepted_edit(self, candidate_id: int, *, feedback_id: str, row_id: str) -> KnowledgeCandidate:
         if not feedback_id or not row_id or len(feedback_id) > 128 or len(row_id) > 128:
             raise KnowledgeValidationError("invalid feedback reference")
@@ -457,13 +518,18 @@ class KnowledgeService:
             _audit(session, actor=actor, action="candidate_rejected", entity_type="candidate", entity_id=candidate.public_id or str(candidate.id), previous=previous, new=KnowledgeStatus.REJECTED.value)
             return candidate
 
-    def rollback_pattern(self, pattern_id: int, *, actor: str, target_version_id: str | None = None) -> PatternTransitionRead:
+    def rollback_pattern(
+        self, pattern_id: int, *, actor: str, target_version_id: str | None = None,
+        expected_rule_version: str | None = None,
+    ) -> PatternTransitionRead:
         with self._lock, self._write_session() as session:
             pattern = session.get(KnowledgePattern, pattern_id)
             if pattern is None:
                 raise KnowledgeNotFoundError
             versions = list(session.scalars(select(RuleVersion).where(RuleVersion.pattern_id == pattern.id).order_by(RuleVersion.sequence)))
             active = next((version for version in reversed(versions) if version.status is KnowledgeStatus.ACTIVE), None)
+            if expected_rule_version is not None and (active is None or active.version != expected_rule_version):
+                raise KnowledgeConflictError("rollback request is stale")
             eligible = [version for version in versions if active and version.sequence < active.sequence]
             target = next((version for version in eligible if version.public_id == target_version_id), None) if target_version_id else (eligible[-1] if eligible else None)
             if target is None or active is None or target.id == active.id:

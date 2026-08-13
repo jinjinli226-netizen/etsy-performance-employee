@@ -457,6 +457,91 @@ def _task7_trust_hardening(connection: Connection) -> None:
     ))
 
 
+def _task7_candidate_cas_and_capacity(connection: Connection) -> None:
+    columns = _columns(connection, "knowledge_candidates")
+    if "base_active_rule_public_id" not in columns:
+        connection.execute(text("ALTER TABLE knowledge_candidates ADD COLUMN base_active_rule_public_id VARCHAR(36)"))
+    if "base_pattern_revision" not in columns:
+        connection.execute(text("ALTER TABLE knowledge_candidates ADD COLUMN base_pattern_revision INTEGER"))
+    connection.execute(text(
+        "UPDATE knowledge_candidates SET "
+        "base_active_rule_public_id=(SELECT rv.public_id FROM knowledge_patterns kp "
+        "JOIN rule_versions rv ON rv.pattern_id=kp.id AND rv.status='active' "
+        "WHERE kp.kind=knowledge_candidates.kind), "
+        "base_pattern_revision=(SELECT kp.revision FROM knowledge_patterns kp "
+        "WHERE kp.kind=knowledge_candidates.kind) "
+        "WHERE status='proposed' AND base_pattern_revision IS NULL"
+    ))
+    connection.execute(text(
+        "CREATE TABLE IF NOT EXISTS knowledge_capacity_state ("
+        "id INTEGER PRIMARY KEY CHECK (id=1), status VARCHAR(31) NOT NULL, "
+        "evidence_count INTEGER NOT NULL, record_limit INTEGER NOT NULL, "
+        "oversized_count INTEGER NOT NULL, updated_at DATETIME NOT NULL)"
+    ))
+    evidence = list(connection.execute(text(
+        "SELECT public_id,title,snapshot,tags FROM competitor_evidence ORDER BY public_id"
+    )).mappings())
+    count = len(evidence)
+    oversized = sum(
+        len(str(row["snapshot"]).encode("utf-8")) > 20_000
+        or len(str(row["title"]).encode("utf-8")) > 500
+        for row in evidence
+    )
+    status = "exceeded" if count > 500 or oversized or _legacy_guard_too_large(evidence) else "ready"
+    connection.execute(text(
+        "INSERT INTO knowledge_capacity_state "
+        "(id,status,evidence_count,record_limit,oversized_count,updated_at) "
+        "VALUES (1,:status,:count,500,:oversized,CURRENT_TIMESTAMP) "
+        "ON CONFLICT(id) DO UPDATE SET status=excluded.status, evidence_count=excluded.evidence_count, "
+        "record_limit=excluded.record_limit, oversized_count=excluded.oversized_count, updated_at=CURRENT_TIMESTAMP"
+    ), {"status": status, "count": count, "oversized": oversized})
+    condition = (
+        "(NEW.base_pattern_revision IS NOT NULL AND NEW.base_pattern_revision < 0) OR "
+        "(NEW.base_active_rule_public_id IS NOT NULL AND "
+        "(length(NEW.base_active_rule_public_id)!=36 OR NEW.base_active_rule_public_id != lower(NEW.base_active_rule_public_id)))"
+    )
+    for operation in ("INSERT", "UPDATE"):
+        name = f"trg_knowledge_candidates_v7_base_{operation.casefold()}"
+        connection.execute(text(f"DROP TRIGGER IF EXISTS {name}"))
+        connection.execute(text(
+            f"CREATE TRIGGER {name} BEFORE {operation} ON knowledge_candidates WHEN {condition} "
+            "BEGIN SELECT RAISE(ABORT, 'knowledge candidate base token violation'); END"
+        ))
+
+
+def _legacy_guard_too_large(evidence: list[dict]) -> bool:
+    if not evidence:
+        return False
+    import hashlib
+    from app.knowledge.originality import OriginalityGuard
+
+    def digest(value: object) -> str:
+        encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    guard = OriginalityGuard()
+    records = []
+    for row in evidence:
+        try:
+            tags = json.loads(row["tags"]) if isinstance(row["tags"], str) else row["tags"]
+        except (TypeError, ValueError):
+            tags = []
+        tags = tags if isinstance(tags, list) else []
+        shingles = guard.fingerprint_texts([row["title"], row["snapshot"], *tags])
+        if len(shingles) > 30_000:
+            return True
+        record = {"id": row["public_id"], "shingles": shingles}
+        records.append({**record, "content_sha256": digest(record)})
+    export_id = "eg-" + digest(records)[:32]
+    payload = {
+        "schema_version": 1, "export_id": export_id, "issuer": "local-evidence-guard-v1",
+        "threshold": 0.72, "records": records,
+    }
+    envelope = {**payload, "content_sha256": digest(payload)}
+    encoded = json.dumps(envelope, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return len(encoded) > 8 * 1024 * 1024
+
+
 MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (1, _task4_chat_columns),
     (2, _task6_excel_job_columns),
@@ -465,6 +550,7 @@ MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (4, _task6_legacy_policy_and_constraints),
     (5, _task7_controlled_learning),
     (6, _task7_trust_hardening),
+    (7, _task7_candidate_cas_and_capacity),
 )
 
 

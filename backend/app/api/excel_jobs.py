@@ -11,6 +11,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from app.excel_jobs.schemas import ExcelJobPage, ExcelJobRead
 from app.excel_jobs.service import ExcelJobService, JobConflictError, JobNotFoundError
 from app.excel_jobs.storage import StorageError, store_upload
+from app.knowledge.service import KnowledgeCapacityError
 
 
 router = APIRouter(prefix="/api/excel-jobs", tags=["excel-jobs"])
@@ -53,6 +54,11 @@ async def create_excel_job(request: Request, file: UploadFile = File(...)):
         return view_payload(job)
     except StorageError as exc:
         raise HTTPException(status_code=exc.status_code, detail={"code": exc.code, "message": str(exc)}) from exc
+    except KnowledgeCapacityError as exc:
+        raise HTTPException(status_code=507, detail={
+            "code": "knowledge_capacity_exceeded",
+            "message": "Knowledge evidence capacity must be resolved before generation.",
+        }) from exc
     except JobConflictError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -11,8 +10,7 @@ from app.knowledge.schemas import KnowledgeKind
 
 
 MAX_ENVELOPE_BYTES = 128 * 1024
-_CONTROL_KEY = re.compile(r'"(?:event|type)"', re.IGNORECASE)
-_CONTROL_VALUE = re.compile(r'(?:knowledge_candidate|learning_batch)', re.IGNORECASE)
+MAX_REPLY_BYTES = 1024 * 1024
 
 
 class KnowledgeCandidatePayload(BaseModel):
@@ -60,36 +58,115 @@ class ParsedEmployeeReply:
 
 
 def parse_final_envelopes(text: str) -> ParsedEmployeeReply:
-    """Strip every suspected control frame, including malformed or oversized frames."""
+    """Decode bounded JSON objects before deciding whether they are control frames."""
+    if len(text.encode("utf-8")) > MAX_REPLY_BYTES:
+        return ParsedEmployeeReply(visible_text="", envelopes=[], control_errors=["envelope_invalid"])
+    lines = text.rstrip().splitlines()
     visible: list[str] = []
     envelopes: list[dict[str, Any]] = []
     errors: list[str] = []
-    for line in text.rstrip().splitlines():
+    index = 0
+    while index < len(lines):
+        line = lines[index]
         raw = line.strip()
-        suspected_control = raw.startswith("{") and _CONTROL_KEY.search(raw) and _CONTROL_VALUE.search(raw)
-        if not suspected_control:
+        if not raw.startswith("{"):
             visible.append(line)
+            index += 1
             continue
-        if len(raw.encode("utf-8")) > MAX_ENVELOPE_BYTES:
+        block, consumed, complete, oversized = _bounded_json_object(lines, index)
+        index += consumed
+        if oversized or not complete:
             errors.append("envelope_invalid")
             continue
         try:
-            value = json.loads(raw)
+            value = json.loads(block)
         except (json.JSONDecodeError, UnicodeError):
             errors.append("envelope_invalid")
             continue
-        if not isinstance(value, dict) or value.get("event") not in {"knowledge_candidate", "learning_batch"}:
-            errors.append("envelope_invalid")
+        if not isinstance(value, dict):
+            visible.extend(block.splitlines())
+            continue
+        event = value.get("event")
+        fallback_type = value.get("type")
+        if event not in {"knowledge_candidate", "learning_batch"}:
+            if fallback_type in {"knowledge_candidate", "learning_batch"}:
+                errors.append("envelope_invalid")
+            else:
+                visible.extend(block.splitlines())
             continue
         payload = value.get("payload")
         if not isinstance(payload, dict):
             errors.append("envelope_invalid")
             continue
         try:
-            model = KnowledgeCandidatePayload if value["event"] == "knowledge_candidate" else LearningBatchPayload
+            model = KnowledgeCandidatePayload if event == "knowledge_candidate" else LearningBatchPayload
             validated = model.model_validate(payload)
         except ValidationError:
             errors.append("envelope_invalid")
             continue
-        envelopes.append({"event": value["event"], "payload": validated.model_dump(mode="json")})
+        envelopes.append({"event": event, "payload": validated.model_dump(mode="json")})
     return ParsedEmployeeReply(visible_text="\n".join(visible).strip(), envelopes=envelopes, control_errors=errors)
+
+
+def _bounded_json_object(lines: list[str], start: int) -> tuple[str, int, bool, bool]:
+    block: list[str] = []
+    depth = 0
+    in_string = False
+    escaped = False
+    total = 0
+    for index in range(start, len(lines)):
+        line = lines[index]
+        if index > start and depth > 0 and line and not line[0].isspace() and not line.lstrip().startswith(("}", "]")):
+            return "\n".join(block), len(block), False, False
+        encoded_length = len(line.encode("utf-8"))
+        total += encoded_length + (1 if block else 0)
+        if encoded_length > MAX_ENVELOPE_BYTES or total > MAX_ENVELOPE_BYTES:
+            consumed = len(block) + _drain_json_block(lines, index, depth, in_string, escaped)
+            return "\n".join(block), consumed, False, True
+        block.append(line)
+        for char in line:
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char in "{[":
+                depth += 1
+            elif char in "}]":
+                depth -= 1
+                if depth < 0:
+                    return "\n".join(block), len(block), True, False
+        if depth == 0 and not in_string:
+            return "\n".join(block), len(block), True, False
+    return "\n".join(block), len(block), False, False
+
+
+def _drain_json_block(lines: list[str], start: int, depth: int, in_string: bool, escaped: bool) -> int:
+    """Count the rest of an oversized frame without retaining its raw content."""
+    for index in range(start, len(lines)):
+        line = lines[index]
+        if index > start and depth > 0 and line and not line[0].isspace() and not line.lstrip().startswith(("}", "]")):
+            return index - start
+        for char in line:
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char in "{[":
+                depth += 1
+            elif char in "}]":
+                depth -= 1
+        if depth <= 0 and not in_string:
+            return index - start + 1
+    return len(lines) - start
