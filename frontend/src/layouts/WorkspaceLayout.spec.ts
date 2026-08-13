@@ -1,5 +1,5 @@
-import { mount } from "@vue/test-utils";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { enableAutoUnmount, mount } from "@vue/test-utils";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { nextTick } from "vue";
 import { createMemoryHistory, createRouter } from "vue-router";
 
@@ -7,6 +7,8 @@ import App from "../App.vue";
 import ChatView from "../views/ChatView.vue";
 import ExcelView from "../views/ExcelView.vue";
 import EmployeeStatus from "../components/EmployeeStatus.vue";
+
+enableAutoUnmount(afterEach);
 
 const createTestRouter = (initialPath = "/chat") => {
   const router = createRouter({
@@ -34,6 +36,8 @@ describe("WorkspaceLayout", () => {
 
   afterEach(() => {
     document.body.style.overflow = "";
+    localStorage.clear();
+    setViewport(1440);
   });
 
   it("renders exactly two primary navigation destinations and marks the active route", async () => {
@@ -132,7 +136,57 @@ describe("WorkspaceLayout", () => {
     window.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", shiftKey: true, bubbles: true }));
     expect(document.activeElement).toBe(last);
 
+  });
+
+  it("restores an existing body overflow style without overwriting later external changes", async () => {
+    setViewport(390);
+    document.body.style.overflow = "clip";
+    const router = createTestRouter();
+    await router.isReady();
+    const wrapper = mount(App, { global: { plugins: [router] }, attachTo: document.body });
+    await nextTick();
+
+    await wrapper.get('[aria-label="打开导航菜单"]').trigger("click");
+    expect(document.body.style.overflow).toBe("hidden");
+    await wrapper.get('[data-testid="drawer-backdrop"]').trigger("click");
+    expect(document.body.style.overflow).toBe("clip");
+
+    await wrapper.get('[aria-label="打开导航菜单"]').trigger("click");
+    document.body.style.overflow = "scroll";
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+    await nextTick();
+    expect(document.body.style.overflow).toBe("scroll");
+  });
+
+  it("restores the original body overflow when unmounted while the drawer is open", async () => {
+    setViewport(390);
+    document.body.style.overflow = "clip";
+    const router = createTestRouter();
+    await router.isReady();
+    const wrapper = mount(App, { global: { plugins: [router] }, attachTo: document.body });
+    await nextTick();
+
+    await wrapper.get('[aria-label="打开导航菜单"]').trigger("click");
     wrapper.unmount();
+
+    expect(document.body.style.overflow).toBe("clip");
+  });
+
+  it("removes its global event listeners when unmounted", async () => {
+    const addSpy = vi.spyOn(window, "addEventListener");
+    const removeSpy = vi.spyOn(window, "removeEventListener");
+    const router = createTestRouter();
+    await router.isReady();
+    const wrapper = mount(App, { global: { plugins: [router] } });
+
+    const resizeHandler = addSpy.mock.calls.find(([type]) => type === "resize")?.[1];
+    const keydownHandler = addSpy.mock.calls.find(([type]) => type === "keydown")?.[1];
+    wrapper.unmount();
+
+    expect(removeSpy).toHaveBeenCalledWith("resize", resizeHandler);
+    expect(removeSpy).toHaveBeenCalledWith("keydown", keydownHandler);
+    addSpy.mockRestore();
+    removeSpy.mockRestore();
   });
 
   it("closes the mobile drawer by backdrop and after route navigation", async () => {
@@ -156,6 +210,38 @@ describe("WorkspaceLayout", () => {
 
     wrapper.unmount();
   });
+
+  it.each([1440, 390])("focuses the page heading and updates the document title after navigation at %ipx", async (width) => {
+    setViewport(width);
+    const router = createTestRouter();
+    await router.isReady();
+    const wrapper = mount(App, { global: { plugins: [router] }, attachTo: document.body });
+    await nextTick();
+    const initialHeading = wrapper.get<HTMLElement>("h1").element;
+    expect(document.activeElement).not.toBe(initialHeading);
+
+    if (width === 390) await wrapper.get('[aria-label="打开导航菜单"]').trigger("click");
+    const navigated = new Promise<void>((resolve) => router.afterEach(() => resolve()));
+    await router.push("/excel");
+    await navigated;
+    await nextTick();
+
+    expect(document.activeElement).toBe(wrapper.get("h1").element);
+    expect(document.title).toBe("Listing 表格 · Etsy 表演服数字员工");
+    if (width === 390) {
+      expect(wrapper.get("#workspace-navigation").attributes()).toHaveProperty("inert");
+      expect(document.activeElement).not.toBe(wrapper.get('[aria-label="打开导航菜单"]').element);
+    }
+  });
+
+  it("exposes only one live employee status in the workspace", async () => {
+    const router = createTestRouter();
+    await router.isReady();
+    const wrapper = mount(App, { global: { plugins: [router] } });
+
+    expect(wrapper.findAll('[role="status"][aria-live="polite"]')).toHaveLength(1);
+    expect(wrapper.findAll('[aria-label^="数字员工状态"]')).toHaveLength(2);
+  });
 });
 
 describe("EmployeeStatus", () => {
@@ -165,7 +251,7 @@ describe("EmployeeStatus", () => {
     ["offline", "离线"],
     ["error", "异常"],
   ] as const)("renders the %s state with a semantic label", (status, label) => {
-    const wrapper = mount(EmployeeStatus, { props: { status } });
+    const wrapper = mount(EmployeeStatus, { props: { status, announce: true } });
 
     expect(wrapper.attributes("role")).toBe("status");
     expect(wrapper.attributes("aria-live")).toBe("polite");

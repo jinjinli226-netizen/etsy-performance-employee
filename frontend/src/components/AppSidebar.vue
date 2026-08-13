@@ -18,7 +18,7 @@ defineProps<{
 
 defineEmits<{
   toggleCollapse: [];
-  closeMobile: [];
+  closeMobile: [restoreFocus?: boolean];
 }>();
 
 const navigation = [
@@ -47,7 +47,7 @@ const navigation = [
         type="button"
         aria-label="关闭导航菜单"
         :tabindex="mobile && !mobileOpen ? -1 : undefined"
-        @click="$emit('closeMobile')"
+        @click="$emit('closeMobile', true)"
       >
         <X :size="18" aria-hidden="true" />
       </button>
@@ -62,7 +62,7 @@ const navigation = [
         :title="collapsed && !mobile ? item.label : undefined"
         :aria-label="collapsed && !mobile ? item.label : undefined"
         :tabindex="mobile && !mobileOpen ? -1 : undefined"
-        @click="$emit('closeMobile')"
+        @click="$emit('closeMobile', false)"
       >
         <component :is="item.icon" :size="18" aria-hidden="true" />
         <span v-if="!collapsed || mobile">{{ item.label }}</span>

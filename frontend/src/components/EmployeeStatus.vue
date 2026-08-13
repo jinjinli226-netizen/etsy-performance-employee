@@ -7,8 +7,9 @@ const props = withDefaults(
   defineProps<{
     status: EmployeeState;
     compact?: boolean;
+    announce?: boolean;
   }>(),
-  { compact: false },
+  { compact: false, announce: false },
 );
 
 const labels: Record<EmployeeState, string> = {
@@ -33,8 +34,8 @@ const shortLabel = computed(() => shortLabels[props.status]);
   <div
     class="employee-status"
     :class="[`is-${status}`, { 'is-compact': compact }]"
-    role="status"
-    aria-live="polite"
+    :role="announce ? 'status' : 'group'"
+    :aria-live="announce ? 'polite' : undefined"
     :aria-label="`数字员工状态：${label}`"
     :title="compact ? `数字员工状态：${label}` : undefined"
   >

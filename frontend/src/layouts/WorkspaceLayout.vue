@@ -14,6 +14,10 @@ const employeeStatus: EmployeeState = "offline";
 const mobile = ref(false);
 const mobileOpen = ref(false);
 const menuButton = ref<HTMLButtonElement | null>(null);
+const pageHeading = ref<HTMLHeadingElement | null>(null);
+let hasHandledInitialRoute = false;
+let bodyScrollLocked = false;
+let previousBodyOverflow = "";
 const focusableSelector = 'a[href], button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])';
 
 const readCollapsedPreference = () => {
@@ -55,6 +59,22 @@ const closeMobile = (restoreFocus = false) => {
   if (restoreFocus) void nextTick(() => menuButton.value?.focus());
 };
 
+const lockBodyScroll = () => {
+  if (bodyScrollLocked) return;
+  previousBodyOverflow = document.body.style.overflow;
+  document.body.style.overflow = "hidden";
+  bodyScrollLocked = true;
+};
+
+const unlockBodyScroll = () => {
+  if (!bodyScrollLocked) return;
+  if (document.body.style.overflow === "hidden") {
+    document.body.style.overflow = previousBodyOverflow;
+  }
+  bodyScrollLocked = false;
+  previousBodyOverflow = "";
+};
+
 const handleKeydown = (event: KeyboardEvent) => {
   if (!mobileOpen.value) return;
   if (event.key === "Escape") {
@@ -85,12 +105,23 @@ const handleKeydown = (event: KeyboardEvent) => {
 };
 
 watch(mobileOpen, (isOpen) => {
-  document.body.style.overflow = isOpen ? "hidden" : "";
+  if (isOpen) lockBodyScroll();
+  else unlockBodyScroll();
 });
 
 watch(
   () => route.fullPath,
-  () => closeMobile(),
+  async () => {
+    document.title = `${routeTitle.value} · Etsy 表演服数字员工`;
+    if (!hasHandledInitialRoute) {
+      hasHandledInitialRoute = true;
+      return;
+    }
+    closeMobile();
+    await nextTick();
+    pageHeading.value?.focus();
+  },
+  { immediate: true },
 );
 
 onMounted(() => {
@@ -100,7 +131,7 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
-  document.body.style.overflow = "";
+  unlockBodyScroll();
   window.removeEventListener("resize", updateViewport);
   window.removeEventListener("keydown", handleKeydown);
 });
@@ -118,7 +149,7 @@ onBeforeUnmount(() => {
       :mobile-open="mobileOpen"
       :employee-status="employeeStatus"
       @toggle-collapse="persistCollapsed"
-      @close-mobile="closeMobile(true)"
+      @close-mobile="closeMobile"
     />
 
     <button
@@ -147,13 +178,13 @@ onBeforeUnmount(() => {
 
         <div class="workspace__heading">
           <span class="workspace__breadcrumb">表演服员工 / 工作台</span>
-          <h1>{{ routeTitle }}</h1>
+          <h1 ref="pageHeading" tabindex="-1">{{ routeTitle }}</h1>
         </div>
 
-        <EmployeeStatus class="workspace__status" :status="employeeStatus" compact />
+        <EmployeeStatus class="workspace__status" :status="employeeStatus" compact announce />
       </header>
 
-      <main id="main-content" class="workspace__content">
+      <main id="main-content" class="workspace__content" tabindex="-1">
         <RouterView />
       </main>
     </div>
