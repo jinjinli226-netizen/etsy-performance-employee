@@ -1,0 +1,38 @@
+:root {
+  color-scheme: dark;
+  --ds-canvas: #08090b;
+  --ds-canvas-soft: #0d0f12;
+  --ds-surface: #12151a;
+  --ds-surface-raised: #171b21;
+  --ds-border: rgba(255, 255, 255, 0.09);
+  --ds-border-strong: rgba(255, 255, 255, 0.16);
+  --ds-text: #f5f7fa;
+  --ds-text-secondary: #a7adb7;
+  --ds-text-muted: #737a86;
+  --ds-accent: #ff7a1a;
+  --ds-accent-hover: #ff913d;
+  --ds-success: #2ccb8c;
+  --ds-warning: #f0b44d;
+  --ds-danger: #f06464;
+  --ds-radius-label: 4px;
+  --ds-radius-control: 6px;
+  --ds-radius-frame: 8px;
+  --ds-ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+
+  --canvas: var(--ds-canvas);
+  --canvas-soft: var(--ds-canvas-soft);
+  --surface: var(--ds-surface);
+  --surface-raised: var(--ds-surface-raised);
+  --border: var(--ds-border);
+  --border-strong: var(--ds-border-strong);
+  --text: var(--ds-text);
+  --text-secondary: var(--ds-text-secondary);
+  --text-muted: var(--ds-text-muted);
+  --accent: var(--ds-accent);
+  --success: var(--ds-success);
+  --warning: var(--ds-warning);
+  --danger: var(--ds-danger);
+  --sidebar-width: 252px;
+  --sidebar-width-collapsed: 72px;
+  --topbar-height: 64px;
+}
