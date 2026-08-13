@@ -21,13 +21,19 @@ from app.db.models import (
     KnowledgePattern,
     Message,
     RuleVersion,
+    ImportedEvidenceFingerprint,
+    MigrationImport,
+    CompetitorEvidence,
 )
 from app.db.session import create_engine_for_url, create_session_factory
 from app.knowledge.schemas import KnowledgeStatus
+from app.knowledge.service import KnowledgeService, KnowledgeValidationError
 from app.main import create_app
 from app.migration.exporter import ExportError, MigrationExporter
 from app.migration.importer import ImportConflict, ImportValidationError, MigrationImporter
+from app.migration.secrets import SensitiveDataError, scan_for_secrets
 from app.core.config import Settings
+from app.migration.capability import create_capability_file, remove_owned_capability_file
 
 
 def _assets(root: Path) -> Path:
@@ -95,6 +101,7 @@ def _seed(factory) -> None:
         session.flush()
         session.add(FeedbackEvent(public_id=str(uuid4()), knowledge_candidate_id=candidate.id, feedback_id="edit-1", row_id="row-1", accepted=True, event_type="accepted_edit", payload={"field": "title"}, created_at=now))
         session.add(AuditEvent(actor="owner", action="candidate_activated", entity_type="candidate", entity_id=candidate.public_id, details={"trace_id": "trace-safe"}, created_at=now))
+        session.add(CompetitorEvidence(public_id="ev-" + "2" * 32, canonical_url="https://www.etsy.com/listing/123", source_key="etsy-listing:123", title="Crystal dance costume", snapshot="Crystal dance costume with fringe stage sparkle", tags=["dance costume"], source_timestamp=now, content_hash="c" * 64, snapshot_hash="d" * 64, created_at=now))
 
 
 def _export(tmp_path: Path) -> tuple[Path, object]:
@@ -104,6 +111,29 @@ def _export(tmp_path: Path) -> tuple[Path, object]:
     result = exporter.export(tmp_path / "employee.zip", created_at=datetime(2026, 8, 13, tzinfo=UTC))
     engine.dispose()
     return result.path, result
+
+
+def _rewrite_jsonl(package: Path, destination: Path, member: str, transform) -> Path:
+    with zipfile.ZipFile(package) as source:
+        bodies = {info.filename: source.read(info.filename) for info in source.infolist()}
+    records = [transform(json.loads(line)) for line in bodies[member].decode().splitlines() if line]
+    bodies[member] = b"".join((json.dumps(record, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode() for record in records)
+    manifest = json.loads(bodies["manifest.json"])
+    for item in manifest["files"]:
+        body = bodies[item["path"]]
+        item["size"] = len(body)
+        item["sha256"] = __import__("hashlib").sha256(body).hexdigest()
+    content = __import__("hashlib").sha256(b"".join(name.encode() + b"\0" + __import__("hashlib").sha256(body).hexdigest().encode() for name, body in sorted(bodies.items()) if name != "manifest.json")).hexdigest()
+    manifest["content_sha256"] = content
+    manifest["package_id"] = "pkg-" + content[:32]
+    bodies["manifest.json"] = (json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    with zipfile.ZipFile(destination, "w", zipfile.ZIP_DEFLATED) as target:
+        for name, body in bodies.items():
+            info = zipfile.ZipInfo(name)
+            info.external_attr = (stat.S_IFREG | 0o644) << 16
+            info.compress_type = zipfile.ZIP_DEFLATED
+            target.writestr(info, body)
+    return destination
 
 
 def test_export_is_portable_deterministic_and_excludes_sensitive_evidence(tmp_path: Path) -> None:
@@ -153,7 +183,7 @@ def test_export_refuses_secret_or_tampered_repository_asset(tmp_path: Path) -> N
 def test_import_validates_then_restores_relationships_and_guard_only(tmp_path: Path) -> None:
     package, result = _export(tmp_path)
     engine, target_factory = _database(tmp_path / "target.db")
-    importer = MigrationImporter(target_factory, employee_assets=tmp_path / "target-assets", repository_assets=tmp_path / "repo" / "employee", guard_path=tmp_path / "trust" / "evidence-guard.json", workspace=tmp_path / "imports")
+    importer = MigrationImporter(target_factory, repository_assets=tmp_path / "repo" / "employee", workspace=tmp_path / "imports")
     report = importer.import_package(package, dry_run=True)
     assert report.package_id == result.package_id
     assert report.credential_status == "pending"
@@ -164,19 +194,22 @@ def test_import_validates_then_restores_relationships_and_guard_only(tmp_path: P
     assert report.imported is True
     with target_factory() as session:
         conversation = session.query(Conversation).one()
-        assert "Prefer concise titles" in conversation.messages[0].content
+        assert conversation.messages[0].content == "[evidence content omitted]"
         assert "etsy.com/listing" not in conversation.messages[0].content
         assert conversation.employee_session_id is None
         assert conversation.attachments[0].path.startswith("migration/attachments/not-included/")
         assert session.query(KnowledgePattern).one().source_candidate is not None
         assert session.query(RuleVersion).one().pattern is not None
-    guard = json.loads((tmp_path / "trust" / "evidence-guard.json").read_text(encoding="utf-8"))
-    assert guard["issuer"] == "local-evidence-guard-v1"
-    assert guard["content_sha256"]
-    assert guard["records"][0]["id"] == "ev-" + "2" * 32
-    assert "url" not in guard["records"][0]
-    with pytest.raises(ImportConflict):
-        importer.import_package(package)
+        assert session.query(ImportedEvidenceFingerprint).one().public_id == "ev-" + "2" * 32
+        assert session.query(MigrationImport).one().credential_status == "pending"
+        assert session.execute(__import__("sqlalchemy").text("SELECT count(*) FROM conversation_messages_fts WHERE conversation_messages_fts MATCH 'evidence'")).scalar_one() == 1
+        assert session.execute(__import__("sqlalchemy").text("SELECT count(*) FROM knowledge_patterns_fts WHERE knowledge_patterns_fts MATCH 'buyer'")).scalar_one() == 1
+    assert not (tmp_path / "target-assets").exists()
+    repeated = importer.import_package(package)
+    assert repeated.imported is True
+    with target_factory() as session:
+        assert session.query(MigrationImport).count() == 1
+        assert session.query(Conversation).count() == 1
     engine.dispose()
 
 
@@ -184,9 +217,89 @@ def test_import_rejects_package_assets_that_do_not_match_local_repository(tmp_pa
     package, _ = _export(tmp_path)
     (tmp_path / "repo" / "employee" / "SOUL.md").write_text("tampered", encoding="utf-8")
     _, factory = _database(tmp_path / "target.db")
-    importer = MigrationImporter(factory, employee_assets=tmp_path / "assets", repository_assets=tmp_path / "repo" / "employee", workspace=tmp_path / "imports")
+    importer = MigrationImporter(factory, repository_assets=tmp_path / "repo" / "employee", workspace=tmp_path / "imports")
     with pytest.raises(ImportValidationError, match="application version"):
         importer.import_package(package, dry_run=True)
+
+
+def test_import_requires_explicit_trusted_repository_root(tmp_path: Path) -> None:
+    package, _ = _export(tmp_path)
+    _, factory = _database(tmp_path / "target.db")
+    with pytest.raises(ImportValidationError, match="trusted repository"):
+        MigrationImporter(factory, workspace=tmp_path / "imports").import_package(package, dry_run=True)
+
+
+def test_secret_scanner_catches_multiple_credentials_without_hash_false_positives() -> None:
+    for value in ("github_pat_" + "a" * 40, "xoxb-123456789-abcdefghijklmnop", "AKIA" + "A" * 16, "AIza" + "A" * 35, "Authorization: Bearer abc.def.ghi", "postgresql://owner:secret@example.test/db"):
+        with pytest.raises(SensitiveDataError):
+            scan_for_secrets({"note": value})
+    scan_for_secrets({"sha256": "a" * 64, "id": str(uuid4()), "abstract": "sequence and color balance"})
+
+
+def test_imported_fingerprints_feed_runtime_originality_guard(tmp_path: Path) -> None:
+    package, _ = _export(tmp_path)
+    _, factory = _database(tmp_path / "target.db")
+    importer = MigrationImporter(factory, repository_assets=tmp_path / "repo" / "employee", workspace=tmp_path / "imports")
+    importer.import_package(package)
+    service = KnowledgeService(factory, export_dir=tmp_path / "trust", originality_threshold=.72)
+    trust = service.export_evidence_guard(tmp_path / "guard.json")
+    envelope = json.loads(trust.path.read_text(encoding="utf-8"))
+    assert envelope["records"][0]["id"] == "ev-" + "2" * 32
+    assert envelope["records"][0]["shingles"]
+
+
+def test_existing_evidence_or_excel_job_is_reported_as_dry_run_conflict(tmp_path: Path) -> None:
+    package, _ = _export(tmp_path)
+    _, factory = _database(tmp_path / "target.db")
+    with factory.begin() as session:
+        from app.db.models import ExcelJob
+        from app.excel_jobs.schemas import JobStatus
+        session.add(ExcelJob(public_id=str(uuid4()), source_filename="existing.xlsx", source_sha256="a" * 64, source_size_bytes=1, status=JobStatus.QUEUED))
+    importer = MigrationImporter(factory, repository_assets=tmp_path / "repo" / "employee", workspace=tmp_path / "imports")
+    report = importer.import_package(package, dry_run=True)
+    assert report.conflicts == ["excel_jobs"]
+    with pytest.raises(ImportConflict):
+        importer.import_package(package)
+
+
+def test_export_keeps_rule_history_and_ancestor_candidate_lineage(tmp_path: Path) -> None:
+    engine, factory = _database(tmp_path / "source.db")
+    _seed(factory)
+    with factory.begin() as session:
+        active_pattern = session.query(KnowledgePattern).one()
+        ancestor = KnowledgeCandidate(public_id="kc-" + "3" * 32, title="Previous version", proposal={}, kind="title_structure", abstract_summary="Earlier safe abstraction", confidence=.9, evidence_ids=[], source_timestamps={}, revision=0, status=KnowledgeStatus.ROLLED_BACK)
+        session.add(ancestor); session.flush()
+        session.add(RuleVersion(public_id=str(uuid4()), pattern=active_pattern, candidate=ancestor, version="knowledge-title-v0", sequence=0, rules={"order": "style-first"}, status=KnowledgeStatus.ROLLED_BACK, created_at=datetime.now(UTC)))
+    exporter = MigrationExporter(factory, employee_assets=_assets(tmp_path / "repo"), workspace=tmp_path / "migration")
+    package = exporter.export(tmp_path / "history.zip").path
+    with zipfile.ZipFile(package) as archive:
+        candidates = [json.loads(line) for line in archive.read("data/knowledge_candidates.jsonl").decode().splitlines()]
+        rules = [json.loads(line) for line in archive.read("data/rule_versions.jsonl").decode().splitlines()]
+    assert {item["status"] for item in candidates} == {"active", "rolled_back"}
+    assert {item["sequence"] for item in rules} == {0, 1}
+    engine.dispose()
+
+
+def test_export_rejects_raw_competitor_substring_hidden_in_audit(tmp_path: Path) -> None:
+    engine, factory = _database(tmp_path / "source.db")
+    _seed(factory)
+    with factory.begin() as session:
+        session.add(AuditEvent(actor="owner", action="note", entity_type="candidate", entity_id="safe", details={"note": "crystal dance costume with fringe stage sparkle"}))
+    exporter = MigrationExporter(factory, employee_assets=_assets(tmp_path / "repo"), workspace=tmp_path / "migration")
+    with pytest.raises(ExportError, match="raw competitor"):
+        exporter.export(tmp_path / "raw.zip")
+    engine.dispose()
+
+
+def test_dry_run_rejects_broken_relationship_before_database_write(tmp_path: Path) -> None:
+    package, _ = _export(tmp_path)
+    attacked = _rewrite_jsonl(package, tmp_path / "broken.zip", "data/messages.jsonl", lambda row: {**row, "conversation_id": "missing-conversation"})
+    _, factory = _database(tmp_path / "target.db")
+    importer = MigrationImporter(factory, repository_assets=tmp_path / "repo" / "employee", workspace=tmp_path / "imports")
+    with pytest.raises(ImportValidationError, match="relationship"):
+        importer.import_package(attacked, dry_run=True)
+    with factory() as session:
+        assert session.query(Conversation).count() == 0
 
 
 @pytest.mark.parametrize("member", ["../escape.json", "/absolute.json", "C:/drive.json", "DATA/conversations.jsonl"])
@@ -198,7 +311,7 @@ def test_import_rejects_unsafe_or_case_colliding_members(tmp_path: Path, member:
             target.writestr(info, source.read(info.filename))
         target.writestr(member, b"{}\n")
     _, factory = _database(tmp_path / "target.db")
-    importer = MigrationImporter(factory, employee_assets=tmp_path / "assets", workspace=tmp_path / "imports")
+    importer = MigrationImporter(factory, repository_assets=tmp_path / "repo" / "employee", workspace=tmp_path / "imports")
     with pytest.raises(ImportValidationError):
         importer.import_package(attacked, dry_run=True)
     assert not (tmp_path / "escape.json").exists()
@@ -218,20 +331,20 @@ def test_import_rejects_checksum_corruption_and_symlink_entries(tmp_path: Path) 
         target.writestr(link, "target")
     _, factory = _database(tmp_path / "target.db")
     with pytest.raises(ImportValidationError):
-        MigrationImporter(factory, employee_assets=tmp_path / "assets", workspace=tmp_path / "imports").import_package(corrupted, dry_run=True)
+        MigrationImporter(factory, repository_assets=tmp_path / "repo" / "employee", workspace=tmp_path / "imports").import_package(corrupted, dry_run=True)
 
 
 def test_import_rolls_back_database_and_assets_on_mid_import_failure(tmp_path: Path, monkeypatch) -> None:
     package, _ = _export(tmp_path)
     _, factory = _database(tmp_path / "target.db")
-    importer = MigrationImporter(factory, employee_assets=tmp_path / "assets", workspace=tmp_path / "imports")
-    monkeypatch.setattr(importer, "_import_rules", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("boom")))
+    importer = MigrationImporter(factory, repository_assets=tmp_path / "repo" / "employee", workspace=tmp_path / "imports")
+    monkeypatch.setattr(importer, "_commit_graph", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("boom")))
     with pytest.raises(RuntimeError, match="boom"):
         importer.import_package(package)
     with factory() as session:
         assert session.query(Conversation).count() == 0
         assert session.query(KnowledgeCandidate).count() == 0
-    assert not (tmp_path / "assets").exists()
+        assert session.query(MigrationImport).count() == 0
 
 
 def test_migration_api_requires_capability_and_supports_dry_run(tmp_path: Path) -> None:
@@ -259,3 +372,41 @@ def test_package_script_does_not_accept_secrets_on_argv() -> None:
     assert "invoke-expression" not in lowered and "start-process" not in lowered
     assert "x-migration-capability" in lowered
     assert "test-path" in lowered
+    assert "getenvironmentvariable" not in lowered
+    assert "migration-capability" in lowered
+    assert "move-item" in lowered
+
+
+def test_capability_file_is_random_private_and_owner_cleanup_is_bounded(tmp_path: Path) -> None:
+    first = create_capability_file(tmp_path)
+    token = first.path.read_text(encoding="ascii")
+    assert token == first.token and len(token) >= 32
+    assert first.path.name == "migration-capability"
+    first.path.write_text("replaced", encoding="ascii")
+    remove_owned_capability_file(first)
+    assert first.path.exists()
+    first.path.write_text(token, encoding="ascii")
+    remove_owned_capability_file(first)
+    assert not first.path.exists()
+
+
+def test_export_api_persists_manifest_hash_and_refuses_symlink_download(tmp_path: Path) -> None:
+    settings = Settings(data_dir=tmp_path / "runtime", database_url=f"sqlite:///{(tmp_path / 'api.db').as_posix()}")
+    app = create_app(settings=settings)
+    with TestClient(app) as client:
+        app.state.migration_exporter.employee_assets = _assets(tmp_path / "repo")
+        token = app.state.migration_capability
+        created = client.post("/api/migration/exports", headers={"X-Migration-Capability": token})
+        assert created.status_code == 200
+        payload = created.json()
+        assert len(payload["file_sha256"]) == 64
+        downloaded = client.get(f"/api/migration/exports/{payload['filename']}", headers={"X-Migration-Capability": token})
+        assert downloaded.status_code == 200
+        assert downloaded.headers["X-Content-SHA256"] == payload["file_sha256"]
+        exported = settings.data_dir / "migration-packages" / payload["filename"]
+        exported.unlink()
+        try:
+            exported.symlink_to(Path(__file__))
+        except OSError:
+            pytest.skip("symlinks unavailable")
+        assert client.get(f"/api/migration/exports/{payload['filename']}", headers={"X-Migration-Capability": token}).status_code == 404

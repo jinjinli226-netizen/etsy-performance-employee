@@ -16,7 +16,7 @@ from uuid import uuid4
 from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.db.models import AuditEvent, CompetitorEvidence, FeedbackEvent, KnowledgeCandidate, KnowledgePattern, RuleVersion
+from app.db.models import AuditEvent, CompetitorEvidence, FeedbackEvent, ImportedEvidenceFingerprint, KnowledgeCandidate, KnowledgePattern, RuleVersion
 from app.knowledge.originality import OriginalityGuard
 from app.knowledge.promotion import PolicyValidationError, PolicyValidator, PolicyValidatorProtocol, decide_promotion
 from app.knowledge.schemas import (
@@ -643,7 +643,8 @@ class KnowledgeService:
     def export_evidence_guard(self, path: Path) -> KnowledgeTrust:
         with self.session_factory() as session:
             evidence = list(session.scalars(select(CompetitorEvidence).order_by(CompetitorEvidence.public_id)))
-        envelope, encoded = self._guard_envelope(evidence)
+            imported = list(session.scalars(select(ImportedEvidenceFingerprint).order_by(ImportedEvidenceFingerprint.public_id)))
+        envelope, encoded = self._guard_envelope(evidence, imported)
         export_id = envelope["export_id"]
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_name(path.name + ".tmp-" + uuid4().hex)
@@ -654,8 +655,9 @@ class KnowledgeService:
         os.chmod(path, stat.S_IREAD)
         return KnowledgeTrust(path.resolve(), export_id, envelope["content_sha256"], hashlib.sha256(encoded).hexdigest())
 
-    def _guard_envelope(self, evidence: list[CompetitorEvidence]) -> tuple[dict[str, object], bytes]:
-        if len(evidence) > self.max_guard_records:
+    def _guard_envelope(self, evidence: list[CompetitorEvidence], imported: list[ImportedEvidenceFingerprint] | None = None) -> tuple[dict[str, object], bytes]:
+        imported = imported or []
+        if len(evidence) + len(imported) > self.max_guard_records:
             raise KnowledgeCapacityError("evidence guard capacity exceeded")
         records = []
         for item in sorted(evidence, key=lambda record: record.public_id):
@@ -664,6 +666,15 @@ class KnowledgeService:
                 raise KnowledgeCapacityError("evidence guard capacity exceeded")
             record_payload = {"id": item.public_id, "shingles": shingles}
             records.append({**record_payload, "content_sha256": _canonical_hash(record_payload)})
+        existing = {record["id"] for record in records}
+        for item in imported:
+            if item.public_id in existing:
+                continue
+            if len(item.shingles) > MAX_GUARD_SHINGLES_PER_RECORD:
+                raise KnowledgeCapacityError("evidence guard capacity exceeded")
+            record_payload = {"id": item.public_id, "shingles": sorted(item.shingles)}
+            records.append({**record_payload, "content_sha256": _canonical_hash(record_payload)})
+        records.sort(key=lambda record: record["id"])
         identity = _canonical_hash(records)
         export_id = "eg-" + identity[:32]
         payload = {"schema_version": 1, "export_id": export_id, "issuer": "local-evidence-guard-v1", "threshold": self.originality.threshold, "records": records}

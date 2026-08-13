@@ -542,6 +542,30 @@ def _legacy_guard_too_large(evidence: list[dict]) -> bool:
     return len(encoded) > 8 * 1024 * 1024
 
 
+def _task8_migration_and_fts(connection: Connection) -> None:
+    connection.execute(text(
+        "CREATE TABLE IF NOT EXISTS imported_evidence_fingerprints ("
+        "id INTEGER PRIMARY KEY, public_id VARCHAR(35) NOT NULL UNIQUE, shingles JSON NOT NULL, "
+        "source_timestamp DATETIME, threshold FLOAT NOT NULL, content_hash VARCHAR(64), "
+        "snapshot_hash VARCHAR(64), created_at DATETIME NOT NULL)"
+    ))
+    connection.execute(text(
+        "CREATE TABLE IF NOT EXISTS migration_imports ("
+        "id INTEGER PRIMARY KEY, package_id VARCHAR(36) NOT NULL UNIQUE, content_sha256 VARCHAR(64) NOT NULL UNIQUE, "
+        "profile_id VARCHAR(63) NOT NULL, credential_status VARCHAR(31) NOT NULL, record_counts JSON NOT NULL, created_at DATETIME NOT NULL)"
+    ))
+    connection.execute(text(
+        "CREATE TABLE IF NOT EXISTS migration_exports ("
+        "id INTEGER PRIMARY KEY, package_id VARCHAR(36) NOT NULL UNIQUE, content_sha256 VARCHAR(64) NOT NULL, "
+        "filename VARCHAR(255) NOT NULL UNIQUE, file_sha256 VARCHAR(64) NOT NULL, size_bytes BIGINT NOT NULL, created_at DATETIME NOT NULL)"
+    ))
+    try:
+        connection.execute(text("CREATE VIRTUAL TABLE IF NOT EXISTS conversation_messages_fts USING fts5(content, message_id UNINDEXED)"))
+        connection.execute(text("CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_patterns_fts USING fts5(abstract_summary, pattern_id UNINDEXED)"))
+    except Exception as error:
+        raise RuntimeError("SQLite FTS5 support is required") from error
+
+
 MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (1, _task4_chat_columns),
     (2, _task6_excel_job_columns),
@@ -551,6 +575,7 @@ MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (5, _task7_controlled_learning),
     (6, _task7_trust_hardening),
     (7, _task7_candidate_cas_and_capacity),
+    (8, _task8_migration_and_fts),
 )
 
 

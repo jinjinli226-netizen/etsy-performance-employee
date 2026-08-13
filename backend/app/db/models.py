@@ -310,3 +310,40 @@ class AuditEvent(Base):
     entity_id: Mapped[str] = mapped_column(String(127), nullable=False)
     details: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now, nullable=False)
+
+
+class ImportedEvidenceFingerprint(Base):
+    __tablename__ = "imported_evidence_fingerprints"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    public_id: Mapped[str] = mapped_column(String(35), unique=True, index=True, nullable=False)
+    shingles: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    source_timestamp: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    threshold: Mapped[float] = mapped_column(nullable=False)
+    content_hash: Mapped[str | None] = mapped_column(String(64))
+    snapshot_hash: Mapped[str | None] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now, nullable=False)
+
+
+class MigrationImport(Base):
+    __tablename__ = "migration_imports"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    package_id: Mapped[str] = mapped_column(String(36), unique=True, index=True, nullable=False)
+    content_sha256: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    profile_id: Mapped[str] = mapped_column(String(63), nullable=False)
+    credential_status: Mapped[str] = mapped_column(String(31), nullable=False)
+    record_counts: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now, nullable=False)
+
+
+class MigrationExport(Base):
+    __tablename__ = "migration_exports"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    package_id: Mapped[str] = mapped_column(String(36), unique=True, index=True, nullable=False)
+    content_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    filename: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
+    file_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now, nullable=False)

@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     excel_worker_timeout_seconds: float = 900.0
     originality_threshold: float = Field(default=0.72, ge=0.1, le=1)
     max_migration_package_bytes: int = 128 * 1024 * 1024
+    migration_capability: str | None = None
 
     @property
     def resolved_database_url(self) -> str:

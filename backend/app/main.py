@@ -19,7 +19,7 @@ from app.excel_jobs.service import ExcelJobService
 from app.knowledge.service import KnowledgeService
 from app.migration.exporter import MigrationExporter
 from app.migration.importer import MigrationImporter
-import secrets
+from app.migration.capability import create_capability_file, remove_owned_capability_file
 
 
 def create_app(
@@ -67,7 +67,8 @@ def create_app(
         )
         app.state.excel_job_service.reconcile_interrupted_jobs()
         repository_root = Path(__file__).resolve().parents[2]
-        app.state.migration_capability = secrets.token_urlsafe(32)
+        app.state.migration_capability_file = create_capability_file(runtime_settings.data_dir, runtime_settings.migration_capability)
+        app.state.migration_capability = app.state.migration_capability_file.token
         app.state.migration_exporter = MigrationExporter(
             factory,
             employee_assets=repository_root / "employee",
@@ -75,10 +76,8 @@ def create_app(
         )
         app.state.migration_importer = MigrationImporter(
             factory,
-            employee_assets=runtime_settings.data_dir / "imported-employee",
             workspace=runtime_settings.data_dir / "migration-workspace",
             repository_assets=repository_root / "employee",
-            guard_path=runtime_settings.data_dir / "trust" / "evidence-guard.json",
         )
         try:
             yield
@@ -91,6 +90,7 @@ def create_app(
 
                 await asyncio.gather(*tasks, return_exceptions=True)
             await app.state.excel_job_service.shutdown()
+            remove_owned_capability_file(app.state.migration_capability_file)
             engine.dispose()
 
     application = FastAPI(title="Etsy Performance Employee", lifespan=lifespan)
