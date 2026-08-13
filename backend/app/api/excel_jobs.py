@@ -10,7 +10,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 
 from app.excel_jobs.schemas import ExcelJobPage, ExcelJobRead
 from app.excel_jobs.service import ExcelJobService, JobConflictError, JobNotFoundError
-from app.excel_jobs.storage import StorageError, store_upload
+from app.excel_jobs.storage import StorageError, discard_unclaimed_upload, store_upload
 from app.knowledge.service import KnowledgeCapacityError
 
 
@@ -42,7 +42,11 @@ def view_payload(view) -> ExcelJobRead:
 async def create_excel_job(request: Request, file: UploadFile = File(...)):
     public_id = uuid4()
     settings = request.app.state.settings
+    stored = None
+    claimed = False
     try:
+        knowledge = request.app.state.knowledge_service
+        knowledge.require_capacity_ready()
         stored = await store_upload(
             file,
             root=settings.data_dir / "excel-jobs",
@@ -50,6 +54,7 @@ async def create_excel_job(request: Request, file: UploadFile = File(...)):
             max_bytes=settings.max_excel_upload_bytes,
         )
         job = service(request).create_job(stored, file.filename or "workbook.xlsx")
+        claimed = True
         await service(request).start_job(str(public_id))
         return view_payload(job)
     except StorageError as exc:
@@ -61,6 +66,12 @@ async def create_excel_job(request: Request, file: UploadFile = File(...)):
         }) from exc
     except JobConflictError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    finally:
+        if stored is not None and not claimed:
+            try:
+                discard_unclaimed_upload(stored, settings.data_dir / "excel-jobs")
+            except (OSError, StorageError):
+                pass
 
 
 @router.get("", response_model=ExcelJobPage)

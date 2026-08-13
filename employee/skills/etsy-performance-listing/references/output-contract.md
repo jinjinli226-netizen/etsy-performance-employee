@@ -2,7 +2,7 @@
 
 ## Employee control-frame contract
 
-Hermes learning control frames should be emitted as one compact JSON object per line. The app parser also accepts bounded pretty-printed JSON objects for compatibility. Control frames are never user-visible; malformed, incomplete, or oversized JSON object frames are rejected without persisting their raw content.
+Hermes learning control frames must be emitted at the final tail of the response and should use one compact JSON object per line. The app parser also accepts bounded pretty-printed JSON objects for compatibility. Control frames are never user-visible; malformed, incomplete, or oversized JSON object tails are rejected fail-closed without persisting their raw content.
 
 ## Detached knowledge trust contract
 

@@ -198,6 +198,27 @@ def create_operation_dir(workspace: Path, operation_id: str) -> Path:
     return safe_path(operation, workspace, must_exist=True)
 
 
+def discard_unclaimed_upload(stored: StoredSource, root: Path) -> None:
+    root_resolved = root.resolve(strict=True)
+    workspace = Path(os.path.abspath(stored.workspace))
+    try:
+        UUID(workspace.name)
+    except ValueError as exc:
+        raise StorageError("unsafe_path", "The unclaimed upload workspace is invalid.") from exc
+    if workspace.parent != root_resolved or not workspace.exists():
+        raise StorageError("unsafe_path", "The unclaimed upload workspace is outside storage.")
+    if workspace.is_symlink() or _is_reparse_point(workspace):
+        raise StorageError("unsafe_path", "Links are not allowed in upload workspaces.")
+    verified_source = safe_path(stored.source_path, workspace, must_exist=True)
+    if verified_source != workspace / "source" / "source.xlsx":
+        raise StorageError("unsafe_path", "The unclaimed upload source is invalid.")
+    def make_writable(function, path, _error) -> None:
+        os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+        function(path)
+
+    shutil.rmtree(workspace, onerror=make_writable)
+
+
 def remove_operation_dir(operation: Path, workspace: Path) -> None:
     try:
         verified = safe_path(operation, workspace, must_exist=True)

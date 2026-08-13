@@ -192,6 +192,30 @@ def test_upload_returns_507_before_queue_or_worker_when_knowledge_capacity_excee
     assert response.json()["detail"]["code"] == "knowledge_capacity_exceeded"
     assert runner.calls == []
     assert client.get("/api/excel-jobs").json()["total"] == 0
+    root = app.state.settings.data_dir / "excel-jobs"
+    assert not root.exists() or not list(root.iterdir())
+
+
+def test_capacity_race_after_store_discards_only_unclaimed_upload(api, monkeypatch) -> None:
+    client, runner, _, app = api
+    from app.knowledge.service import KnowledgeCapacityError
+
+    calls = 0
+
+    def race():
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise KnowledgeCapacityError("private capacity details")
+
+    monkeypatch.setattr(app.state.knowledge_service, "require_capacity_ready", race)
+    response = upload(client)
+    assert response.status_code == 507
+    assert calls == 2
+    assert runner.calls == []
+    root = app.state.settings.data_dir / "excel-jobs"
+    assert not root.exists() or not list(root.iterdir())
+    assert client.get("/api/excel-jobs").json()["total"] == 0
 
 
 def test_queued_job_fails_with_capacity_code_before_worker_starts(api, monkeypatch) -> None:

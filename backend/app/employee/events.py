@@ -11,6 +11,7 @@ from app.knowledge.schemas import KnowledgeKind
 
 MAX_ENVELOPE_BYTES = 128 * 1024
 MAX_REPLY_BYTES = 1024 * 1024
+MAX_ENVELOPE_LINES = 256
 
 
 class KnowledgeCandidatePayload(BaseModel):
@@ -69,7 +70,7 @@ def parse_final_envelopes(text: str) -> ParsedEmployeeReply:
     while index < len(lines):
         line = lines[index]
         raw = line.strip()
-        if not raw.startswith("{"):
+        if not raw.startswith(("{", "[")):
             visible.append(line)
             index += 1
             continue
@@ -77,6 +78,8 @@ def parse_final_envelopes(text: str) -> ParsedEmployeeReply:
         index += consumed
         if oversized or not complete:
             errors.append("envelope_invalid")
+            if not complete:
+                index = len(lines)
             continue
         try:
             value = json.loads(block)
@@ -116,8 +119,8 @@ def _bounded_json_object(lines: list[str], start: int) -> tuple[str, int, bool, 
     total = 0
     for index in range(start, len(lines)):
         line = lines[index]
-        if index > start and depth > 0 and line and not line[0].isspace() and not line.lstrip().startswith(("}", "]")):
-            return "\n".join(block), len(block), False, False
+        if index - start >= MAX_ENVELOPE_LINES:
+            return "\n".join(block), len(block), False, True
         encoded_length = len(line.encode("utf-8"))
         total += encoded_length + (1 if block else 0)
         if encoded_length > MAX_ENVELOPE_BYTES or total > MAX_ENVELOPE_BYTES:
@@ -150,7 +153,7 @@ def _drain_json_block(lines: list[str], start: int, depth: int, in_string: bool,
     """Count the rest of an oversized frame without retaining its raw content."""
     for index in range(start, len(lines)):
         line = lines[index]
-        if index > start and depth > 0 and line and not line[0].isspace() and not line.lstrip().startswith(("}", "]")):
+        if index - start >= MAX_ENVELOPE_LINES:
             return index - start
         for char in line:
             if in_string:

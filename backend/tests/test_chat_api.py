@@ -307,17 +307,37 @@ def test_control_parser_keeps_valid_noncontrol_json_but_strips_invalid_object_bl
     assert parsed.control_errors == ["envelope_invalid"]
 
 
-def test_unclosed_json_block_is_bounded_and_does_not_swallow_following_visible_text() -> None:
-    parsed = parse_final_envelopes('{"event":"learning_batch","payload":{\nVisible after')
-    assert parsed.visible_text == "Visible after"
+def test_unclosed_json_tail_is_removed_fail_closed() -> None:
+    parsed = parse_final_envelopes('Visible before\n{"event":"learning_batch","payload":{\nRAWSECRET visible-looking tail')
+    assert parsed.visible_text == "Visible before"
     assert parsed.control_errors == ["envelope_invalid"]
 
 
 def test_oversized_pretty_control_block_is_removed_as_one_frame() -> None:
-    raw = '{\n  "event":"learning_batch",\n  "payload":{"evidence_items":[],"candidates":[],"extra":"' + ("x" * 132_000) + '"}\n}\nVisible after'
+    raw = 'Visible before\n{\n  "event":"learning_batch",\n  "payload":{"evidence_items":[],"candidates":[],"extra":"' + ("x" * 132_000) + '"}\n}'
     parsed = parse_final_envelopes(raw)
-    assert parsed.visible_text == "Visible after"
+    assert parsed.visible_text == "Visible before"
     assert parsed.control_errors == ["envelope_invalid"]
+
+
+def test_unindented_pretty_control_tracks_nested_arrays_and_braces_inside_strings() -> None:
+    raw = (
+        "Visible before\n{\n"
+        '"event":"learning_batch",\n'
+        '"payload":{\n'
+        '"evidence_items":[],\n'
+        '"candidates":[]\n'
+        "}\n}\n"
+        "Visible after"
+    )
+    parsed = parse_final_envelopes(raw)
+    assert parsed.visible_text == "Visible before\nVisible after"
+    assert len(parsed.envelopes) == 1
+
+    noncontrol = '{\n"example":[{"text":"brace } and escaped \\\" quote"}]\n}'
+    parsed = parse_final_envelopes(noncontrol)
+    assert parsed.visible_text == noncontrol
+    assert parsed.control_errors == []
 
 
 def test_learning_batch_is_atomic_when_second_candidate_is_invalid(api) -> None:
