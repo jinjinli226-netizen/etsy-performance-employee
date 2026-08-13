@@ -26,6 +26,7 @@ defineEmits<{
     v-if="!mobileOpen"
     class="conversation-mobile-trigger"
     type="button"
+    data-testid="conversation-mobile-trigger"
     aria-label="打开对话列表"
     @click="$emit('update:mobile-open', true)"
   >

@@ -32,11 +32,13 @@
 
 ```powershell
 Set-Location .\backend
-py -3.11 -m pip install -e ".[dev]"
+uv sync --extra dev --frozen
 Set-Location ..\frontend
-pnpm install
+pnpm install --frozen-lockfile
 Set-Location ..
 ```
+
+后端的 `uv.lock` 与前端的 `pnpm-lock.yaml` 都已提交；日常安装使用 frozen 模式，依赖升级时再显式更新锁文件。
 
 首次使用模型时，由本人在可见终端完成 OAuth：
 
@@ -93,5 +95,11 @@ Set-Location ..\frontend
 pnpm vitest run
 pnpm build
 ```
+
+## 当前发布状态
+
+软件与假 Hermes 的自动化验收已经完成；**生产激活未完成**。本机只读检查显示现有 `etsy-performance-us` Profile 的旧 provisioning manifest 与当前员工资产不一致，且 `openai-codex` 仍为 `logged out`，因此不能声称 `PROFILE_READY`，也没有运行真实模型或写入用户工作簿。
+
+正式启用前必须：先停止程序并备份旧 Profile 和 DataDirectory；迁移或移出旧 Profile 后重新 provision；在可见终端执行 `hermes -p etsy-performance-us auth add openai-codex --type oauth`；再运行 `verify-employee.ps1 -RunModelCheck -RunDoctor`；最后仅对真实表格的副本做验收，确认结果后再交由负责人审核。不要对 Downloads 中的原文件直接运行生成任务。
 
 第一版使用本机单用户 SQLite，不包含 Etsy 自动发布、在线多用户部署、后台浏览器采集、AI 图片生成、宏工作簿（`.xlsm`）、旧版 `.xls`、移动端原生应用或无人审核的自动知识升级。Excel 单文件上限为 50 MB；原创保护是启发式相似度护栏，不能替代人工审核或法律判断。迁移包不包含模型凭据。

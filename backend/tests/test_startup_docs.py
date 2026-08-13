@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import json
 from pathlib import Path
 
 import pytest
@@ -9,9 +10,12 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 START = ROOT / "scripts" / "start.ps1"
+START_ENV = ROOT / "scripts" / "start-environment.ps1"
+CLEAN_E2E = ROOT / "scripts" / "clean-e2e-data.ps1"
 README = ROOT / "README.md"
 RUNBOOK = ROOT / "docs" / "operations" / "mvp-runbook.md"
 VITE_CONFIG = ROOT / "frontend" / "vite.config.ts"
+UV_LOCK = ROOT / "backend" / "uv.lock"
 
 
 def read(path: Path) -> str:
@@ -43,8 +47,9 @@ def test_production_start_script_parses_and_uses_bounded_owned_processes() -> No
     assert parsed.returncode == 0, parsed.stdout + parsed.stderr
 
     script = read(START)
+    environment_script = read(START_ENV)
     assert "Set-StrictMode -Version Latest" in script
-    assert "ETSY_EMPLOYEE_DATA_DIR" in script and "GetFullPath" in script
+    assert "ETSY_EMPLOYEE_DATA_DIR" in environment_script and "GetFullPath" in script
     assert "ReparsePoint" in script
     assert ".start-pids.json" in script
     assert "creationTimeUtcTicks" in script
@@ -83,6 +88,58 @@ def test_startup_preflight_is_read_only_and_never_handles_credentials() -> None:
     assert "invoke-expression" not in lowered
     assert "CredentialResult.Output" not in script
     assert "CredentialResult.Lines" not in script
+
+
+def test_startup_child_environment_ignores_conflicting_parent_values(tmp_path: Path) -> None:
+    powershell = powershell_executable = shutil.which("pwsh") or shutil.which("powershell")
+    if powershell_executable is None:
+        pytest.skip("PowerShell is not available")
+    hermes = tmp_path / "hermes.exe"
+    hermes.write_bytes(b"MZ")
+    data_dir = (tmp_path / "canonical-data").resolve()
+    hermes_home = (tmp_path / "canonical-hermes-home").resolve()
+    capture = tmp_path / "captured.json"
+    child = tmp_path / "capture.ps1"
+    child.write_text(
+        "[ordered]@{data=$env:ETSY_EMPLOYEE_DATA_DIR; database=$env:ETSY_EMPLOYEE_DATABASE_URL; "
+        "executable=$env:ETSY_EMPLOYEE_HERMES_EXECUTABLE; profile=$env:ETSY_EMPLOYEE_HERMES_PROFILE; "
+        "home=$env:HERMES_HOME; testMode=$env:ETSY_EMPLOYEE_TEST_MODE} | "
+        "ConvertTo-Json | Set-Content -LiteralPath $args[0] -Encoding utf8",
+        encoding="utf-8-sig",
+    )
+    command = (
+        f"$env:ETSY_EMPLOYEE_DATA_DIR='C:\\wrong'; "
+        "$env:ETSY_EMPLOYEE_DATABASE_URL='sqlite:///C:/wrong.db'; "
+        "$env:ETSY_EMPLOYEE_HERMES_EXECUTABLE='C:\\wrong-hermes.exe'; "
+        "$env:ETSY_EMPLOYEE_HERMES_PROFILE='wrong-profile'; $env:HERMES_HOME='C:\\wrong-home'; "
+        "$env:ETSY_EMPLOYEE_TEST_MODE='1'; "
+        f". '{START_ENV}'; Set-EmployeeRuntimeEnvironment -DataDirectory '{data_dir}' "
+        f"-HermesExecutable '{hermes}' -HermesHome '{hermes_home}'; "
+        f"& '{powershell_executable}' -NoProfile -NonInteractive -File '{child}' '{capture}'"
+    )
+    result = subprocess.run(
+        [powershell_executable, "-NoProfile", "-NonInteractive", "-Command", command],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    captured = json.loads(capture.read_text(encoding="utf-8-sig"))
+    assert Path(captured["data"]) == data_dir
+    assert captured["database"] is None
+    assert Path(captured["executable"]) == hermes
+    assert captured["profile"] == "etsy-performance-us"
+    assert Path(captured["home"]) == hermes_home
+    assert captured["testMode"] is None
+
+
+def test_start_script_uses_resolved_hermes_and_canonical_environment() -> None:
+    script = read(START)
+    assert "[string]$HermesExecutable" in script
+    assert ". $StartEnvironmentScript" in script
+    assert "Set-EmployeeRuntimeEnvironment" in script
+    assert "-HermesHome $HermesHome" in script
+    assert "$env:ETSY_EMPLOYEE_HERMES_PROFILE = \"etsy-performance-us\"" in read(START_ENV)
 
 
 def test_startup_refuses_profile_drift_before_starting_any_process() -> None:
@@ -125,6 +182,8 @@ def test_chinese_readme_documents_truthful_setup_start_stop_and_storage() -> Non
         "http://127.0.0.1:5173",
         "五个",
         "不会自动发布",
+        "uv sync --extra dev --frozen",
+        "生产激活未完成",
     ):
         assert required in document
 
@@ -154,5 +213,33 @@ def test_runbook_covers_recovery_migration_capacity_and_known_limits() -> None:
         "excel-jobs",
         "migration-packages",
         "限制",
+        "生产激活未完成",
+        "logged out",
+        "RunModelCheck",
+        "RunDoctor",
     ):
         assert required in document
+
+
+def test_python_dependencies_use_a_committed_uv_lock() -> None:
+    assert UV_LOCK.is_file()
+    lock = read(UV_LOCK)
+    assert 'name = "etsy-performance-employee-backend"' in lock
+    assert "uv sync --extra dev --frozen" in read(README)
+
+
+def test_e2e_cleanup_is_manifest_scoped_and_scripts_parse() -> None:
+    powershell = shutil.which("pwsh") or shutil.which("powershell")
+    if powershell is None:
+        pytest.skip("PowerShell is not available")
+    for path in (START, START_ENV, CLEAN_E2E):
+        result = subprocess.run(
+            [powershell, "-NoProfile", "-NonInteractive", "-Command", f"$e=$null; [void][System.Management.Automation.Language.Parser]::ParseFile('{path}', [ref]$null, [ref]$e); if($e.Count){{exit 1}}"],
+            check=False,
+        )
+        assert result.returncode == 0
+    script = read(CLEAN_E2E)
+    assert "e2e-run-manifest.json" in script
+    assert "run-" in script and "GetFullPath" in script
+    assert "Get-NetTCPConnection" in script
+    assert "Remove-Item -LiteralPath $RunDirectory -Recurse -Force" in script

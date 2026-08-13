@@ -7,6 +7,7 @@ const repositoryDir = fileURLToPath(new URL("..", import.meta.url));
 const backendDir = fileURLToPath(new URL("../backend", import.meta.url));
 const runId = randomUUID().replaceAll("-", "");
 const dataDir = fileURLToPath(new URL(`../.e2e-data/run-${runId}`, import.meta.url));
+const manifestPath = fileURLToPath(new URL("../.e2e-data/e2e-run-manifest.json", import.meta.url));
 const backendPython = fileURLToPath(new URL("../backend/.venv/Scripts/python.exe", import.meta.url));
 
 export default defineConfig({
@@ -16,6 +17,7 @@ export default defineConfig({
   retries: 0,
   timeout: 45_000,
   expect: { timeout: 10_000 },
+  globalSetup: "./e2e/global-setup.ts",
   globalTeardown: "./e2e/global-teardown.ts",
   outputDir: "../test-results/playwright",
   use: {
@@ -46,5 +48,5 @@ export default defineConfig({
       env: { ETSY_E2E_BACKEND: "http://127.0.0.1:58765" },
     },
   ],
-  metadata: { repositoryDir },
+  metadata: { repositoryDir, dataDir, manifestPath },
 });

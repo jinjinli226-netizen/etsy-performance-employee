@@ -7,7 +7,7 @@ defineEmits<{ toggle: [active: boolean] }>();
 </script>
 
 <template>
-  <div class="learning-mode" :class="{ 'is-active': active }">
+  <div class="learning-mode" data-testid="learning-status" :class="{ 'is-active': active }">
     <BookOpenCheck :size="15" aria-hidden="true" />
     <div>
       <label>

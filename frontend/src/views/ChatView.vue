@@ -112,7 +112,7 @@ watch(() => store.isBusy, async (busy, previous) => {
     <div class="chat-stage">
       <header class="chat-stage__toolbar">
         <div>
-          <h2>{{ store.currentConversation?.title ?? "长期对话" }}</h2>
+          <h2 data-testid="conversation-title">{{ store.currentConversation?.title ?? "长期对话" }}</h2>
           <span>{{ store.isBusy ? "正在处理" : store.currentConversation ? "内容已保存在本机" : "选择或新建一条对话" }}</span>
         </div>
 
@@ -276,11 +276,11 @@ watch(() => store.isBusy, async (busy, previous) => {
 
   .chat-stage__toolbar {
     min-height: 61px;
-    padding: 8px 10px 8px 80px;
+    padding: 8px 10px 8px 96px;
   }
 
   .chat-stage__toolbar h2 {
-    max-width: 32vw;
+    max-width: min(32vw, calc(100vw - 218px));
   }
 }
 

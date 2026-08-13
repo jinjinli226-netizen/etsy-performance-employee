@@ -2,6 +2,8 @@
 
 本文面向本地负责人，覆盖启动、停止、恢复、Excel 任务重试、数据备份和电脑迁移。所有命令默认在项目根目录执行。
 
+> 发布状态：软件与假 Hermes 自动化验收已完成；**生产激活未完成**。截至 2026-08-14，本机现有 Profile 的旧 manifest 与当前员工资产不一致，`openai-codex` 状态为 `logged out`。未执行真实模型调用，不得声称 `PROFILE_READY`。
+
 ## 1. 运行位置与边界
 
 - 页面：`http://127.0.0.1:5173`
@@ -40,6 +42,14 @@ hermes -p etsy-performance-us auth add openai-codex --type oauth
 ```
 
 不要把 OAuth 返回值、API key 或 `.env` 内容粘贴进日志或聊天。`start.ps1` 不会自动执行认证，只检查是否已就绪。
+
+### 生产激活清单
+
+1. 停止应用，完整备份旧 Hermes Profile 与显式 DataDirectory；
+2. 迁移旧 Profile，或把整个旧 Profile 目录移出后重新运行 provision；脚本不会覆盖同名目录；
+3. 在可见终端运行 `hermes -p etsy-performance-us auth add openai-codex --type oauth`；该命令已用本机 `hermes auth --help` 核对；
+4. 运行 `.\scripts\verify-employee.ps1 -RunModelCheck -RunDoctor`，只有检查成功后才可把 Profile 视为可用；
+5. 把真实工作簿复制到临时目录，只处理副本，核对五字段、图片、公式和布局。不要修改 Downloads 中的源文件。
 
 ## 3. 启动与停止
 

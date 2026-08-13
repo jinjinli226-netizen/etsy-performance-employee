@@ -20,6 +20,8 @@ data_dir = settings.data_dir.resolve()
 expected_root = Path(__file__).resolve().parents[2] / ".e2e-data"
 if not data_dir.name.startswith("run-") or data_dir.parent != expected_root:
     raise RuntimeError("The Playwright data directory is not the owned test directory.")
+(data_dir / ".owned-e2e-run").parent.mkdir(parents=True, exist_ok=True)
+(data_dir / ".owned-e2e-run").write_text(data_dir.name, encoding="utf-8")
 
 # Windows ACL hardening is covered by backend tests. Keeping the capability file
 # normally inherited here lets the owning test process remove its private run
@@ -33,8 +35,9 @@ def remove_readonly_test_file(function, path, _error_info):
     candidate = Path(path).resolve()
     if not candidate.is_relative_to(data_dir):
         raise RuntimeError("Refusing to clean a path outside the owned E2E directory")
-    os.chmod(candidate, stat.S_IWRITE)
-    function(candidate)
+    if candidate.exists():
+        os.chmod(candidate, stat.S_IWRITE)
+        function(candidate)
 
 
 @app.post("/__e2e__/shutdown", include_in_schema=False)
@@ -52,7 +55,8 @@ async def e2e_lifespan(application):
         async with production_lifespan(application):
             yield
     finally:
-        shutil.rmtree(data_dir, ignore_errors=False, onerror=remove_readonly_test_file)
+        if data_dir.exists():
+            shutil.rmtree(data_dir, ignore_errors=False, onerror=remove_readonly_test_file)
 
 
 app.router.lifespan_context = e2e_lifespan

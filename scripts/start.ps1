@@ -1,6 +1,8 @@
 [CmdletBinding()]
 param(
     [string]$DataDirectory,
+    [string]$HermesExecutable = "hermes",
+    [string]$HermesHome,
     [switch]$Stop
 )
 
@@ -15,11 +17,14 @@ $ProfileId = "etsy-performance-us"
 $ProviderId = "openai-codex"
 $BackendPort = 8765
 $FrontendPort = 5173
+$StartEnvironmentScript = Join-Path $PSScriptRoot "start-environment.ps1"
+. $StartEnvironmentScript
 
 if ([string]::IsNullOrWhiteSpace($DataDirectory)) {
     $DataDirectory = Join-Path $env:LOCALAPPDATA "etsy-performance-employee\data"
 }
 $DataDirectory = [IO.Path]::GetFullPath($DataDirectory)
+$env:ETSY_EMPLOYEE_HERMES_PROFILE = "etsy-performance-us"
 
 function Assert-SafeDataDirectory {
     param([Parameter(Mandatory = $true)][string]$Path)
@@ -46,7 +51,6 @@ New-Item -ItemType Directory -Path $DataDirectory -Force | Out-Null
 $RuntimePath = Join-Path $DataDirectory "runtime"
 New-Item -ItemType Directory -Path $RuntimePath -Force | Out-Null
 $PidFile = Join-Path $RuntimePath ".start-pids.json"
-$env:ETSY_EMPLOYEE_DATA_DIR = $DataDirectory
 
 function Get-ProcessInfo {
     param([Parameter(Mandatory = $true)][int]$ProcessId)
@@ -242,7 +246,8 @@ function Invoke-ProfileVerifier {
     param(
         [Parameter(Mandatory = $true)][string]$PowerShellCommand,
         [Parameter(Mandatory = $true)][string]$VerifyScript,
-        [Parameter(Mandatory = $true)][string]$HermesCommand
+        [Parameter(Mandatory = $true)][string]$HermesCommand,
+        [Parameter(Mandatory = $true)][string]$HermesHome
     )
 
     $stdoutPath = Join-Path $RuntimePath (".preflight-stdout-" + [Guid]::NewGuid().ToString("N") + ".tmp")
@@ -250,7 +255,8 @@ function Invoke-ProfileVerifier {
     try {
         $process = Start-Process -FilePath $PowerShellCommand -ArgumentList @(
             "-NoProfile", "-NonInteractive", "-File", ('"' + $VerifyScript + '"'),
-            "-HermesCommand", ('"' + $HermesCommand + '"')
+            "-HermesCommand", ('"' + $HermesCommand + '"'),
+            "-HermesHome", ('"' + $HermesHome + '"')
         ) -WorkingDirectory $ProjectRoot -WindowStyle Hidden -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -Wait -PassThru
         return [pscustomobject]@{
             ExitCode = $process.ExitCode
@@ -279,7 +285,17 @@ if ((Test-PortInUse -Port $BackendPort) -or (Test-PortInUse -Port $FrontendPort)
     throw "Port 8765 or 5173 is already in use; no process was stopped."
 }
 
-$HermesPath = (Get-Command hermes -ErrorAction Stop).Source
+$HermesCommand = Get-Command $HermesExecutable -CommandType Application -ErrorAction Stop
+$HermesPath = [IO.Path]::GetFullPath($HermesCommand.Source)
+if (-not (Test-Path -LiteralPath $HermesPath -PathType Leaf)) {
+    throw "The resolved Hermes executable is not a file."
+}
+if ([string]::IsNullOrWhiteSpace($HermesHome)) {
+    $HermesHome = Join-Path $env:LOCALAPPDATA "hermes"
+}
+$HermesHome = [IO.Path]::GetFullPath($HermesHome)
+Assert-SafeDataDirectory -Path $HermesHome
+Set-EmployeeRuntimeEnvironment -DataDirectory $DataDirectory -HermesExecutable $HermesPath -HermesHome $HermesHome
 $NodePath = (Get-Command node -ErrorAction Stop).Source
 $PnpmPath = (Get-Command pnpm -ErrorAction Stop).Source
 $PowerShellPath = (Get-Command powershell -ErrorAction Stop).Source
@@ -293,7 +309,7 @@ if (-not (Test-Path -LiteralPath $VitePath -PathType Leaf)) {
 }
 
 $verifyScript = Join-Path $PSScriptRoot "verify-employee.ps1"
-$verifyResult = Invoke-ProfileVerifier -PowerShellCommand $PowerShellPath -VerifyScript $verifyScript -HermesCommand $HermesPath
+$verifyResult = Invoke-ProfileVerifier -PowerShellCommand $PowerShellPath -VerifyScript $verifyScript -HermesCommand $HermesPath -HermesHome $HermesHome
 if ($verifyResult.ExitCode -ne 0) {
     if (-not [string]::IsNullOrWhiteSpace($verifyResult.Stdout)) { Write-Host $verifyResult.Stdout.Trim() }
     if (-not [string]::IsNullOrWhiteSpace($verifyResult.Stderr)) { [Console]::Error.WriteLine($verifyResult.Stderr.Trim()) }
