@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from app.knowledge.schemas import CandidatePage, EvidenceInput, KnowledgeStatus, PatternPage, PatternTransitionRead
-from app.knowledge.service import KnowledgeConflictError, KnowledgeNotFoundError, KnowledgeService, KnowledgeValidationError
+from app.knowledge.service import KnowledgeCapacityError, KnowledgeConflictError, KnowledgeNotFoundError, KnowledgeService, KnowledgeValidationError
 
 
 router = APIRouter(prefix="/api/knowledge", tags=["knowledge"])
@@ -19,7 +19,10 @@ def ingest_evidence(
     request: Request,
     _capability: None = Depends(require_evidence_capability),
 ):
-    record = service(request).ingest_evidence(payload)
+    try:
+        record = service(request).ingest_evidence(payload)
+    except KnowledgeCapacityError as exc:
+        raise HTTPException(507, "Evidence guard capacity reached") from exc
     return {"id": record.public_id, "source_timestamp": record.source_timestamp}
 
 

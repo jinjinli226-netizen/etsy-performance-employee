@@ -16,6 +16,7 @@ from app.employee.adapter import (
     HermesAdapter,
     HermesCancelledError,
 )
+from app.employee.events import MAX_ENVELOPE_BYTES, parse_final_envelopes
 from app.main import create_app
 
 
@@ -238,6 +239,72 @@ def test_valid_knowledge_envelope_is_stripped_and_unknown_json_is_visible(api) -
     assert stored[-1]["content"] == (
         'Visible answer\n{"event":"not_allowed","payload":{"text":"keep me"}}'
     )
+
+
+def test_invalid_oversize_control_frame_is_never_visible_or_persisted_raw(api) -> None:
+    client, fake, _ = api
+    conversation_id = create_conversation(client)
+    secret = "RAWSECRET" * 1200
+
+    async def invalid_control(*args, **kwargs):
+        return EmployeeReply(
+            text='Visible answer\n{"event":"learning_batch","payload":{"evidence_items":[],"candidates":[],"extra":"' + secret + '"}}',
+            session_id="invalid-control",
+        )
+
+    fake.send = invalid_control
+    sent = client.post(f"/api/conversations/{conversation_id}/messages", json={"content": "normal"})
+    assert wait_for_final(client, sent.json()["operation_id"])[-1]["status"] == "completed"
+    stored = client.get(f"/api/conversations/{conversation_id}/messages").json()
+    serialized = json.dumps(stored)
+    assert stored[-1]["content"] == "Visible answer"
+    assert secret not in serialized
+    with client.app.state.session_factory() as session:
+        audit = session.query(AuditEvent).filter_by(action="candidate_event_rejected").one()
+        assert audit.details["new"] == "envelope_invalid"
+        assert secret not in json.dumps(audit.details)
+
+
+def test_valid_learning_control_frame_accepts_bounded_snapshot_and_is_not_visible() -> None:
+    snapshot = "x" * 20_000
+    raw = (
+        'Visible answer\n{"event":"learning_batch","payload":{"evidence_items":[{'
+        '"url":"https://www.etsy.com/listing/123/sample","title":"Safe title",'
+        f'"snapshot":"{snapshot}","tags":[],"source_timestamp":"2026-08-10T12:00:00Z"}}],'
+        '"candidates":[]}}'
+    )
+    assert len(raw.splitlines()[-1].encode("utf-8")) < MAX_ENVELOPE_BYTES
+    parsed = parse_final_envelopes(raw)
+    assert parsed.visible_text == "Visible answer"
+    assert len(parsed.envelopes) == 1
+    assert parsed.control_errors == []
+
+
+def test_learning_batch_is_atomic_when_second_candidate_is_invalid(api) -> None:
+    client, fake, _ = api
+    conversation_id = create_conversation(client)
+
+    async def invalid_second(*args, **kwargs):
+        return EmployeeReply(text=(
+            "Visible answer\n"
+            '{"event":"learning_batch","payload":{"evidence_items":[{'
+            '"url":"https://www.etsy.com/listing/123/sample","title":"Safe title",'
+            '"snapshot":"Safe public snapshot for a performance costume.","tags":[],"source_timestamp":"2026-08-10T12:00:00Z"}],'
+            '"candidates":[{"kind":"title_structure","summary":"Lead with occasion and garment type for search clarity.",'
+            '"confidence":0.9,"evidence_urls":["https://www.etsy.com/listing/123/sample"]},'
+            '{"kind":"tag_taxonomy","summary":"Safe public snapshot for a performance costume.",'
+            '"confidence":0.9,"evidence_urls":["https://www.etsy.com/listing/123/sample"]}]}}'
+        ), session_id="atomic-batch")
+
+    fake.send = invalid_second
+    sent = client.post(f"/api/conversations/{conversation_id}/messages", json={
+        "content": "learn https://www.etsy.com/listing/123/sample", "learning_mode": True,
+    })
+    assert wait_for_final(client, sent.json()["operation_id"])[-1]["status"] == "completed"
+    with client.app.state.session_factory() as session:
+        assert session.query(CompetitorEvidence).count() == 0
+        assert session.query(KnowledgeCandidate).count() == 0
+        assert session.query(AuditEvent).filter_by(action="candidate_event_rejected").count() == 1
 
 
 def test_explicit_learning_mode_ingests_whitelisted_evidence_then_bound_candidate(api) -> None:

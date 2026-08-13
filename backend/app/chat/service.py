@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.db.models import Attachment, Conversation, Message
 from app.employee.adapter import HermesAdapter, HermesAdapterError
 from app.employee.events import parse_final_envelopes
-from app.knowledge.schemas import CandidateInput, EvidenceInput, EvidenceReference
+from app.knowledge.schemas import CandidateInput, EvidenceReference
 from app.knowledge.service import KnowledgeService
 
 
@@ -218,6 +218,14 @@ class ChatService:
         try:
             reply = await self.employee.send(prompt, session_id, image_path, "app")
             parsed = parse_final_envelopes(reply.text)
+            if self.knowledge_service is not None:
+                for _ in parsed.control_errors:
+                    try:
+                        self.knowledge_service.audit_candidate_event_rejection(
+                            actor="employee", trace_id=operation.id, reason="envelope_invalid"
+                        )
+                    except Exception:
+                        pass
             if not parsed.visible_text:
                 raise HermesAdapterError("The employee returned no visible response.")
             with self.session_factory() as session:
@@ -304,33 +312,14 @@ class ChatService:
 
     def _ingest_learning_batch(self, payload: dict, *, operation: Operation, message_id: int) -> None:
         try:
-            by_url = {}
-            for item in payload.get("evidence_items", []):
-                evidence = EvidenceInput.model_validate(item)
-                listing_id = re.search(r"/listing/([0-9]+)", evidence.url).group(1)
-                canonical = f"https://www.etsy.com/listing/{listing_id}"
-                if canonical not in operation.allowed_evidence_urls:
-                    raise ValueError("unapproved evidence URL")
-                by_url[canonical] = self.knowledge_service.ingest_evidence(evidence)
-            for item in payload.get("candidates", []):
-                references = []
-                evidence_urls = item.get("evidence_urls", [])
-                evidence_ids = item.get("evidence_ids", [])
-                if not evidence_urls and not evidence_ids:
-                    raise ValueError("learning candidates require operation-bound evidence")
-                for url in evidence_urls:
-                    match = re.search(r"/listing/([0-9]+)", url)
-                    canonical = f"https://www.etsy.com/listing/{match.group(1)}" if match else ""
-                    record = by_url.get(canonical)
-                    if record is None or canonical not in operation.allowed_evidence_urls:
-                        raise ValueError("candidate evidence is not operation-bound")
-                    references.append(EvidenceReference(evidence_id=record.public_id, source_timestamp=record.source_timestamp))
-                for record in self.knowledge_service.resolve_bound_evidence(evidence_ids, operation.allowed_evidence_urls):
-                    references.append(EvidenceReference(evidence_id=record.public_id, source_timestamp=record.source_timestamp))
-                self.knowledge_service.ingest_candidate(
-                    CandidateInput(kind=item["kind"], abstract=item["summary"], confidence=item["confidence"], evidence_refs=references),
-                    actor="employee", trace_id=operation.id, conversation_id=operation.conversation_id, message_id=message_id,
-                )
+            self.knowledge_service.ingest_learning_batch(
+                payload,
+                allowed_urls=operation.allowed_evidence_urls,
+                actor="employee",
+                trace_id=operation.id,
+                conversation_id=operation.conversation_id,
+                message_id=message_id,
+            )
         except Exception:
             self.knowledge_service.audit_candidate_event_rejection(actor="employee", trace_id=operation.id, reason="ingestion_failed")
 

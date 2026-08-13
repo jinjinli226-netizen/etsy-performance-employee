@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import hashlib
 import unicodedata
 from dataclasses import dataclass
 from typing import Iterable, Mapping, Sequence
@@ -69,6 +70,23 @@ class OriginalityGuard:
             if not raw_shingles:
                 continue
             score = len(generated & raw_shingles) / max(1, min(len(generated), len(raw_shingles)))
+            if score > maximum:
+                maximum, matched_id = score, evidence_id
+        return OriginalityResult(maximum < self.threshold, round(maximum, 6), matched_id)
+
+    def fingerprint_texts(self, texts: Iterable[str]) -> list[str]:
+        shingles = set().union(*(_shingles(str(value), self.max_chars_per_text) for value in texts))
+        return sorted(hashlib.sha256(value.encode("utf-8")).hexdigest() for value in shingles)
+
+    def check_fingerprints(self, generated_texts: Iterable[str], evidence: Sequence[tuple[str, Sequence[str]]]) -> OriginalityResult:
+        generated = set(self.fingerprint_texts(list(generated_texts)[: self.max_generated_texts]))
+        if not generated:
+            return OriginalityResult(True, 0.0, None)
+        maximum = 0.0
+        matched_id: str | None = None
+        for evidence_id, raw_shingles in list(evidence)[: self.max_evidence]:
+            fingerprints = set(raw_shingles)
+            score = len(generated & fingerprints) / max(1, min(len(generated), len(fingerprints))) if fingerprints else 0
             if score > maximum:
                 maximum, matched_id = score, evidence_id
         return OriginalityResult(maximum < self.threshold, round(maximum, 6), matched_id)

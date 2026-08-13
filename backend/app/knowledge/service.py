@@ -5,6 +5,7 @@ import json
 import os
 import stat
 import threading
+from contextlib import contextmanager
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,6 +25,8 @@ from app.knowledge.schemas import (
     CandidatePage,
     CandidateRead,
     EvidenceInput,
+    EvidenceReference,
+    KnowledgeKind,
     KnowledgeStatus,
     PatternPage,
     PatternTransitionRead,
@@ -40,6 +43,15 @@ class KnowledgeConflictError(RuntimeError):
 
 class KnowledgeValidationError(ValueError):
     pass
+
+
+class KnowledgeCapacityError(KnowledgeValidationError):
+    pass
+
+
+MAX_GUARD_BYTES = 8 * 1024 * 1024
+MAX_GUARD_RECORDS = 500
+MAX_GUARD_SHINGLES_PER_RECORD = 30_000
 
 
 @dataclass(frozen=True)
@@ -80,15 +92,37 @@ class KnowledgeService:
         originality_threshold: float = 0.72,
         regression_check: Callable[[str, str], bool] | None = None,
         policy_validator: PolicyValidatorProtocol | None = None,
+        max_guard_bytes: int = MAX_GUARD_BYTES,
+        max_guard_records: int = MAX_GUARD_RECORDS,
     ) -> None:
         self.session_factory = session_factory
         self.export_dir = export_dir
         self.originality = OriginalityGuard(threshold=originality_threshold)
         self.regression_check = regression_check
         self.policy_validator = policy_validator or PolicyValidator()
+        self.max_guard_bytes = max(512, min(max_guard_bytes, MAX_GUARD_BYTES))
+        self.max_guard_records = max(1, min(max_guard_records, self.originality.max_evidence))
         self._lock = threading.RLock()
 
+    @contextmanager
+    def _write_session(self):
+        session = self.session_factory()
+        try:
+            if session.bind is not None and session.bind.dialect.name == "sqlite":
+                session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            yield session
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
     def ingest_evidence(self, payload: EvidenceInput) -> CompetitorEvidence:
+        with self._lock, self._write_session() as session:
+            return self._ingest_evidence_in_session(session, payload)
+
+    def _ingest_evidence_in_session(self, session: Session, payload: EvidenceInput) -> CompetitorEvidence:
         parsed = urlsplit(payload.url)
         listing_id = parsed.path.split("/")[2]
         canonical = f"https://www.etsy.com/listing/{listing_id}"
@@ -96,31 +130,31 @@ class KnowledgeService:
         raw_payload = {"url": canonical, **snapshot_payload}
         digest = _canonical_hash(raw_payload)
         snapshot_digest = _snapshot_hash(payload.title, payload.snapshot, payload.tags)
-        with self._lock, self.session_factory() as session:
-            existing = session.scalar(
-                select(CompetitorEvidence).where(
-                    CompetitorEvidence.source_key == f"etsy-listing:{listing_id}",
-                    CompetitorEvidence.content_hash == digest,
-                )
+        existing = session.scalar(
+            select(CompetitorEvidence).where(
+                CompetitorEvidence.source_key == f"etsy-listing:{listing_id}",
+                CompetitorEvidence.content_hash == digest,
             )
-            if existing:
-                return existing
-            record = CompetitorEvidence(
-                public_id="ev-" + uuid4().hex,
-                canonical_url=canonical,
-                source_key=f"etsy-listing:{listing_id}",
-                title=payload.title,
-                snapshot=payload.snapshot,
-                tags=payload.tags,
-                source_timestamp=payload.source_timestamp,
-                content_hash=digest,
-                snapshot_hash=snapshot_digest,
-            )
-            session.add(record)
-            session.flush()
-            _audit(session, actor="employee", action="evidence_ingested", entity_type="evidence", entity_id=record.public_id, previous=None, new="evidence_only")
-            session.commit()
-            return record
+        )
+        if existing:
+            return existing
+        record = CompetitorEvidence(
+            public_id="ev-" + uuid4().hex,
+            canonical_url=canonical,
+            source_key=f"etsy-listing:{listing_id}",
+            title=payload.title,
+            snapshot=payload.snapshot,
+            tags=payload.tags,
+            source_timestamp=payload.source_timestamp,
+            content_hash=digest,
+            snapshot_hash=snapshot_digest,
+        )
+        current = list(session.scalars(select(CompetitorEvidence).order_by(CompetitorEvidence.public_id)))
+        self._guard_envelope([*current, record])
+        session.add(record)
+        session.flush()
+        _audit(session, actor="employee", action="evidence_ingested", entity_type="evidence", entity_id=record.public_id, previous=None, new="evidence_only")
+        return record
 
     def _validated_evidence(self, session: Session, payload: CandidateInput) -> list[CompetitorEvidence]:
         ids = list(dict.fromkeys(reference.evidence_id for reference in payload.evidence_refs))
@@ -153,36 +187,109 @@ class KnowledgeService:
         conversation_id: int | None = None,
         message_id: int | None = None,
     ) -> KnowledgeCandidate:
-        with self._lock, self.session_factory() as session:
-            evidence = self._validated_evidence(session, payload)
-            similarity = self._raw_similarity(payload.abstract, evidence)
-            if not similarity.passed:
-                _audit(session, actor=actor, action="candidate_rejected_similarity", entity_type="candidate", entity_id="pending", previous=None, new="rejected", trace_id=trace_id, score=similarity.max_score)
-                session.commit()
-                raise KnowledgeValidationError("candidate is overly similar to raw evidence")
-            candidate = KnowledgeCandidate(
-                public_id="kc-" + uuid4().hex,
-                title=payload.abstract[:255],
-                proposal={"kind": payload.kind, "abstract": payload.abstract, "confidence": payload.confidence},
-                kind=payload.kind,
-                abstract_summary=payload.abstract,
-                confidence=payload.confidence,
-                evidence_ids=[record.public_id for record in evidence],
-                source_timestamps={record.public_id: record.source_timestamp.isoformat() for record in evidence},
-                conversation_id=conversation_id,
-                message_id=message_id,
-                trace_id=trace_id[:127],
-                status=KnowledgeStatus.PROPOSED,
-            )
-            session.add(candidate)
-            session.flush()
-            _audit(session, actor=actor, action="candidate_proposed", entity_type="candidate", entity_id=candidate.public_id, previous=None, new=KnowledgeStatus.PROPOSED.value, trace_id=trace_id)
-            self._maybe_auto_activate(session, candidate, evidence, actor=actor)
-            session.commit()
-            return candidate
+        try:
+            with self._lock, self._write_session() as session:
+                return self._ingest_candidate_in_session(
+                    session, payload, actor=actor, trace_id=trace_id,
+                    conversation_id=conversation_id, message_id=message_id,
+                )
+        except KnowledgeValidationError as exc:
+            if str(exc) == "candidate is overly similar to raw evidence":
+                with self._lock, self._write_session() as session:
+                    _audit(session, actor=actor, action="candidate_rejected_similarity", entity_type="candidate", entity_id="pending", previous=None, new="rejected", trace_id=trace_id)
+            raise
+
+    def _ingest_candidate_in_session(
+        self, session: Session, payload: CandidateInput, *, actor: str, trace_id: str,
+        conversation_id: int | None, message_id: int | None,
+    ) -> KnowledgeCandidate:
+        evidence = self._validated_evidence(session, payload)
+        similarity = self._raw_similarity(payload.abstract, evidence)
+        if not similarity.passed:
+            raise KnowledgeValidationError("candidate is overly similar to raw evidence")
+        candidate = KnowledgeCandidate(
+            public_id="kc-" + uuid4().hex,
+            title=payload.abstract[:255],
+            proposal={"kind": payload.kind, "abstract": payload.abstract, "confidence": payload.confidence},
+            kind=payload.kind,
+            abstract_summary=payload.abstract,
+            confidence=payload.confidence,
+            evidence_ids=[record.public_id for record in evidence],
+            source_timestamps={record.public_id: record.source_timestamp.isoformat() for record in evidence},
+            conversation_id=conversation_id,
+            message_id=message_id,
+            trace_id=trace_id[:127],
+            status=KnowledgeStatus.PROPOSED,
+        )
+        session.add(candidate)
+        session.flush()
+        _audit(session, actor=actor, action="candidate_proposed", entity_type="candidate", entity_id=candidate.public_id, previous=None, new=KnowledgeStatus.PROPOSED.value, trace_id=trace_id)
+        self._maybe_auto_activate(session, candidate, evidence, actor=actor)
+        return candidate
+
+    def ingest_learning_batch(
+        self,
+        payload: dict,
+        *,
+        allowed_urls: frozenset[str],
+        actor: str,
+        trace_id: str,
+        conversation_id: int | None,
+        message_id: int | None,
+    ) -> list[KnowledgeCandidate]:
+        evidence_inputs = [EvidenceInput.model_validate(item) for item in payload.get("evidence_items", [])]
+        candidate_items = payload.get("candidates", [])
+        if len(evidence_inputs) > 5 or len(candidate_items) > 5:
+            raise KnowledgeValidationError("learning batch exceeds its limit")
+        prepared_urls: dict[str, EvidenceInput] = {}
+        for evidence in evidence_inputs:
+            listing_id = urlsplit(evidence.url).path.split("/")[2]
+            canonical = f"https://www.etsy.com/listing/{listing_id}"
+            if canonical not in allowed_urls:
+                raise KnowledgeValidationError("unapproved evidence URL")
+            prepared_urls[canonical] = evidence
+        allowed_kinds = {member.value for member in KnowledgeKind}
+        for item in candidate_items:
+            if item.get("kind") not in allowed_kinds:
+                raise KnowledgeValidationError("unknown knowledge kind")
+            CandidateInput(kind=item["kind"], abstract=item["summary"], confidence=item["confidence"], evidence_refs=[])
+            urls, ids = item.get("evidence_urls", []), item.get("evidence_ids", [])
+            if not urls and not ids:
+                raise KnowledgeValidationError("learning candidates require operation-bound evidence")
+            for url in urls:
+                match = __import__("re").search(r"/listing/([0-9]+)", url)
+                canonical = f"https://www.etsy.com/listing/{match.group(1)}" if match else ""
+                if canonical not in prepared_urls or canonical not in allowed_urls:
+                    raise KnowledgeValidationError("candidate evidence is not operation-bound")
+        created: list[KnowledgeCandidate] = []
+        with self._lock, self._write_session() as session:
+            by_url: dict[str, CompetitorEvidence] = {}
+            for canonical, evidence in prepared_urls.items():
+                by_url[canonical] = self._ingest_evidence_in_session(session, evidence)
+            for item in candidate_items:
+                records = []
+                for url in item.get("evidence_urls", []):
+                    listing_id = __import__("re").search(r"/listing/([0-9]+)", url).group(1)
+                    records.append(by_url[f"https://www.etsy.com/listing/{listing_id}"])
+                ids = item.get("evidence_ids", [])
+                if ids:
+                    existing = list(session.scalars(select(CompetitorEvidence).where(CompetitorEvidence.public_id.in_(set(ids)))))
+                    expected = {"etsy-listing:" + url.split("/listing/", 1)[1] for url in allowed_urls}
+                    if len(existing) != len(set(ids)) or any(record.source_key not in expected for record in existing):
+                        raise KnowledgeValidationError("evidence is not bound to the learning operation")
+                    records.extend(existing)
+                candidate_payload = CandidateInput(
+                    kind=item["kind"], abstract=item["summary"], confidence=item["confidence"],
+                    evidence_refs=[EvidenceReference(evidence_id=record.public_id, source_timestamp=record.source_timestamp) for record in records],
+                )
+                created.append(self._ingest_candidate_in_session(
+                    session, candidate_payload, actor=actor, trace_id=trace_id,
+                    conversation_id=conversation_id, message_id=message_id,
+                ))
+        return created
 
     def audit_candidate_event_rejection(self, *, actor: str, trace_id: str, reason: str) -> None:
-        allowed = {"invalid_schema", "unknown_evidence", "timestamp_mismatch", "unsafe_content", "ingestion_failed", "learning_mode_required"}
+        allowed = {"invalid_schema", "unknown_evidence", "timestamp_mismatch", "unsafe_content", "ingestion_failed", "learning_mode_required", "envelope_invalid"}
         safe_reason = reason if reason in allowed else "ingestion_failed"
         with self.session_factory() as session:
             _audit(session, actor=actor, action="candidate_event_rejected", entity_type="candidate", entity_id="untrusted-event", previous=None, new=safe_reason, trace_id=trace_id)
@@ -231,6 +338,7 @@ class KnowledgeService:
         independent, edits = self._support_counts(session, candidate, evidence)
         constraints, reason = self._constraints_pass(candidate, evidence)
         decision = decide_promotion(
+            kind=candidate.kind or "",
             confidence=candidate.confidence or 0,
             independent_evidence=independent,
             accepted_edits=edits,
@@ -306,7 +414,7 @@ class KnowledgeService:
     def record_accepted_edit(self, candidate_id: int, *, feedback_id: str, row_id: str) -> KnowledgeCandidate:
         if not feedback_id or not row_id or len(feedback_id) > 128 or len(row_id) > 128:
             raise KnowledgeValidationError("invalid feedback reference")
-        with self._lock, self.session_factory() as session:
+        with self._lock, self._write_session() as session:
             candidate = session.get(KnowledgeCandidate, candidate_id)
             if candidate is None:
                 raise KnowledgeNotFoundError
@@ -317,7 +425,6 @@ class KnowledgeService:
             evidence = list(session.scalars(select(CompetitorEvidence).where(CompetitorEvidence.public_id.in_(candidate.evidence_ids or [])))) if candidate.evidence_ids else []
             if candidate.status is KnowledgeStatus.PROPOSED:
                 self._maybe_auto_activate(session, candidate, evidence, actor="feedback")
-            session.commit()
             return candidate
 
     def get_candidate(self, candidate_id: int) -> KnowledgeCandidate:
@@ -328,16 +435,15 @@ class KnowledgeService:
             return candidate
 
     def approve_candidate(self, candidate_id: int, *, actor: str) -> KnowledgePattern:
-        with self._lock, self.session_factory() as session:
+        with self._lock, self._write_session() as session:
             candidate = session.get(KnowledgeCandidate, candidate_id)
             if candidate is None:
                 raise KnowledgeNotFoundError
             pattern = self._activate(session, candidate, actor=actor)
-            session.commit()
             return pattern
 
     def reject_candidate(self, candidate_id: int, *, actor: str) -> KnowledgeCandidate:
-        with self._lock, self.session_factory() as session:
+        with self._lock, self._write_session() as session:
             candidate = session.get(KnowledgeCandidate, candidate_id)
             if candidate is None:
                 raise KnowledgeNotFoundError
@@ -349,11 +455,10 @@ class KnowledgeService:
             candidate.status = KnowledgeStatus.REJECTED
             candidate.revision += 1
             _audit(session, actor=actor, action="candidate_rejected", entity_type="candidate", entity_id=candidate.public_id or str(candidate.id), previous=previous, new=KnowledgeStatus.REJECTED.value)
-            session.commit()
             return candidate
 
     def rollback_pattern(self, pattern_id: int, *, actor: str, target_version_id: str | None = None) -> PatternTransitionRead:
-        with self._lock, self.session_factory() as session:
+        with self._lock, self._write_session() as session:
             pattern = session.get(KnowledgePattern, pattern_id)
             if pattern is None:
                 raise KnowledgeNotFoundError
@@ -400,7 +505,6 @@ class KnowledgeService:
             pattern.abstract_summary = target.rules["abstract"]
             pattern.revision += 1
             _audit(session, actor=actor, action="pattern_rolled_back", entity_type="pattern", entity_id=pattern.public_id or str(pattern.id), previous=active.public_id, new=replacement.public_id)
-            session.commit()
             return self._transition(pattern, replacement)
 
     @staticmethod
@@ -473,15 +577,8 @@ class KnowledgeService:
     def export_evidence_guard(self, path: Path) -> KnowledgeTrust:
         with self.session_factory() as session:
             evidence = list(session.scalars(select(CompetitorEvidence).order_by(CompetitorEvidence.public_id)))
-        records = []
-        for item in evidence:
-            record_payload = {"id": item.public_id, "text": f"{item.title} {item.snapshot} {' '.join(item.tags)}"}
-            records.append({**record_payload, "content_sha256": _canonical_hash(record_payload)})
-        identity = _canonical_hash(records)
-        export_id = "eg-" + identity[:32]
-        payload = {"schema_version": 1, "export_id": export_id, "issuer": "local-evidence-guard-v1", "threshold": self.originality.threshold, "records": records}
-        envelope = {**payload, "content_sha256": _canonical_hash(payload)}
-        encoded = json.dumps(envelope, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        envelope, encoded = self._guard_envelope(evidence)
+        export_id = envelope["export_id"]
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_name(path.name + ".tmp-" + uuid4().hex)
         temporary.write_bytes(encoded)
@@ -490,6 +587,25 @@ class KnowledgeService:
         os.replace(temporary, path)
         os.chmod(path, stat.S_IREAD)
         return KnowledgeTrust(path.resolve(), export_id, envelope["content_sha256"], hashlib.sha256(encoded).hexdigest())
+
+    def _guard_envelope(self, evidence: list[CompetitorEvidence]) -> tuple[dict[str, object], bytes]:
+        if len(evidence) > self.max_guard_records:
+            raise KnowledgeCapacityError("evidence guard capacity exceeded")
+        records = []
+        for item in sorted(evidence, key=lambda record: record.public_id):
+            shingles = self.originality.fingerprint_texts([item.title, item.snapshot, *item.tags])
+            if len(shingles) > MAX_GUARD_SHINGLES_PER_RECORD:
+                raise KnowledgeCapacityError("evidence guard capacity exceeded")
+            record_payload = {"id": item.public_id, "shingles": shingles}
+            records.append({**record_payload, "content_sha256": _canonical_hash(record_payload)})
+        identity = _canonical_hash(records)
+        export_id = "eg-" + identity[:32]
+        payload = {"schema_version": 1, "export_id": export_id, "issuer": "local-evidence-guard-v1", "threshold": self.originality.threshold, "records": records}
+        envelope = {**payload, "content_sha256": _canonical_hash(payload)}
+        encoded = json.dumps(envelope, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        if len(encoded) > self.max_guard_bytes:
+            raise KnowledgeCapacityError("evidence guard capacity exceeded")
+        return envelope, encoded
 
     def resolve_bound_evidence(self, evidence_ids: list[str], allowed_urls: frozenset[str]) -> list[CompetitorEvidence]:
         if not evidence_ids:
@@ -512,7 +628,7 @@ class KnowledgeService:
         }
         with self.session_factory() as session:
             evidence = [
-                (item.public_id, f"{item.title} {item.snapshot} {' '.join(item.tags)}")
+                (item.public_id, self.originality.fingerprint_texts([item.title, item.snapshot, *item.tags]))
                 for item in session.scalars(select(CompetitorEvidence).order_by(CompetitorEvidence.public_id))
             ]
         if not evidence:
@@ -531,7 +647,7 @@ class KnowledgeService:
                         continue
                     for row_number in range(header_row + 1, sheet.max_row + 1):
                         generated = {field: sheet.cell(row_number, columns[header]).value or "" for header, field in fixed.items()}
-                        result = self.originality.check(generated, evidence)
+                        result = self.originality.check_fingerprints(generated.values(), evidence)
                         if not result.passed:
                             raise KnowledgeValidationError(
                                 json.dumps({"code": "originality_failed", "score": result.max_score, "evidence_id": result.evidence_id}, separators=(",", ":"))

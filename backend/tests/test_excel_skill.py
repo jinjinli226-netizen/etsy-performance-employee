@@ -141,7 +141,8 @@ def write_knowledge_export(path: Path, *, abstract: str = "Use occasion-specific
 
 
 def write_evidence_guard(path: Path, raw: str) -> dict[str, str]:
-    record_payload = {"id": "ev-" + "a" * 32, "text": raw}
+    guard = load_script("originality_guard")
+    record_payload = {"id": "ev-" + "a" * 32, "shingles": guard.fingerprint_texts([raw])}
     record = {**record_payload, "content_sha256": canonical_sha(record_payload)}
     payload = {"schema_version": 1, "export_id": "eg-" + "1" * 32, "issuer": "local-evidence-guard-v1", "threshold": 0.72, "records": [record]}
     envelope = {**payload, "content_sha256": canonical_sha(payload)}

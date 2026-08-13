@@ -23,7 +23,7 @@ MAX_TIMEOUT_SECONDS = 600.0
 DEFAULT_MAX_RESPONSE_BYTES = 256 * 1024
 MAX_RESPONSE_BYTES = 1024 * 1024
 MAX_STDERR_BYTES = 32 * 1024
-MAX_KNOWLEDGE_BYTES = 256 * 1024
+MAX_KNOWLEDGE_BYTES = 8 * 1024 * 1024
 MAX_KNOWLEDGE_ITEMS = 50
 MAX_KNOWLEDGE_ID_CHARS = 128
 MAX_KNOWLEDGE_ABSTRACT_CHARS = 2_000
@@ -390,25 +390,28 @@ def _safe_guard(
     if _canonical_sha256(payload) != expected_payload_sha256:
         raise TaskError("invalid_guard", "The evidence guard payload digest is invalid.")
     records = value.get("records")
-    if not isinstance(records, list) or len(records) > 1000:
+    if not isinstance(records, list) or len(records) > 500:
         raise TaskError("invalid_guard", "The evidence guard record count is invalid.")
     safe = []
     for record in records:
-        if not isinstance(record, dict) or set(record) != {"id", "text", "content_sha256"}:
+        if not isinstance(record, dict) or set(record) != {"id", "shingles", "content_sha256"}:
             raise TaskError("invalid_guard", "An evidence guard record is invalid.")
-        identifier, raw = record.get("id"), record.get("text")
-        if not isinstance(identifier, str) or not re.fullmatch(r"ev-[0-9a-f]{32}", identifier) or not isinstance(raw, str) or len(raw) > 100_000:
+        identifier, shingles = record.get("id"), record.get("shingles")
+        if not isinstance(identifier, str) or not re.fullmatch(r"ev-[0-9a-f]{32}", identifier) or not isinstance(shingles, list) or len(shingles) > 30_000:
             raise TaskError("invalid_guard", "An evidence guard record is invalid.")
-        record_payload = {"id": identifier, "text": raw}
+        if any(not isinstance(item, str) or not _SHA256.fullmatch(item) for item in shingles) or shingles != sorted(set(shingles)):
+            raise TaskError("invalid_guard", "An evidence guard record is invalid.")
+        record_payload = {"id": identifier, "shingles": shingles}
         if not isinstance(record.get("content_sha256"), str) or _canonical_sha256(record_payload) != record["content_sha256"]:
             raise TaskError("invalid_guard", "An evidence guard record digest is invalid.")
-        safe.append((identifier, raw))
+        safe.append((identifier, shingles))
     return safe, float(threshold)
 
 
-def _originality_result(generated: dict[str, Any], evidence: list[tuple[str, str]], threshold: float = 0.72) -> dict[str, Any]:
+def _originality_result(generated: dict[str, Any], evidence: list[tuple[str, list[str]]], threshold: float = 0.72) -> dict[str, Any]:
     guard = _load_sibling("originality_guard")
-    return guard.check_listing(generated, evidence, threshold=threshold)
+    values = [str(generated.get(field, "")) for field in ("head_titles", "specification", "instructions_for_buyers")]
+    return guard.check_fingerprints(values, evidence, threshold=threshold)
 
 
 def _prompt(row: dict[str, Any], knowledge: Any, rules: dict[str, Any], repair_error: dict[str, Any] | None) -> str:

@@ -17,6 +17,22 @@ class KnowledgeStatus(StrEnum):
     ROLLED_BACK = "rolled_back"
 
 
+class KnowledgeKind(StrEnum):
+    TITLE_STRUCTURE = "title_structure"
+    TAG_TAXONOMY = "tag_taxonomy"
+    OCCASION_VOCABULARY = "occasion_vocabulary"
+    BUYER_INSTRUCTION_STYLE = "buyer_instruction_style"
+    CATEGORY_MAPPING = "category_mapping"
+    MATERIAL_INFERENCE = "material_inference"
+    SIZE_INFERENCE = "size_inference"
+    BUNDLE_CONTENTS = "bundle_contents"
+    ACCESSORY_INFERENCE = "accessory_inference"
+    PRICING = "pricing"
+    SHIPPING = "shipping"
+    GUARANTEE = "guarantee"
+    CERTIFICATION = "certification"
+
+
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _SECRET = re.compile(
     r"(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|cookie|authorization|bearer)\s*[:=]|\bsk-[A-Za-z0-9_-]{12,}",
@@ -45,8 +61,8 @@ class StrictModel(BaseModel):
 class EvidenceInput(StrictModel):
     url: str = Field(min_length=20, max_length=2048)
     title: str = Field(min_length=1, max_length=500)
-    snapshot: str = Field(min_length=1, max_length=100_000)
-    tags: list[str] = Field(default_factory=list, max_length=100)
+    snapshot: str = Field(min_length=1, max_length=20_000)
+    tags: list[str] = Field(default_factory=list, max_length=50)
     source_timestamp: datetime
 
     @field_validator("url")

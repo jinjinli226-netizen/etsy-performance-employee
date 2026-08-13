@@ -46,6 +46,10 @@ class PolicyValidator:
 
 AUTO_PROMOTION_CONFIDENCE = 0.85
 AUTO_PROMOTION_SUPPORT = 3
+AUTO_PROMOTION_KINDS = frozenset({
+    "title_structure", "tag_taxonomy", "occasion_vocabulary",
+    "buyer_instruction_style", "category_mapping",
+})
 
 
 @dataclass(frozen=True)
@@ -55,8 +59,10 @@ class PromotionDecision:
 
 
 def decide_promotion(
-    *, confidence: float, independent_evidence: int, accepted_edits: int, hard_conflict: bool, regression_passed: bool, originality_passed: bool
+    *, kind: str = "title_structure", confidence: float, independent_evidence: int, accepted_edits: int, hard_conflict: bool, regression_passed: bool, originality_passed: bool
 ) -> PromotionDecision:
+    if kind not in AUTO_PROMOTION_KINDS:
+        return PromotionDecision(False, "manual_kind")
     if hard_conflict:
         return PromotionDecision(False, "hard_rule_conflict")
     if not regression_passed:

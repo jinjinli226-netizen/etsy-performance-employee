@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import stat
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -21,7 +22,7 @@ from app.db.models import AuditEvent, CompetitorEvidence, FeedbackEvent, Knowled
 from app.db.session import create_engine_for_url, create_session_factory
 from app.employee.adapter import EmployeeReply, HermesAdapter
 from app.knowledge.schemas import CandidateInput, EvidenceInput, KnowledgeStatus
-from app.knowledge.service import KnowledgeConflictError, KnowledgeService, KnowledgeValidationError
+from app.knowledge.service import KnowledgeCapacityError, KnowledgeConflictError, KnowledgeService, KnowledgeValidationError
 from app.main import create_app
 
 
@@ -155,6 +156,86 @@ def test_identical_snapshots_at_different_urls_do_not_satisfy_independence(knowl
     assert len({item.snapshot_hash for item in evidence}) == 1
 
 
+def test_high_risk_candidate_kind_never_auto_activates(knowledge) -> None:
+    service, _, _ = knowledge
+    evidence = add_evidence(service)
+    risky = service.ingest_candidate(
+        candidate_payload(evidence, kind="material_inference", abstract="Use glossy wording as a material inference strategy."),
+        actor="employee", trace_id="risky-kind",
+    )
+    assert risky.status is KnowledgeStatus.PROPOSED
+
+
+def test_guard_compacts_three_large_evidence_records_within_worker_budget(knowledge, tmp_path) -> None:
+    service, _, _ = knowledge
+    for index in range(3):
+        payload = evidence_payload(index)
+        service.ingest_evidence(EvidenceInput(**{
+            **payload.model_dump(),
+            "snapshot": (("distinct stage costume wording %s " % index) * 900)[:20_000],
+        }))
+    trust = service.export_evidence_guard(tmp_path / "guard.json")
+    envelope = json.loads(trust.path.read_text(encoding="utf-8"))
+    assert trust.path.stat().st_size <= 8 * 1024 * 1024
+    assert all("text" not in record and "shingles" in record for record in envelope["records"])
+
+
+def test_guard_capacity_rejects_new_evidence_without_breaking_existing_export(knowledge, tmp_path) -> None:
+    service, factory, _ = knowledge
+    service.max_guard_records = 1
+    first = service.ingest_evidence(evidence_payload(1))
+    with pytest.raises(KnowledgeCapacityError):
+        service.ingest_evidence(evidence_payload(2))
+    trust = service.export_evidence_guard(tmp_path / "guard.json")
+    with factory() as session:
+        assert session.query(CompetitorEvidence).count() == 1
+    assert json.loads(trust.path.read_text(encoding="utf-8"))["records"][0]["id"] == first.public_id
+
+
+def test_cross_instance_concurrent_approve_is_idempotent(knowledge) -> None:
+    service, factory, _ = knowledge
+    candidate = service.ingest_candidate(
+        candidate_payload([], confidence=0.4, kind="title_structure"), actor="employee", trace_id="race"
+    )
+    other = KnowledgeService(factory, export_dir=service.export_dir)
+    barrier = threading.Barrier(2)
+
+    def approve(active):
+        barrier.wait()
+        return active.approve_candidate(candidate.id, actor="owner").public_id
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(approve, (service, other)))
+    assert len(set(results)) == 1
+    with factory() as session:
+        assert session.query(KnowledgePattern).count() == 1
+        assert session.query(RuleVersion).count() == 1
+
+
+def test_cross_instance_different_candidates_same_kind_are_serialized(knowledge) -> None:
+    service, factory, _ = knowledge
+    first = service.ingest_candidate(candidate_payload([], confidence=0.4, kind="serialized_kind"), actor="employee", trace_id="race-1")
+    second = service.ingest_candidate(
+        candidate_payload([], confidence=0.4, kind="serialized_kind", abstract="Put audience before occasion and garment type."),
+        actor="employee", trace_id="race-2",
+    )
+    other = KnowledgeService(factory, export_dir=service.export_dir)
+    barrier = threading.Barrier(2)
+
+    def approve(pair):
+        active, candidate_id = pair
+        barrier.wait()
+        return active.approve_candidate(candidate_id, actor="owner").public_id
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(approve, ((service, first.id), (other, second.id))))
+    assert len(set(results)) == 1
+    with factory() as session:
+        assert session.query(KnowledgePattern).count() == 1
+        assert session.query(RuleVersion).count() == 2
+        assert session.query(RuleVersion).filter_by(status=KnowledgeStatus.ACTIVE).count() == 1
+
+
 def test_generation_uses_only_valid_immutable_active_rule_snapshot(knowledge) -> None:
     service, factory, _ = knowledge
     candidate = service.ingest_candidate(
@@ -180,7 +261,7 @@ def test_generation_uses_only_valid_immutable_active_rule_snapshot(knowledge) ->
 
 def test_three_distinct_accepted_edits_can_promote_high_confidence_candidate(knowledge) -> None:
     service, _, _ = knowledge
-    candidate = service.ingest_candidate(candidate_payload([], kind="tag_strategy"), actor="employee", trace_id="t")
+    candidate = service.ingest_candidate(candidate_payload([], kind="tag_taxonomy"), actor="employee", trace_id="t")
     for index in range(3):
         service.record_accepted_edit(candidate.id, feedback_id=f"feedback-{index}", row_id=f"row-{index}")
 
@@ -242,7 +323,7 @@ def test_medium_confidence_conflict_regression_and_raw_leakage_never_auto_activa
 def test_production_default_policy_passes_safe_abstract_and_blocks_fact_claims(knowledge) -> None:
     service, _, _ = knowledge
     safe = service.ingest_candidate(
-        candidate_payload(add_evidence(service), kind="safe_structure"), actor="employee", trace_id="safe"
+        candidate_payload(add_evidence(service), kind="title_structure"), actor="employee", trace_id="safe"
     )
     risky = service.ingest_candidate(
         candidate_payload([], kind="risky", abstract="Always claim genuine silk material and guaranteed shipping."),
@@ -373,7 +454,7 @@ def test_detached_export_matches_task5_contract_and_tamper_changes_file_hash(kno
     assert hashlib.sha256(trust.path.read_bytes()).hexdigest() != before
 
 
-def test_detached_evidence_guard_export_contains_only_id_and_raw_digest_records(knowledge, tmp_path: Path) -> None:
+def test_detached_evidence_guard_export_contains_only_id_and_fingerprint_records(knowledge, tmp_path: Path) -> None:
     service, _, _ = knowledge
     evidence = add_evidence(service, 2)
     trust = service.export_evidence_guard(tmp_path / "guard.json")
@@ -383,7 +464,8 @@ def test_detached_evidence_guard_export_contains_only_id_and_raw_digest_records(
     assert envelope["export_id"].startswith("eg-")
     assert envelope["threshold"] == service.originality.threshold
     assert envelope["content_sha256"] == hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-    assert set(envelope["records"][0]) == {"id", "text", "content_sha256"}
+    assert set(envelope["records"][0]) == {"id", "shingles", "content_sha256"}
+    assert "Public listing snapshot" not in trust.path.read_text(encoding="utf-8")
     assert {record["id"] for record in envelope["records"]} == {item.public_id for item in evidence}
     assert trust.file_sha256 == hashlib.sha256(trust.path.read_bytes()).hexdigest()
     assert stat.S_IMODE(trust.path.stat().st_mode) & stat.S_IWRITE == 0

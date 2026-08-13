@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import re
 from pathlib import Path
 
 import pytest
@@ -88,3 +89,26 @@ def test_backend_and_employee_originality_implementations_are_identical(generate
         "score": backend.max_score,
         "evidence_id": backend.evidence_id,
     }
+
+
+@pytest.mark.parametrize(
+    ("generated", "raw"),
+    [
+        (["舞台表演服装闪亮成人"], "舞台表演服装闪亮成人"),
+        (["ＶＥＬＶＥＴ　ＣＡＰＥ"], "velvet cape"),
+        (["舞台 velvet 表演 cape 服装"], "舞台 VELVET 表演 CAPE 服装"),
+        (["dramatic velvet vampire cape for women"], "Dramatic velvet vampire cape for women"),
+        (["cape"], "CAPE"),
+    ],
+)
+def test_backend_and_employee_compact_fingerprints_have_exact_parity(generated, raw) -> None:
+    employee = _load_employee_guard()
+    backend_guard = OriginalityGuard(threshold=0.72)
+    backend_fingerprint = backend_guard.fingerprint_texts([raw])
+    employee_fingerprint = employee.fingerprint_texts([raw])
+
+    assert employee_fingerprint == backend_fingerprint
+    backend = backend_guard.check_fingerprints(generated, [("ev-parity", backend_fingerprint)])
+    skill = employee.check_fingerprints(generated, [("ev-parity", employee_fingerprint)], threshold=0.72)
+    assert skill == {"passed": backend.passed, "score": backend.max_score, "evidence_id": backend.evidence_id}
+    assert all(re.fullmatch(r"[0-9a-f]{64}", item) for item in backend_fingerprint)
