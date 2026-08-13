@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import io
+import os
+import tempfile
 import stat
 import zipfile
 from dataclasses import dataclass
@@ -19,11 +23,15 @@ from app.db.models import (
 from app.migration.contracts import ManifestRecord, RECORD_MODELS
 from app.migration.exporter import APP_VERSION, ASSET_ALLOWLIST, PROFILE_ID, SCHEMA_VERSION, _scan, _sha
 from app.migration.secrets import SensitiveDataError, scan_for_secrets
+from app.migration.guard import GuardValidationError, PortableGuard, merge_guards, validate_portable_guard_size
 
 MAX_PACKAGE_BYTES = 128 * 1024 * 1024
 MAX_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
 MAX_MEMBERS = 128
 MAX_RATIO = 200
+MAX_JSONL_LINE_BYTES = 2 * 1024 * 1024
+MAX_JSON_DEPTH = 20
+MAX_JSON_NODES = 10_000
 
 
 class ImportValidationError(ValueError): pass
@@ -57,11 +65,50 @@ def _read_jsonl(body: bytes) -> list[dict[str, Any]]:
         raise ImportValidationError("invalid UTF-8 JSONL payload") from error
 
 
+def _json_shape(value: Any) -> None:
+    nodes = 0
+    def visit(item: Any, depth: int) -> None:
+        nonlocal nodes
+        nodes += 1
+        if depth > MAX_JSON_DEPTH or nodes > MAX_JSON_NODES:
+            raise ImportValidationError("JSON payload exceeds structure limits")
+        if isinstance(item, dict):
+            for key, child in item.items():
+                visit(key, depth + 1); visit(child, depth + 1)
+        elif isinstance(item, list):
+            for child in item: visit(child, depth + 1)
+    visit(value, 0)
+
+
+def _read_jsonl_stream(stream) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = []
+    while line := stream.readline(MAX_JSONL_LINE_BYTES + 1):
+        if len(line) > MAX_JSONL_LINE_BYTES:
+            raise ImportValidationError("JSONL line exceeds size limit")
+        if b"\r" in line or not line.endswith(b"\n"):
+            raise ImportValidationError("JSONL must use canonical LF lines")
+        try:
+            value = json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ImportValidationError("invalid UTF-8 JSONL payload") from error
+        _json_shape(value)
+        output.append(value)
+    return output
+
+
 def _safe_name(name: str) -> str:
     pure = PurePosixPath(name)
     if not name or "\0" in name or "\\" in name or name.startswith("/") or pure.is_absolute() or ".." in pure.parts or "." in pure.parts or ":" in pure.parts[0] or pure.as_posix() != name:
         raise ImportValidationError("unsafe ZIP member path")
     return name
+
+
+def _sha_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 class MigrationImporter:
@@ -77,27 +124,23 @@ class MigrationImporter:
         with package.open("rb") as stream:
             if stream.read(4) != b"PK\x03\x04":
                 raise ImportValidationError("invalid ZIP magic")
-        manifest, payloads = self._validate_archive(package)
-        self._validate_trusted_assets(payloads)
-        graph = self._build_graph(manifest, payloads)
+        self.workspace.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="validated-", dir=self.workspace) as staging_name:
+            manifest, payloads = self._validate_archive(package, Path(staging_name))
+            self._validate_trusted_assets(payloads)
+            graph = self._build_graph(manifest, payloads)
         with self.session_factory() as session:
             existing = session.scalar(select(MigrationImport).where(MigrationImport.package_id == manifest["package_id"]))
             if existing is not None:
                 if existing.content_sha256 != manifest["content_sha256"]:
                     raise ImportConflict("package identity collision")
                 return ImportReport(manifest["package_id"], dry_run, not dry_run, existing.credential_status, manifest["record_counts"], "rebuilt", [])
-        conflicts = self._conflicts()
-        report = ImportReport(manifest["package_id"], dry_run, False, "pending", manifest["record_counts"], "pending" if conflicts else "ready", conflicts)
-        if conflicts:
-            if dry_run:
-                return report
-            raise ImportConflict("target data is not empty")
         if dry_run:
-            return report
-        self._commit_graph(graph)
-        return ImportReport(manifest["package_id"], False, True, "pending", manifest["record_counts"], "rebuilt", [])
+            conflicts = self._conflicts()
+            return ImportReport(manifest["package_id"], True, False, "pending", manifest["record_counts"], "pending" if conflicts else "ready", conflicts)
+        return self._commit_graph(graph)
 
-    def _validate_archive(self, package: Path) -> tuple[dict[str, Any], dict[str, bytes]]:
+    def _validate_archive(self, package: Path, staging: Path) -> tuple[dict[str, Any], dict[str, Path]]:
         try:
             with zipfile.ZipFile(package) as archive:
                 infos = archive.infolist()
@@ -118,6 +161,9 @@ class MigrationImporter:
                         raise ImportValidationError("ZIP expansion limits exceeded")
                 if "manifest.json" not in names:
                     raise ImportValidationError("manifest is missing")
+                manifest_info = archive.getinfo("manifest.json")
+                if manifest_info.file_size > 1024 * 1024:
+                    raise ImportValidationError("manifest exceeds size limit")
                 manifest = json.loads(archive.read("manifest.json"))
                 try:
                     ManifestRecord.model_validate(manifest)
@@ -135,36 +181,49 @@ class MigrationImporter:
                 required = {f"assets/{name}" for name in ASSET_ALLOWLIST} | {f"data/{name}.jsonl" for name in RECORD_MODELS}
                 if len(set(declared)) != len(declared) or set(declared) != required or set(names) != required | {"manifest.json"}:
                     raise ImportValidationError("package allowlist mismatch")
-                payloads = {row["path"]: archive.read(row["path"]) for row in files}
+                payloads: dict[str, Path] = {}
                 for row in files:
-                    body = payloads[row["path"]]
-                    if row["mode"] != "0644" or row["size"] != len(body) or row["sha256"] != _sha(body):
+                    digest = hashlib.sha256()
+                    actual_size = 0
+                    destination = staging / PurePosixPath(row["path"])
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    with archive.open(row["path"]) as member:
+                        with destination.open("xb") as output:
+                            while chunk := member.read(1024 * 1024):
+                                actual_size += len(chunk)
+                                if actual_size > row["size"] or actual_size > MAX_UNCOMPRESSED_BYTES:
+                                    raise ImportValidationError("file size exceeds manifest limit")
+                                digest.update(chunk); output.write(chunk)
+                            output.flush(); os.fsync(output.fileno())
+                    payloads[row["path"]] = destination
+                    if row["mode"] != "0644" or row["size"] != actual_size or row["sha256"] != digest.hexdigest():
                         raise ImportValidationError("file checksum or size mismatch")
-                content = _sha(b"".join(name.encode() + b"\0" + _sha(body).encode() for name, body in sorted(payloads.items())))
+                content = _sha(b"".join(name.encode() + b"\0" + _sha_file(path).encode() for name, path in sorted(payloads.items())))
                 if manifest["content_sha256"] != content or manifest["package_id"] != "pkg-" + content[:32]:
                     raise ImportValidationError("package content identity mismatch")
-                for name, body in payloads.items():
+                for name, path in payloads.items():
                     if name.endswith(".jsonl"):
                         continue
-                    try: _scan(body.decode("utf-8"))
+                    try: _scan(path.read_text(encoding="utf-8"))
                     except UnicodeDecodeError as error: raise ImportValidationError("asset must be UTF-8") from error
                 return manifest, payloads
         except (zipfile.BadZipFile, json.JSONDecodeError) as error:
             raise ImportValidationError("invalid ZIP package") from error
 
-    def _validate_trusted_assets(self, payloads: dict[str, bytes]) -> None:
+    def _validate_trusted_assets(self, payloads: dict[str, Path]) -> None:
         if self.repository_assets is None:
             raise ImportValidationError("trusted repository asset root is required")
         for relative in ASSET_ALLOWLIST:
             local = self.repository_assets / PurePosixPath(relative)
-            if local.is_symlink() or not local.is_file() or local.stat().st_nlink != 1 or _sha(local.read_bytes()) != _sha(payloads[f"assets/{relative}"]):
+            if local.is_symlink() or not local.is_file() or local.stat().st_nlink != 1 or _sha_file(local) != _sha_file(payloads[f"assets/{relative}"]):
                 raise ImportValidationError("employee asset does not match this application version")
 
-    def _build_graph(self, manifest: dict[str, Any], payloads: dict[str, bytes]) -> ValidatedGraph:
+    def _build_graph(self, manifest: dict[str, Any], payloads: dict[str, Path]) -> ValidatedGraph:
         records: dict[str, list[Any]] = {}
         try:
             for name, model in RECORD_MODELS.items():
-                raw = _read_jsonl(payloads[f"data/{name}.jsonl"])
+                with payloads[f"data/{name}.jsonl"].open("rb") as jsonl:
+                    raw = _read_jsonl_stream(jsonl)
                 if manifest["record_counts"].get(name) != len(raw):
                     raise ImportValidationError("record count mismatch")
                 scan_for_secrets(raw)
@@ -192,6 +251,14 @@ class MigrationImporter:
             if set(item.evidence_ids) != set(item.source_timestamps):
                 raise ImportValidationError("candidate evidence provenance is invalid")
         guard_ids = {x.id for x in records["evidence_guard"]}
+        try:
+            merged_guard, _ = merge_guards(PortableGuard(item.id, tuple(item.shingles), item.source_timestamp, item.threshold, item.content_hash, item.snapshot_hash) for item in records["evidence_guard"])
+            validate_portable_guard_size([
+                {"id": item.public_id, "source_timestamp": item.source_timestamp.isoformat() if item.source_timestamp else None, "content_hash": item.content_hash, "snapshot_hash": item.snapshot_hash, "shingles": list(item.shingles), "threshold": item.threshold}
+                for item in merged_guard
+            ], manifest["guard_threshold"])
+        except GuardValidationError as error:
+            raise ImportValidationError(str(error)) from error
         if any(item.threshold != manifest["guard_threshold"] for item in records["evidence_guard"]):
             raise ImportValidationError("evidence guard threshold mismatch")
         for message in messages.values():
@@ -260,8 +327,17 @@ class MigrationImporter:
         finally:
             if owned: session.close()
 
-    def _commit_graph(self, graph: ValidatedGraph) -> None:
-        with self.session_factory.begin() as session:
+    def _commit_graph(self, graph: ValidatedGraph) -> ImportReport:
+        session = self.session_factory()
+        try:
+            if session.bind is not None and session.bind.dialect.name == "sqlite":
+                session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            existing = session.scalar(select(MigrationImport).where(MigrationImport.package_id == graph.manifest["package_id"]))
+            if existing is not None:
+                if existing.content_sha256 != graph.manifest["content_sha256"]:
+                    raise ImportConflict("package identity collision")
+                session.rollback()
+                return ImportReport(existing.package_id, False, True, existing.credential_status, graph.manifest["record_counts"], "rebuilt", [])
             if self._conflicts(session): raise ImportConflict("target data changed during import")
             conversation_map: dict[str, Conversation] = {}
             message_map: dict[str, Message] = {}
@@ -284,6 +360,13 @@ class MigrationImporter:
             session.add(MigrationImport(package_id=graph.manifest["package_id"], content_sha256=graph.manifest["content_sha256"], profile_id=PROFILE_ID, credential_status="pending", record_counts=graph.manifest["record_counts"]))
             session.flush()
             self._rebuild_fts(session)
+            session.commit()
+            return ImportReport(graph.manifest["package_id"], False, True, "pending", graph.manifest["record_counts"], "rebuilt", [])
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
 
     @staticmethod
     def _rebuild_fts(session: Session) -> None:

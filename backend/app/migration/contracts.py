@@ -7,6 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.chat.schemas import MessageRole
 from app.knowledge.schemas import KnowledgeStatus
+from app.migration.guard import GuardValidationError, validate_shingles
 
 
 class StrictRecord(BaseModel):
@@ -194,7 +195,7 @@ class GuardRecord(StrictRecord):
     source_timestamp: datetime | None
     content_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     snapshot_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
-    shingles: list[str] = Field(max_length=30_000)
+    shingles: list[str] = Field(min_length=1, max_length=30_000)
     threshold: float = Field(ge=.1, le=1)
 
     @field_validator("source_timestamp", mode="before")
@@ -205,6 +206,14 @@ class GuardRecord(StrictRecord):
         if not isinstance(value, str) or not __import__("re").fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z", value):
             raise ValueError("canonical evidence timestamp required")
         return datetime.fromisoformat(value[:-1] + "+00:00")
+
+    @field_validator("shingles")
+    @classmethod
+    def canonical_shingles(cls, value: list[str]) -> list[str]:
+        try:
+            return list(validate_shingles(value))
+        except GuardValidationError as error:
+            raise ValueError(str(error)) from error
 
 
 class ManifestFileRecord(StrictRecord):

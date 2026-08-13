@@ -26,6 +26,7 @@ from app.db.models import (
     Conversation,
     FeedbackEvent,
     ExcelJob,
+    ImportedEvidenceFingerprint,
     KnowledgeCandidate,
     KnowledgePattern,
     Message,
@@ -34,6 +35,7 @@ from app.db.models import (
 from app.knowledge.originality import OriginalityGuard
 from app.knowledge.schemas import KnowledgeStatus
 from app.migration.secrets import SensitiveDataError, scan_for_secrets
+from app.migration.guard import GuardValidationError, PortableGuard, merge_guards, validate_portable_guard_size
 
 SCHEMA_VERSION = 1
 PROFILE_ID = "etsy-performance-us"
@@ -49,6 +51,9 @@ ASSET_ALLOWLIST = (
     "skills/etsy-performance-listing/scripts/write_workbook.py",
 )
 MAX_TEXT_FILE = 16 * 1024 * 1024
+MAX_SCAN_DEPTH = 20
+MAX_SCAN_NODES = 10_000
+MAX_SCAN_CHARS = 1_000_000
 
 
 class ExportError(ValueError):
@@ -121,6 +126,47 @@ def _evidence_words(value: str) -> list[str]:
     return re.findall(r"[^\W_]+", normalized, re.UNICODE)
 
 
+def _bounded_strings(value: Any) -> list[str]:
+    output: list[str] = []
+    nodes = 0
+    characters = 0
+
+    def visit(item: Any, depth: int) -> None:
+        nonlocal nodes, characters
+        nodes += 1
+        if depth > MAX_SCAN_DEPTH or nodes > MAX_SCAN_NODES:
+            raise ExportError("migration record exceeds scan structure limits")
+        if isinstance(item, str):
+            characters += len(item)
+            if characters > MAX_SCAN_CHARS:
+                raise ExportError("migration record exceeds scan text limits")
+            output.append(item)
+        elif isinstance(item, dict):
+            for key in sorted(item):
+                visit(str(key), depth + 1)
+                visit(item[key], depth + 1)
+        elif isinstance(item, list):
+            for child in item:
+                visit(child, depth + 1)
+
+    visit(value, 0)
+    return output
+
+
+def _scan_logical_record(value: Any, *, fingerprints: list[tuple[str, list[str]]] | None = None, threshold: float = .72) -> None:
+    strings = _bounded_strings(value)
+    for item in strings:
+        _scan(item)
+    aggregate = " ".join(" ".join(_evidence_words(item)) for item in strings)
+    if aggregate:
+        _scan(aggregate)
+    if fingerprints:
+        originality = OriginalityGuard(threshold=threshold)
+        for text_value in [*strings, aggregate]:
+            if text_value and not originality.check_fingerprints([text_value], fingerprints).passed:
+                raise ExportError("raw competitor evidence detected in portable payload")
+
+
 def _public(kind: str, value: str | None, fallback: str) -> str:
     if value:
         return value
@@ -157,7 +203,10 @@ class MigrationExporter:
                 files[f"assets/{relative}"] = body
             for name, records in payloads.items():
                 body = b"".join(_json(record) for record in records)
-                _scan(records)
+                for index, record in enumerate(records):
+                    _scan_logical_record(record)
+                    if index:
+                        _scan_logical_record([records[index - 1], record])
                 files[f"data/{name}.jsonl"] = body
             content_hash = _sha(b"".join(name.encode() + b"\0" + _sha(body).encode() for name, body in sorted(files.items())))
             package_id = "pkg-" + content_hash[:32]
@@ -171,7 +220,7 @@ class MigrationExporter:
                 "credential_status": "pending",
                 "raw_competitor_evidence_included": False,
                 "attachments_included": False,
-                "guard_threshold": 0.72,
+                "guard_threshold": min((item["threshold"] for item in payloads["evidence_guard"]), default=.72),
                 "record_counts": counts,
                 "files": [
                     {"path": name, "sha256": _sha(body), "size": len(body), "mode": "0644"}
@@ -245,6 +294,7 @@ class MigrationExporter:
             feedback = list(session.scalars(select(FeedbackEvent).order_by(FeedbackEvent.public_id, FeedbackEvent.id)))
             audits = list(session.scalars(select(AuditEvent).order_by(AuditEvent.created_at, AuditEvent.id)))
             evidence = list(session.scalars(select(CompetitorEvidence).order_by(CompetitorEvidence.public_id)))
+            imported_evidence = list(session.scalars(select(ImportedEvidenceFingerprint).order_by(ImportedEvidenceFingerprint.public_id)))
             evidence_by_url = {item.canonical_url: item.public_id for item in evidence}
             # Scan source values before redaction so credentials cannot be hidden by a later transform.
             try:
@@ -296,27 +346,31 @@ class MigrationExporter:
                 unresolved = None if entity_public_id else "unresolved_legacy_reference"
                 records["audit_events"].append({"id": _public("audit", item.public_id, f"audit:{item.id}:{item.created_at.isoformat()}"), "actor": item.actor, "action": item.action, "entity_type": entity_type, "entity_public_id": entity_public_id, "unresolved_reason": unresolved, "details": item.details, "created_at": _timestamp(item.created_at)})
             guard = OriginalityGuard()
+            portable_guards: list[PortableGuard] = []
             for item in evidence:
-                records["evidence_guard"].append({"id": item.public_id, "source_timestamp": _timestamp(item.source_timestamp), "content_hash": item.content_hash, "snapshot_hash": item.snapshot_hash, "shingles": guard.fingerprint_texts([item.title, item.snapshot, *item.tags]), "threshold": guard.threshold})
-            known = {record["id"] for record in records["evidence_guard"]}
+                portable_guards.append(PortableGuard(item.public_id, tuple(guard.fingerprint_texts([item.title, item.snapshot, *item.tags])), item.source_timestamp, guard.threshold, item.content_hash, item.snapshot_hash))
+            portable_guards.extend(PortableGuard(item.public_id, tuple(item.shingles), item.source_timestamp, item.threshold, item.content_hash, item.snapshot_hash) for item in imported_evidence)
+            try:
+                merged_guards, guard_threshold = merge_guards(portable_guards)
+            except GuardValidationError as error:
+                raise ExportError(str(error)) from error
+            known = {item.public_id for item in merged_guards}
             for candidate in candidates:
                 for evidence_id in sorted(candidate.evidence_ids or []):
                     if evidence_id not in known:
-                        records["evidence_guard"].append({"id": evidence_id, "source_timestamp": (candidate.source_timestamps or {}).get(evidence_id), "content_hash": None, "snapshot_hash": None, "shingles": [], "threshold": guard.threshold})
-                        known.add(evidence_id)
-            records["evidence_guard"].sort(key=lambda item: item["id"])
-            def portable_strings(value: Any) -> Iterable[str]:
-                if isinstance(value, str):
-                    yield value
-                elif isinstance(value, dict):
-                    for child in value.values():
-                        yield from portable_strings(child)
-                elif isinstance(value, list):
-                    for child in value:
-                        yield from portable_strings(child)
-            evidence_fingerprints = [(item.public_id, guard.fingerprint_texts([item.title, item.snapshot, *item.tags])) for item in evidence]
-            for portable_text in portable_strings({name: rows for name, rows in records.items() if name != "evidence_guard"}):
-                if not guard.check_fingerprints([portable_text], evidence_fingerprints).passed:
-                    raise ExportError("raw competitor evidence detected in portable payload")
+                        raise ExportError("referenced evidence guard fingerprint is missing")
+            records["evidence_guard"] = [{"id": item.public_id, "source_timestamp": _timestamp(item.source_timestamp) if item.source_timestamp else None, "content_hash": item.content_hash, "snapshot_hash": item.snapshot_hash, "shingles": list(item.shingles), "threshold": guard_threshold} for item in merged_guards]
+            try:
+                validate_portable_guard_size(records["evidence_guard"], guard_threshold)
+            except GuardValidationError as error:
+                raise ExportError(str(error)) from error
+            evidence_fingerprints = [(item.public_id, list(item.shingles)) for item in merged_guards]
+            for name, rows in records.items():
+                if name == "evidence_guard":
+                    continue
+                for index, row in enumerate(rows):
+                    _scan_logical_record(row, fingerprints=evidence_fingerprints, threshold=guard_threshold)
+                    if index:
+                        _scan_logical_record([rows[index - 1], row], fingerprints=evidence_fingerprints, threshold=guard_threshold)
             counts = {name: len(items) for name, items in records.items()}
             return records, counts

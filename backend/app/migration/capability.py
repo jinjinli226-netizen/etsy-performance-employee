@@ -61,11 +61,22 @@ def _validate_windows_acl_snapshot(snapshot: dict[str, object], current_sid: str
 
 
 def create_capability_file(data_dir: Path, explicit_token: str | None = None) -> OwnedCapability:
+    data_dir = data_dir.resolve()
     runtime = data_dir / "runtime"
     runtime.mkdir(parents=True, exist_ok=True)
     path = runtime / "migration-capability"
     if path.exists() or path.is_symlink():
-        raise RuntimeError("migration capability file already exists")
+        metadata = path.lstat()
+        if path.is_symlink() or not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or path.parent.resolve() != runtime.resolve():
+            raise RuntimeError("existing migration capability file is unsafe")
+        _lock_windows_acl(path)
+        try:
+            old_token = path.read_text(encoding="ascii")
+        except (OSError, UnicodeError) as error:
+            raise RuntimeError("existing migration capability file is unsafe") from error
+        if not 32 <= len(old_token) <= 256:
+            raise RuntimeError("existing migration capability file is unsafe")
+        path.unlink()
     token = explicit_token or secrets.token_urlsafe(32)
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, stat.S_IRUSR | stat.S_IWUSR)
     try:

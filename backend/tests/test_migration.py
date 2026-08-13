@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import stat
+import threading
 import zipfile
 from datetime import UTC, datetime
 from io import BytesIO
@@ -35,6 +37,7 @@ from app.migration.secrets import SensitiveDataError, scan_for_secrets
 from app.core.config import Settings
 from app.migration.capability import _validate_windows_acl_snapshot, create_capability_file, remove_owned_capability_file
 from app.migration.contracts import GuardRecord, ManifestRecord, MessageRecord
+from app.migration.guard import GuardValidationError, PortableGuard, merge_guards, validate_shingles
 from pydantic import ValidationError
 
 
@@ -299,6 +302,93 @@ def test_imported_fingerprints_feed_runtime_originality_guard(tmp_path: Path) ->
     envelope = json.loads(trust.path.read_text(encoding="utf-8"))
     assert envelope["records"][0]["id"] == "ev-" + "2" * 32
     assert envelope["records"][0]["shingles"]
+
+
+def test_export_merges_imported_guard_and_rejects_conflicting_duplicate_or_missing_guard(tmp_path: Path) -> None:
+    engine, factory = _database(tmp_path / "source.db")
+    _seed(factory)
+    with factory.begin() as session:
+        source = session.query(CompetitorEvidence).one()
+        shingles = KnowledgeService(factory, export_dir=tmp_path / "trust").originality.fingerprint_texts([source.title, source.snapshot, *source.tags])
+        session.add(ImportedEvidenceFingerprint(public_id="ev-" + "3" * 32, shingles=shingles, source_timestamp=source.source_timestamp, threshold=.7, content_hash="e" * 64, snapshot_hash="f" * 64))
+    package = MigrationExporter(factory, employee_assets=_assets(tmp_path / "repo"), workspace=tmp_path / "migration").export(tmp_path / "merged.zip").path
+    with zipfile.ZipFile(package) as archive:
+        guards = [json.loads(line) for line in archive.read("data/evidence_guard.jsonl").decode().splitlines()]
+        manifest = json.loads(archive.read("manifest.json"))
+    assert [item["id"] for item in guards] == sorted(item["id"] for item in guards)
+    assert len(guards) == 2 and manifest["guard_threshold"] == .7
+    with factory.begin() as session:
+        session.add(ImportedEvidenceFingerprint(public_id="ev-" + "2" * 32, shingles=["a" * 64], source_timestamp=None, threshold=.72))
+    with pytest.raises(ExportError, match="conflicting"):
+        MigrationExporter(factory, employee_assets=tmp_path / "repo" / "employee", workspace=tmp_path / "migration2").export(tmp_path / "conflict.zip")
+    engine.dispose()
+
+
+@pytest.mark.parametrize("shingles", [[], ["A" * 64], ["b" * 64, "a" * 64], ["a" * 64, "a" * 64]])
+def test_guard_shingle_contract_rejects_empty_badhex_unsorted_and_duplicate(shingles: list[str]) -> None:
+    with pytest.raises(GuardValidationError):
+        validate_shingles(shingles)
+
+
+def test_guard_contract_rejects_501_records() -> None:
+    records = [PortableGuard(f"ev-{index:032x}", ("a" * 64,), None, .72, None, None) for index in range(501)]
+    with pytest.raises(GuardValidationError, match="capacity"):
+        merge_guards(records)
+
+
+def test_import_rejects_oversized_line_and_deep_json_before_write(tmp_path: Path) -> None:
+    package, _ = _export(tmp_path)
+    oversized = _rewrite_jsonl(package, tmp_path / "oversized.zip", "data/audit_events.jsonl", lambda row: {**row, "details": {"note": "x" * (2 * 1024 * 1024)}})
+    _, factory = _database(tmp_path / "limits.db")
+    importer = MigrationImporter(factory, repository_assets=tmp_path / "repo" / "employee", workspace=tmp_path / "imports")
+    with pytest.raises(ImportValidationError, match="line|expansion"):
+        importer.import_package(oversized, dry_run=True)
+    deep = value = {}
+    for _ in range(25):
+        value["child"] = {}; value = value["child"]
+    attacked = _rewrite_jsonl(package, tmp_path / "deep.zip", "data/audit_events.jsonl", lambda row: {**row, "details": deep})
+    with pytest.raises(ImportValidationError, match="structure"):
+        importer.import_package(attacked, dry_run=True)
+    with factory() as session:
+        assert session.query(MigrationImport).count() == 0
+
+
+def test_concurrent_imports_are_atomic_and_do_not_leak_integrity_errors(tmp_path: Path) -> None:
+    package, _ = _export(tmp_path)
+    _, factory = _database(tmp_path / "concurrent.db")
+    barrier = threading.Barrier(2)
+    results: list[object] = []
+    def worker() -> None:
+        importer = MigrationImporter(factory, repository_assets=tmp_path / "repo" / "employee", workspace=tmp_path / "imports")
+        barrier.wait()
+        try: results.append(importer.import_package(package))
+        except Exception as error: results.append(error)
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for thread in threads: thread.start()
+    for thread in threads: thread.join()
+    assert all(not isinstance(result, Exception) for result in results), repr(results)
+    with factory() as session:
+        assert session.query(MigrationImport).count() == 1
+        assert session.query(Conversation).count() == 1
+
+
+def test_capability_rotates_safe_crash_residual_and_refuses_symlink(tmp_path: Path) -> None:
+    first = create_capability_file(tmp_path)
+    second = create_capability_file(tmp_path)
+    assert second.token != first.token and second.path.read_text(encoding="ascii") == second.token
+    remove_owned_capability_file(first)
+    assert second.path.exists()
+    remove_owned_capability_file(second)
+    runtime = tmp_path / "unsafe" / "runtime"
+    runtime.mkdir(parents=True)
+    target = tmp_path / "target"
+    target.write_text("secret", encoding="ascii")
+    try:
+        (runtime / "migration-capability").symlink_to(target)
+    except OSError:
+        pytest.skip("symlinks unavailable")
+    with pytest.raises(RuntimeError, match="unsafe"):
+        create_capability_file(tmp_path / "unsafe")
 
 
 def test_existing_evidence_or_excel_job_is_reported_as_dry_run_conflict(tmp_path: Path) -> None:

@@ -31,6 +31,7 @@ from app.knowledge.schemas import (
     PatternPage,
     PatternTransitionRead,
 )
+from app.migration.guard import GuardValidationError, PortableGuard, merge_guards
 
 
 class KnowledgeNotFoundError(LookupError):
@@ -657,27 +658,30 @@ class KnowledgeService:
 
     def _guard_envelope(self, evidence: list[CompetitorEvidence], imported: list[ImportedEvidenceFingerprint] | None = None) -> tuple[dict[str, object], bytes]:
         imported = imported or []
-        if len(evidence) + len(imported) > self.max_guard_records:
-            raise KnowledgeCapacityError("evidence guard capacity exceeded")
-        records = []
+        portable: list[PortableGuard] = []
         for item in sorted(evidence, key=lambda record: record.public_id):
             shingles = self.originality.fingerprint_texts([item.title, item.snapshot, *item.tags])
             if len(shingles) > MAX_GUARD_SHINGLES_PER_RECORD:
                 raise KnowledgeCapacityError("evidence guard capacity exceeded")
-            record_payload = {"id": item.public_id, "shingles": shingles}
-            records.append({**record_payload, "content_sha256": _canonical_hash(record_payload)})
-        existing = {record["id"] for record in records}
+            portable.append(PortableGuard(item.public_id, tuple(shingles), item.source_timestamp, self.originality.threshold, item.content_hash, item.snapshot_hash))
         for item in imported:
-            if item.public_id in existing:
-                continue
             if len(item.shingles) > MAX_GUARD_SHINGLES_PER_RECORD:
                 raise KnowledgeCapacityError("evidence guard capacity exceeded")
+            portable.append(PortableGuard(item.public_id, tuple(item.shingles), item.source_timestamp, item.threshold, item.content_hash, item.snapshot_hash))
+        try:
+            merged, threshold = merge_guards(portable)
+        except GuardValidationError as error:
+            raise KnowledgeCapacityError(str(error)) from error
+        if len(merged) > self.max_guard_records:
+            raise KnowledgeCapacityError("evidence guard capacity exceeded")
+        records = []
+        for item in merged:
             record_payload = {"id": item.public_id, "shingles": sorted(item.shingles)}
             records.append({**record_payload, "content_sha256": _canonical_hash(record_payload)})
         records.sort(key=lambda record: record["id"])
         identity = _canonical_hash(records)
         export_id = "eg-" + identity[:32]
-        threshold = min([self.originality.threshold, *(item.threshold for item in imported)])
+        threshold = min(self.originality.threshold, threshold)
         payload = {"schema_version": 1, "export_id": export_id, "issuer": "local-evidence-guard-v1", "threshold": threshold, "records": records}
         envelope = {**payload, "content_sha256": _canonical_hash(payload)}
         encoded = json.dumps(envelope, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
