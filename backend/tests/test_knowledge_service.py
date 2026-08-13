@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+import openpyxl
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from sqlalchemy import select, text
@@ -63,6 +64,34 @@ def candidate_payload(evidence: list[CompetitorEvidence], **overrides) -> Candid
     }
     value.update(overrides)
     return CandidateInput.model_validate(value)
+
+
+@pytest.mark.parametrize("parse_error", [False, True])
+def test_workbook_originality_validator_always_closes_workbook(knowledge, tmp_path, monkeypatch, parse_error) -> None:
+    service, _, _ = knowledge
+    add_evidence(service, 1)
+
+    class FakeWorkbook:
+        closed = False
+
+        @property
+        def worksheets(self):
+            if parse_error:
+                raise RuntimeError("synthetic parser failure")
+            return []
+
+        def close(self):
+            self.closed = True
+
+    workbook = FakeWorkbook()
+    monkeypatch.setattr(openpyxl, "load_workbook", lambda *args, **kwargs: workbook)
+
+    if parse_error:
+        with pytest.raises(KnowledgeValidationError):
+            service.validate_generated_workbook(tmp_path / "generated.xlsx")
+    else:
+        service.validate_generated_workbook(tmp_path / "generated.xlsx")
+    assert workbook.closed is True
 
 
 def test_raw_competitor_data_remains_evidence_only_and_generation_gets_only_active_abstracts(knowledge) -> None:

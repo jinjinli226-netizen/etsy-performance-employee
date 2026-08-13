@@ -8,6 +8,7 @@ import re
 import secrets
 import shutil
 import stat
+import time
 import zipfile
 import ctypes
 from dataclasses import dataclass
@@ -208,7 +209,14 @@ def remove_operation_dir(operation: Path, workspace: Path) -> None:
         os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
         function(path)
 
-    shutil.rmtree(verified, onerror=make_writable_and_retry)
+    for attempt in range(3):
+        try:
+            shutil.rmtree(verified, onerror=make_writable_and_retry)
+            return
+        except (OSError, PermissionError) as exc:
+            if attempt == 2:
+                raise StorageError("cleanup_failed", "Temporary operation cleanup failed.") from exc
+            time.sleep(0.02 * (attempt + 1))
 
 
 def ensure_empty_knowledge_export(data_dir: Path) -> KnowledgeTrust:

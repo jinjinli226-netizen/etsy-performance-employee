@@ -14,7 +14,7 @@ from uuid import NAMESPACE_URL, uuid5
 import pytest
 from fastapi.testclient import TestClient
 from openpyxl import load_workbook
-from sqlalchemy import text
+from sqlalchemy import select, text
 
 from app.core.config import Settings
 from app.excel_jobs.runner import (
@@ -383,6 +383,55 @@ def test_backend_rejects_worker_artifact_that_copies_guarded_competitor_text(tmp
         assert terminal["error"]["code"] == "originality_failed"
         assert raw not in json.dumps(terminal)
         assert client.get(f"/api/excel-jobs/{job['id']}/download").status_code == 409
+        workspace = settings.data_dir / "excel-jobs" / job["id"]
+        assert not (workspace / "operations").exists() or not list((workspace / "operations").rglob("*.xlsx"))
+
+
+def test_cleanup_failure_is_persisted_safely_and_job_remains_failed(tmp_path, monkeypatch) -> None:
+    settings = Settings(data_dir=tmp_path / "data", database_url=f"sqlite:///{tmp_path / 'api.db'}")
+    app = create_app(settings=settings, excel_runner=FakeExcelRunner())
+
+    def fail_cleanup(operation, workspace):
+        raise StorageError("cleanup_failed", "private full path and raw evidence")
+
+    monkeypatch.setattr("app.excel_jobs.service.remove_operation_dir", fail_cleanup)
+    with TestClient(app) as client:
+        job = upload(client).json()
+        for _ in range(200):
+            terminal = client.get(f"/api/excel-jobs/{job['id']}").json()
+            if (terminal.get("error") or {}).get("code") == "cleanup_failed":
+                break
+            time.sleep(0.01)
+        assert terminal["status"] == "failed"
+        assert terminal["error"]["code"] == "cleanup_failed"
+        assert "private" not in json.dumps(terminal).casefold()
+
+        with app.state.session_factory() as session:
+            stored = session.scalar(select(ExcelJob).where(ExcelJob.public_id == job["id"]))
+            cleanup_events = [event.payload for event in stored.events if event.event_type == "cleanup_failed"]
+        assert cleanup_events == [{"status": "failed", "error": {"code": "cleanup_failed", "message": "Temporary operation cleanup failed."}}]
+
+
+def test_remove_operation_dir_retries_transient_windows_lock(tmp_path, monkeypatch) -> None:
+    workspace = tmp_path / "job"
+    operation = workspace / "operations" / "op"
+    operation.mkdir(parents=True)
+    (operation / "generated.xlsx").write_bytes(b"temporary")
+    real_rmtree = shutil.rmtree
+    attempts = 0
+
+    def locked_twice(path, *args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise PermissionError("synthetic lock")
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(excel_storage.shutil, "rmtree", locked_twice)
+    excel_storage.remove_operation_dir(operation, workspace)
+
+    assert attempts == 3
+    assert not operation.exists()
 
 
 def test_artifact_contract_rejects_duplicate_fixed_header(tmp_path) -> None:

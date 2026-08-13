@@ -519,23 +519,25 @@ class KnowledgeService:
             return
         try:
             workbook = load_workbook(path, read_only=True, data_only=False)
-            for sheet in workbook.worksheets:
-                header_row, columns = None, {}
-                for row in sheet.iter_rows(min_row=1, max_row=min(sheet.max_row, 200)):
-                    found = {str(cell.value).strip(): cell.column for cell in row if isinstance(cell.value, str)}
-                    if set(fixed).issubset(found):
-                        header_row, columns = row[0].row, found
-                        break
-                if header_row is None:
-                    continue
-                for row_number in range(header_row + 1, sheet.max_row + 1):
-                    generated = {field: sheet.cell(row_number, columns[header]).value or "" for header, field in fixed.items()}
-                    result = self.originality.check(generated, evidence)
-                    if not result.passed:
-                        raise KnowledgeValidationError(
-                            json.dumps({"code": "originality_failed", "score": result.max_score, "evidence_id": result.evidence_id}, separators=(",", ":"))
-                        )
-            workbook.close()
+            try:
+                for sheet in workbook.worksheets:
+                    header_row, columns = None, {}
+                    for row in sheet.iter_rows(min_row=1, max_row=min(sheet.max_row, 200)):
+                        found = {str(cell.value).strip(): cell.column for cell in row if isinstance(cell.value, str)}
+                        if set(fixed).issubset(found):
+                            header_row, columns = row[0].row, found
+                            break
+                    if header_row is None:
+                        continue
+                    for row_number in range(header_row + 1, sheet.max_row + 1):
+                        generated = {field: sheet.cell(row_number, columns[header]).value or "" for header, field in fixed.items()}
+                        result = self.originality.check(generated, evidence)
+                        if not result.passed:
+                            raise KnowledgeValidationError(
+                                json.dumps({"code": "originality_failed", "score": result.max_score, "evidence_id": result.evidence_id}, separators=(",", ":"))
+                            )
+            finally:
+                workbook.close()
         except KnowledgeValidationError:
             raise
         except Exception as exc:

@@ -337,7 +337,7 @@ class ExcelJobService:
                 try:
                     remove_operation_dir(operation, workspace)
                 except (OSError, StorageError):
-                    pass
+                    self._record_cleanup_failure(public_id)
 
     async def _persist_worker_event(self, public_id: str, event: dict) -> None:
         if not isinstance(event, dict) or not isinstance(event.get("event"), str):
@@ -371,6 +371,28 @@ class ExcelJobService:
             payload["progress_percent"] = job.progress_percent
             job.events.append(JobEvent(event_type=f"worker_{kind}", payload=payload))
             session.commit()
+
+    def _record_cleanup_failure(self, public_id: str) -> None:
+        message = "Temporary operation cleanup failed."
+        with self.factory() as session:
+            try:
+                job = self._get(session, public_id)
+            except JobNotFoundError:
+                return
+            if job.status is JobStatus.COMPLETED:
+                for artifact in list(job.artifacts):
+                    try:
+                        Path(artifact.path).unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    session.delete(artifact)
+            job.status = JobStatus.FAILED
+            job.error = message
+            job.error_code = "cleanup_failed"
+            job.error_message = message
+            job.events.append(JobEvent(event_type="cleanup_failed", payload={"status": "failed", "error": {"code": "cleanup_failed", "message": message}}))
+            session.commit()
+        self._signal(public_id)
 
     def _fail(self, public_id: str, code: str, message: str) -> None:
         with self.factory() as session:

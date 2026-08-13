@@ -407,17 +407,8 @@ def _safe_guard(
 
 
 def _originality_result(generated: dict[str, Any], evidence: list[tuple[str, str]], threshold: float = 0.72) -> dict[str, Any]:
-    def shingles(value: str) -> set[str]:
-        words = re.findall(r"[\w]+", value.casefold(), re.UNICODE)
-        return {" ".join(words[index:index + 3]) for index in range(max(0, len(words) - 2))}
-    generated_shingles = set().union(*(shingles(str(generated.get(field, ""))) for field in ("head_titles", "specification", "instructions_for_buyers")))
-    maximum, evidence_id = 0.0, None
-    for identifier, raw in evidence:
-        raw_shingles = shingles(raw)
-        score = len(generated_shingles & raw_shingles) / max(1, min(len(generated_shingles), len(raw_shingles))) if raw_shingles else 0
-        if score > maximum:
-            maximum, evidence_id = score, identifier
-    return {"passed": maximum < threshold, "score": round(maximum, 6), "evidence_id": evidence_id}
+    guard = _load_sibling("originality_guard")
+    return guard.check_listing(generated, evidence, threshold=threshold)
 
 
 def _prompt(row: dict[str, Any], knowledge: Any, rules: dict[str, Any], repair_error: dict[str, Any] | None) -> str:

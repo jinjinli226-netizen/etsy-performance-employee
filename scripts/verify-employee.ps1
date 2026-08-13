@@ -142,6 +142,7 @@ function Test-AssetIsolation {
         "skills/etsy-performance-listing/SKILL.md" = "employee\skills\etsy-performance-listing\SKILL.md"
         "skills/etsy-performance-listing/references/output-contract.md" = "employee\skills\etsy-performance-listing\references\output-contract.md"
         "skills/etsy-performance-listing/scripts/inspect_workbook.py" = "employee\skills\etsy-performance-listing\scripts\inspect_workbook.py"
+        "skills/etsy-performance-listing/scripts/originality_guard.py" = "employee\skills\etsy-performance-listing\scripts\originality_guard.py"
         "skills/etsy-performance-listing/scripts/run_task.py" = "employee\skills\etsy-performance-listing\scripts\run_task.py"
         "skills/etsy-performance-listing/scripts/validate_output.py" = "employee\skills\etsy-performance-listing\scripts\validate_output.py"
         "skills/etsy-performance-listing/scripts/write_workbook.py" = "employee\skills\etsy-performance-listing\scripts\write_workbook.py"
@@ -172,6 +173,7 @@ function Test-AssetIsolation {
             "etsy-performance-listing/references/output-contract.md",
             "etsy-performance-listing/scripts",
             "etsy-performance-listing/scripts/inspect_workbook.py",
+            "etsy-performance-listing/scripts/originality_guard.py",
             "etsy-performance-listing/scripts/run_task.py",
             "etsy-performance-listing/scripts/validate_output.py",
             "etsy-performance-listing/scripts/write_workbook.py"

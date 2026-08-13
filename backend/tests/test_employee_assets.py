@@ -358,7 +358,7 @@ def test_provisioner_encodes_isolation_and_safe_secret_handling() -> None:
     assert '& $VerifyScript -HermesCommand $HermesCommand' in script
     assert MANIFEST_NAME in script
     assert 'Copy-Item -LiteralPath $SourceSkill -Destination $SkillDestinationRoot -Recurse' not in script
-    for script_name in ("inspect_workbook.py", "run_task.py", "validate_output.py", "write_workbook.py"):
+    for script_name in ("inspect_workbook.py", "originality_guard.py", "run_task.py", "validate_output.py", "write_workbook.py"):
         assert script_name in script
     assert "assetHashes" in script and "defaultBaseline" in script
     assert "keyConfigured" in script
@@ -410,7 +410,7 @@ def test_verifier_is_read_only_and_checks_isolation() -> None:
 
 def test_excel_scripts_disable_bytecode_before_dynamic_imports() -> None:
     scripts = SKILL_PATH.parent / "scripts"
-    for name in ("inspect_workbook.py", "run_task.py", "validate_output.py", "write_workbook.py"):
+    for name in ("inspect_workbook.py", "originality_guard.py", "run_task.py", "validate_output.py", "write_workbook.py"):
         text = read(scripts / name)
         assert "sys.dont_write_bytecode = True" in text
         assert text.index("sys.dont_write_bytecode = True") < text.find("importlib", 0) if "importlib" in text else True

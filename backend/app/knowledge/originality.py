@@ -6,7 +6,11 @@ from dataclasses import dataclass
 from typing import Iterable, Mapping, Sequence
 
 
-_WORD = re.compile(r"[\w]+", re.UNICODE)
+DEFAULT_THRESHOLD = 0.72
+MAX_EVIDENCE_TEXTS = 500
+MAX_GENERATED_TEXTS = 3
+MAX_CHARS_PER_TEXT = 20_000
+_WORD = re.compile(r"[^\W_]+", re.UNICODE)
 _CJK = re.compile(r"[\u3400-\u9fff]")
 
 
@@ -27,22 +31,27 @@ def _normalized(value: str, limit: int) -> str:
 
 def _shingles(value: str, limit: int) -> set[str]:
     normalized = _normalized(value, limit)
-    if _CJK.search(normalized):
-        compact = "".join(normalized.split())
-        if len(compact) >= 5:
-            return {compact[index : index + 3] for index in range(len(compact) - 2)}
+    if not normalized:
+        return set()
     words = normalized.split()
-    if len(words) >= 3:
-        return {" ".join(words[index : index + 3]) for index in range(len(words) - 2)}
-    return set()
+    shingles = {
+        "word:" + " ".join(words[index : index + 3])
+        for index in range(max(0, len(words) - 2))
+    }
+    cjk = "".join(_CJK.findall(normalized))
+    shingles.update("cjk:" + cjk[index : index + 3] for index in range(max(0, len(cjk) - 2)))
+    if not shingles:
+        shingles.add("short:" + normalized)
+    return shingles
 
 
 class OriginalityGuard:
-    def __init__(self, *, threshold: float = 0.72, max_evidence: int = 500, max_chars_per_text: int = 20_000) -> None:
+    def __init__(self, *, threshold: float = DEFAULT_THRESHOLD, max_evidence: int = MAX_EVIDENCE_TEXTS, max_generated_texts: int = MAX_GENERATED_TEXTS, max_chars_per_text: int = MAX_CHARS_PER_TEXT) -> None:
         if not 0 <= threshold <= 1:
             raise ValueError("threshold must be between zero and one")
         self.threshold = threshold
         self.max_evidence = max(1, min(max_evidence, 1000))
+        self.max_generated_texts = max(1, min(max_generated_texts, MAX_GENERATED_TEXTS))
         self.max_chars_per_text = max(100, min(max_chars_per_text, 100_000))
 
     def check(self, generated: Mapping[str, object], evidence: Sequence[tuple[str, str]]) -> OriginalityResult:
@@ -50,7 +59,7 @@ class OriginalityGuard:
         return self.check_texts(values, evidence)
 
     def check_texts(self, generated_texts: Iterable[str], evidence: Sequence[tuple[str, str]]) -> OriginalityResult:
-        generated = set().union(*(_shingles(value, self.max_chars_per_text) for value in generated_texts))
+        generated = set().union(*(_shingles(str(value), self.max_chars_per_text) for value in list(generated_texts)[: self.max_generated_texts]))
         if not generated:
             return OriginalityResult(True, 0.0, None)
         maximum = 0.0
