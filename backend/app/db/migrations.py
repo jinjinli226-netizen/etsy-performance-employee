@@ -617,6 +617,80 @@ def _task10_atomic_attachments(connection: Connection) -> None:
     connection.execute(text("CREATE INDEX IF NOT EXISTS ix_attachments_claimed_by_message_id ON attachments(claimed_by_message_id)"))
 
 
+_EXCEL_WARNING_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+_EXCEL_WARNING_URL = re.compile(r"(?:https?://|www\.)", re.IGNORECASE)
+
+
+def _migration_warning_list(value: object) -> list[str]:
+    if isinstance(value, (str, bytes)):
+        try:
+            value = json.loads(value)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return []
+    if not isinstance(value, list):
+        return []
+    result: list[str] = []
+    seen: set[str] = set()
+    total = 0
+    for item in value:
+        if (
+            not isinstance(item, str)
+            or not item.strip()
+            or len(item) > 500
+            or _EXCEL_WARNING_CONTROL.search(item)
+            or _EXCEL_WARNING_URL.search(item)
+        ):
+            continue
+        cleaned = item.strip()
+        if cleaned in seen or len(result) >= 40 or total + len(cleaned) > 5_000:
+            continue
+        seen.add(cleaned)
+        result.append(cleaned)
+        total += len(cleaned)
+    return result
+
+
+def _task11_excel_warning_aggregate(connection: Connection) -> None:
+    if "warning_messages" not in _columns(connection, "excel_jobs"):
+        connection.execute(
+            text("ALTER TABLE excel_jobs ADD COLUMN warning_messages JSON NOT NULL DEFAULT '[]'")
+        )
+
+    rows = connection.execute(
+        text(
+            "SELECT jobs.id, jobs.warning_messages, events.payload "
+            "FROM excel_jobs AS jobs LEFT JOIN job_events AS events "
+            "ON events.excel_job_id = jobs.id AND events.event_type = 'worker_row_completed' "
+            "ORDER BY jobs.id, events.id"
+        ),
+        execution_options={"stream_results": True},
+    )
+    current_id: int | None = None
+    merged: list[str] = []
+
+    def persist() -> None:
+        if current_id is not None:
+            connection.execute(
+                text("UPDATE excel_jobs SET warning_messages=:warnings WHERE id=:id"),
+                {"id": current_id, "warnings": json.dumps(merged, ensure_ascii=False)},
+            )
+
+    for job_id, existing, payload in rows:
+        if job_id != current_id:
+            persist()
+            current_id = job_id
+            merged = _migration_warning_list(existing)
+        parsed = payload
+        if isinstance(parsed, (str, bytes)):
+            try:
+                parsed = json.loads(parsed)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                parsed = None
+        incoming = parsed.get("warnings", []) if isinstance(parsed, dict) else []
+        merged = _migration_warning_list([*merged, *_migration_warning_list(incoming)])
+    persist()
+
+
 MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (1, _task4_chat_columns),
     (2, _task6_excel_job_columns),
@@ -631,6 +705,7 @@ MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (10, _task8_guard_threshold_constraints),
     (11, _task10_chat_recovery),
     (12, _task10_atomic_attachments),
+    (13, _task11_excel_warning_aggregate),
 )
 
 

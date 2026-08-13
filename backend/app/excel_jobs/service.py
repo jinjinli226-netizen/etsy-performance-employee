@@ -36,14 +36,13 @@ from app.knowledge.service import KnowledgeCapacityError, KnowledgeService
 from app.knowledge.service import KnowledgeValidationError
 
 
-TERMINAL = {JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED}
+TERMINAL = {JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED, JobStatus.NEEDS_REVIEW}
 _SAFE_CODE = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
 _WARNING_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _WARNING_URL = re.compile(r"(?:https?://|www\.)", re.IGNORECASE)
 MAX_JOB_WARNINGS = 40
 MAX_JOB_WARNING_CHARS = 500
 MAX_JOB_WARNING_TOTAL_CHARS = 5_000
-MAX_JOB_WARNING_EVENTS = 200
 
 
 class JobNotFoundError(RuntimeError):
@@ -159,13 +158,7 @@ class ExcelJobService:
     def get_job(self, public_id: str) -> JobView:
         with self.factory() as session:
             job = self._get(session, public_id, artifacts=True)
-            warning_payloads = session.scalars(
-                select(JobEvent.payload)
-                .where(JobEvent.excel_job_id == job.id, JobEvent.event_type == "worker_row_completed")
-                .order_by(JobEvent.id.desc())
-                .limit(MAX_JOB_WARNING_EVENTS)
-            ).all()
-            return self._view(job, warning_payloads=list(reversed(warning_payloads)))
+            return self._view(job)
 
     def events_after(self, public_id: str, after_id: int) -> tuple[list[JobEvent], bool]:
         with self.factory() as session:
@@ -389,6 +382,9 @@ class ExcelJobService:
                 raise JobConflictError("Job is no longer running.")
             if kind == "row_completed":
                 job.progress_percent = min(99, max(job.progress_percent, job.progress_percent + 1))
+                job.warning_messages = _merge_warning_values(
+                    job.warning_messages, payload.get("warnings", [])
+                )
             payload["progress_percent"] = job.progress_percent
             job.events.append(JobEvent(event_type=f"worker_{kind}", payload=payload))
             session.commit()
@@ -452,9 +448,9 @@ class ExcelJobService:
             raise JobNotFoundError(public_id)
         return job
 
-    def _view(self, job: ExcelJob, *, warning_payloads: list[dict] | None = None) -> JobView:
+    def _view(self, job: ExcelJob) -> JobView:
         artifacts = list(job.artifacts) if "artifacts" in job.__dict__ else []
-        warnings = _merge_worker_warnings(warning_payloads or [])
+        warnings = _safe_worker_warnings(job.warning_messages, reject=False)
         artifact_model = artifacts[0] if len(artifacts) == 1 and job.status is JobStatus.COMPLETED else None
         artifact = None
         if artifact_model is not None and artifact_model.sha256 and artifact_model.size_bytes is not None:
@@ -521,14 +517,12 @@ def _safe_worker_warnings(value: object, *, reject: bool = True) -> list[str]:
     return warnings
 
 
-def _merge_worker_warnings(payloads: list[dict]) -> list[str]:
+def _merge_warning_values(existing: object, incoming: object) -> list[str]:
     merged: list[str] = []
     seen: set[str] = set()
     total = 0
-    for payload in payloads[:MAX_JOB_WARNING_EVENTS]:
-        if not isinstance(payload, dict):
-            continue
-        for warning in _safe_worker_warnings(payload.get("warnings", []), reject=False):
+    for values in (existing, incoming):
+        for warning in _safe_worker_warnings(values, reject=False):
             if warning in seen or len(merged) >= MAX_JOB_WARNINGS or total + len(warning) > MAX_JOB_WARNING_TOTAL_CHARS:
                 continue
             seen.add(warning)

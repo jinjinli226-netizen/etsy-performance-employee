@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC
 from uuid import NAMESPACE_URL, uuid5
 
@@ -344,7 +345,7 @@ def test_init_db_migrates_task2_sqlite_schema_and_preserves_data(tmp_path) -> No
         with engine.connect() as connection:
             assert connection.execute(
                 text("SELECT version FROM schema_migrations ORDER BY version")
-                ).scalars().all() == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+                ).scalars().all() == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
             index_names = {
                 row[1] for row in connection.execute(text("PRAGMA index_list('messages')"))
             }
@@ -382,8 +383,8 @@ def test_init_db_migrates_legacy_excel_jobs_and_preserves_rows(tmp_path) -> None
                 100,
             )
             assert connection.execute(text("SELECT kind, path FROM artifacts WHERE id=8")).one() == ("legacy", "legacy/output.xlsx")
-            assert connection.execute(text("SELECT version FROM schema_migrations ORDER BY version")).scalars().all() == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
-            assert {row[1] for row in connection.execute(text("PRAGMA table_info('excel_jobs')"))} >= {"public_id", "source_sha256", "source_size_bytes", "error_code", "error_message", "progress_percent"}
+            assert connection.execute(text("SELECT version FROM schema_migrations ORDER BY version")).scalars().all() == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+            assert {row[1] for row in connection.execute(text("PRAGMA table_info('excel_jobs')"))} >= {"public_id", "source_sha256", "source_size_bytes", "error_code", "error_message", "progress_percent", "warning_messages"}
             assert {row[1] for row in connection.execute(text("PRAGMA table_info('artifacts')"))} >= {"filename", "sha256", "size_bytes"}
             assert "job_events" in {row[0] for row in connection.execute(text("SELECT name FROM sqlite_master WHERE type='table'"))}
             assert connection.execute(
@@ -407,6 +408,51 @@ def test_init_db_migrates_legacy_excel_jobs_and_preserves_rows(tmp_path) -> None
             ):
                 with pytest.raises(IntegrityError):
                     connection.execute(text(f"UPDATE excel_jobs SET {clause} WHERE id=7"))
+    finally:
+        engine.dispose()
+
+
+def test_warning_aggregate_migration_backfills_early_events_without_truncation(tmp_path) -> None:
+    engine = create_engine_for_url(f"sqlite:///{tmp_path / 'warning-backfill.db'}")
+    try:
+        init_db(engine)
+        public_id = "11111111-1111-4111-8111-111111111111"
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO excel_jobs "
+                    "(public_id, source_filename, source_sha256, source_size_bytes, status, "
+                    "progress_percent, warning_messages, created_at, updated_at) VALUES "
+                    "(:public_id, 'legacy-warning.xlsx', :sha, 1, 'completed', 100, '[]', "
+                    "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+                ),
+                {"public_id": public_id, "sha": "a" * 64},
+            )
+            job_id = connection.execute(
+                text("SELECT id FROM excel_jobs WHERE public_id=:public_id"), {"public_id": public_id}
+            ).scalar_one()
+            connection.execute(
+                text(
+                    "INSERT INTO job_events (excel_job_id, event_type, payload, created_at) "
+                    "VALUES (:job_id, 'worker_row_completed', :payload, CURRENT_TIMESTAMP)"
+                ),
+                {"job_id": job_id, "payload": '{"warnings":["early warning"]}'},
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO job_events (excel_job_id, event_type, payload, created_at) "
+                    "VALUES (:job_id, 'worker_row_completed', '{\"warnings\":[]}', CURRENT_TIMESTAMP)"
+                ),
+                [{"job_id": job_id} for _ in range(250)],
+            )
+            connection.execute(text("DELETE FROM schema_migrations WHERE version=13"))
+
+        init_db(engine)
+        with engine.connect() as connection:
+            assert json.loads(connection.execute(
+                text("SELECT warning_messages FROM excel_jobs WHERE public_id=:public_id"),
+                {"public_id": public_id},
+            ).scalar_one()) == ["early warning"]
     finally:
         engine.dispose()
 
@@ -440,6 +486,6 @@ def test_uuid_contract_upgrade_archives_ids_accepted_by_older_v3(tmp_path) -> No
             ).one() == (expected, "failed", "legacy_migrated")
             assert connection.execute(
                 text("SELECT version FROM schema_migrations ORDER BY version")
-                ).scalars().all() == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+                ).scalars().all() == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
     finally:
         engine.dispose()

@@ -137,6 +137,9 @@ class ExcelJob(TimestampMixin, Base):
     error_code: Mapped[str | None] = mapped_column(String(63))
     error_message: Mapped[str | None] = mapped_column(String(255))
     progress_percent: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    warning_messages: Mapped[list[str]] = mapped_column(
+        JSON, default=list, server_default="[]", nullable=False
+    )
 
     conversation: Mapped[Conversation | None] = relationship(back_populates="excel_jobs")
     artifacts: Mapped[list[Artifact]] = relationship(

@@ -42,7 +42,7 @@ class FakeExcelApi implements ExcelApi {
   downloadResult = { blob: new Blob(["xlsx"]), filename: "表演服上新_listing.xlsx" };
   uploadGate?: Promise<void>;
 
-  async createJob(file: File) {
+  async createJob(file: File, _signal?: AbortSignal) {
     await this.uploadGate;
     this.uploads.push(file);
     const job = makeJob("queued", { id: `11111111-1111-4111-8111-${String(this.uploads.length).padStart(12, "0")}`, source_filename: file.name });
@@ -254,10 +254,14 @@ describe("Excel automation workspace", () => {
     const api = new FakeExcelApi();
     const job = makeJob("running");
     api.jobs = [job];
-    api.events.set(job.id, Array.from({ length: 60 }, (_, index) => ({
+    const events = Array.from({ length: 60 }, (_, index) => ({
       id: index + 1,
       event: { type: "worker_row_completed", status: "running", progress_percent: index, warnings: [`warning-${index}`, "same-warning"] },
-    })));
+    } satisfies { id: number; event: ExcelJobEvent }));
+    api.streamJob = async (_id, options) => {
+      events.forEach(({ id, event }) => options.onEvent(event, id));
+      await new Promise<void>((resolve) => options.signal.addEventListener("abort", () => resolve(), { once: true }));
+    };
     const { store } = await render(api);
     await flushPromises();
     expect(store.currentWarnings).toHaveLength(40);
@@ -275,6 +279,21 @@ describe("Excel automation workspace", () => {
     await flushPromises();
     expect(wrapper.findAll('[data-testid="download-result"]')).toHaveLength(1);
     expect(wrapper.text()).toContain("Confirm measurements");
+  });
+
+  it("replaces streamed warnings with an authoritative empty terminal detail", async () => {
+    const api = new FakeExcelApi();
+    const running = makeJob("running", { artifact: null });
+    api.jobs = [running];
+    api.events.set(running.id, [
+      { id: 3, event: { type: "worker_row_completed", status: "running", progress_percent: 50, warnings: ["streamed warning"] } },
+      { id: 4, event: { type: "completed", status: "completed", progress_percent: 100 } },
+    ]);
+    api.getJob = async () => makeJob("completed", { id: running.id, warnings: [] });
+    const { store, wrapper } = await render(api);
+    await flushPromises();
+    expect(store.currentWarnings).toEqual([]);
+    expect(wrapper.text()).not.toContain("streamed warning");
   });
 
   it("retries a transient terminal refresh and clears the recovered connection error", async () => {
@@ -336,12 +355,18 @@ describe("Excel automation workspace", () => {
     const { wrapper, store } = await render(api);
     await chooseFile(wrapper, new File(["PK"], "memory.xlsx"));
     expect(store.retainedFileCount).toBe(1);
-    const active = store.currentJob!;
-    api.getJob = async () => makeJob("completed", { id: active.id });
-    api.events.set(active.id, [{ id: 10, event: { type: "completed", status: "completed", progress_percent: 100 } }]);
-    await store.restartMonitoring(active.id);
+    await store.cancelCurrent();
     await flushPromises();
     expect(store.retainedFileCount).toBe(0);
+
+    const completedApi = new FakeExcelApi();
+    const completedId = "11111111-1111-4111-8111-000000000001";
+    completedApi.events.set(completedId, [{ id: 10, event: { type: "completed", status: "completed", progress_percent: 100 } }]);
+    completedApi.getJob = async () => makeJob("completed", { id: completedId });
+    const completed = await render(completedApi);
+    await chooseFile(completed.wrapper, new File(["PK"], "completed-memory.xlsx"));
+    await flushPromises();
+    expect(completed.store.retainedFileCount).toBe(0);
     store.dispose();
     expect(store.retainedFileCount).toBe(0);
   });
@@ -355,6 +380,27 @@ describe("Excel automation workspace", () => {
     expect(wrapper.text()).not.toContain("private");
     store.dispose();
     expect(store.disposed).toBe(true);
+  });
+
+  it("aborts an owned pending upload on dispose without retaining the file or result", async () => {
+    const api = new FakeExcelApi();
+    let observedSignal: AbortSignal | undefined;
+    api.createJob = (_file, signal) => {
+      observedSignal = signal;
+      return new Promise((_resolve, reject) => {
+        if (!signal) { reject(new Error("missing signal")); return; }
+        signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      });
+    };
+    const store = createExcelStore(api);
+    const pending = store.upload(new File(["PK"], "pending.xlsx"));
+    await nextTick();
+    store.dispose();
+    await expect(pending).resolves.toBe(false);
+    expect(observedSignal?.aborted).toBe(true);
+    expect(store.jobs).toHaveLength(0);
+    expect(store.retainedFileCount).toBe(0);
+    expect(store.errorCode).toBeNull();
   });
 });
 

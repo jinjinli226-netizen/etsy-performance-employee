@@ -324,18 +324,19 @@ def test_list_jobs_does_not_load_event_collections_and_detail_warnings_stay_boun
                 job = ExcelJob(
                     public_id=f"00000000-0000-4000-8000-{index + 1:012d}", source_filename=f"{index}.xlsx",
                     source_sha256="a" * 64, source_size_bytes=1, status=JobStatus.COMPLETED, progress_percent=100,
+                    warning_messages=[f"warning-{event}" for event in range(40)],
                 )
-                job.events.extend(JobEvent(event_type="worker_row_completed", payload={"warnings": [f"warning-{event}", "same"]}) for event in range(100))
+                job.events.extend(JobEvent(event_type="worker_row_completed", payload={"warnings": []}) for _ in range(250))
                 jobs.append(job)
             session.add_all(jobs)
             session.commit()
 
         listed, total = service.list_jobs(20, 0)
         assert total == 20
-        assert all(item.warnings == [] for item in listed)
+        assert all(len(item.warnings) == 40 for item in listed)
         detail = service.get_job("00000000-0000-4000-8000-000000000001")
         assert len(detail.warnings) == 40
-        assert detail.warnings.count("same") == 1
+        assert detail.warnings[0] == "warning-0"
         assert sum(map(len, detail.warnings)) <= 5_000
 
 
@@ -443,6 +444,30 @@ def test_running_cancel_is_idempotent_and_preserves_source(tmp_path) -> None:
         assert first.status_code == second.status_code == 200
         assert wait_terminal(client, job["id"])["status"] == "cancelled"
         assert sha256(runner.calls[0].source_path) == sha256(FIXTURE)
+
+
+def test_legacy_needs_review_job_is_terminal_for_events_cancel_and_recovery(tmp_path) -> None:
+    settings = Settings(data_dir=tmp_path / "data", database_url=f"sqlite:///{tmp_path / 'api.db'}")
+    app = create_app(settings=settings, excel_runner=FakeExcelRunner())
+    with TestClient(app) as client:
+        public_id = "33333333-3333-4333-8333-333333333333"
+        with app.state.session_factory() as session:
+            job = ExcelJob(
+                public_id=public_id, source_filename="legacy-review.xlsx", source_sha256="a" * 64,
+                source_size_bytes=1, status=JobStatus.NEEDS_REVIEW, progress_percent=100,
+            )
+            job.events.append(JobEvent(event_type="needs_review", payload={"status": "needs_review"}))
+            session.add(job)
+            session.commit()
+
+        events, terminal = app.state.excel_job_service.events_after(public_id, 0)
+        assert terminal is True
+        assert [event.event_type for event in events] == ["needs_review"]
+        cancelled = client.post(f"/api/excel-jobs/{public_id}/cancel")
+        assert cancelled.status_code == 200
+        assert cancelled.json()["status"] == "needs_review"
+        app.state.excel_job_service.reconcile_interrupted_jobs()
+        assert client.get(f"/api/excel-jobs/{public_id}").json()["status"] == "needs_review"
 
 
 def test_real_runner_command_invokes_only_employee_entry_and_trusted_arguments(tmp_path) -> None:

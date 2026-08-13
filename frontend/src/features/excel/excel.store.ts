@@ -12,17 +12,21 @@ interface Monitor { controller: AbortController; token: symbol }
 export interface ExcelStoreOptions { pollIntervalMs?: number; pollAttempts?: number }
 
 const safeErrorCode = (error: unknown): HttpErrorCode => error instanceof HttpError ? error.code : "network";
-const safeWarnings = (value: unknown) => {
-  if (!Array.isArray(value)) return [];
+const boundedWarnings = (...values: unknown[]) => {
   const result: string[] = [];
+  const seen = new Set<string>();
   let total = 0;
-  for (const item of value) {
-    if (typeof item !== "string" || item.length > 500 || /[\u0000-\u001f\u007f]/.test(item) || /(?:https?:\/\/|www\.)/i.test(item)) continue;
-    const cleaned = item.trim();
-    if (!cleaned || total + cleaned.length > 5_000) continue;
-    result.push(cleaned);
-    total += cleaned.length;
-    if (result.length === 40) break;
+  for (const value of values) {
+    if (!Array.isArray(value)) continue;
+    for (const item of value) {
+      if (typeof item !== "string" || item.length > 500 || /[\u0000-\u001f\u007f]/.test(item) || /(?:https?:\/\/|www\.)/i.test(item)) continue;
+      const cleaned = item.trim();
+      if (!cleaned || seen.has(cleaned) || total + cleaned.length > 5_000) continue;
+      seen.add(cleaned);
+      result.push(cleaned);
+      total += cleaned.length;
+      if (result.length === 40) return result;
+    }
   }
   return result;
 };
@@ -51,6 +55,8 @@ export const createExcelStore = (api: ExcelApi = excelApi, options: ExcelStoreOp
   const localFiles = shallowReactive(new Map<string, File>());
   let listController: AbortController | null = null;
   let loadToken: symbol | null = null;
+  let uploadController: AbortController | null = null;
+  let uploadToken: symbol | null = null;
   const total = ref(0);
   const pollIntervalMs = options.pollIntervalMs ?? 700;
   const pollAttempts = options.pollAttempts ?? 8;
@@ -67,9 +73,8 @@ export const createExcelStore = (api: ExcelApi = excelApi, options: ExcelStoreOp
     } catch { /* Persistence is optional; server history remains authoritative. */ }
   };
 
-  const upsert = (incoming: ExcelJob) => {
-    const receivedWarnings = safeWarnings(incoming.warnings);
-    if (receivedWarnings.length) warnings.set(incoming.id, receivedWarnings);
+  const upsertAuthoritative = (incoming: ExcelJob) => {
+    warnings.set(incoming.id, boundedWarnings(incoming.warnings));
     const index = jobs.value.findIndex((job) => job.id === incoming.id);
     if (index < 0) jobs.value = [incoming, ...jobs.value];
     else {
@@ -92,8 +97,8 @@ export const createExcelStore = (api: ExcelApi = excelApi, options: ExcelStoreOp
       job.progress_percent = Math.max(job.progress_percent, Math.min(100, Math.max(0, Math.round(event.progress_percent))));
     }
     if (event.status && ["queued", "running"].includes(event.status)) job.status = event.status;
-    const receivedWarnings = safeWarnings(event.warnings);
-    if (receivedWarnings.length) warnings.set(job.id, safeWarnings([...new Set([...(warnings.get(job.id) ?? []), ...receivedWarnings])]));
+    const receivedWarnings = boundedWarnings(event.warnings);
+    if (receivedWarnings.length) warnings.set(job.id, boundedWarnings(warnings.get(job.id), receivedWarnings));
   };
 
   const refreshTerminal = async (job: ExcelJob, handle: Monitor) => {
@@ -105,7 +110,7 @@ export const createExcelStore = (api: ExcelApi = excelApi, options: ExcelStoreOp
           if (attempt + 1 < pollAttempts) await delay(pollIntervalMs, handle.controller.signal).catch(() => undefined);
           continue;
         }
-        const updated = upsert(received);
+        const updated = upsertAuthoritative(received);
         if (TERMINAL.has(updated.status)) {
           errorCode.value = null;
           return true;
@@ -128,7 +133,7 @@ export const createExcelStore = (api: ExcelApi = excelApi, options: ExcelStoreOp
           if (attempt + 1 < pollAttempts) await delay(pollIntervalMs, handle.controller.signal).catch(() => undefined);
           continue;
         }
-        const updated = upsert(received);
+        const updated = upsertAuthoritative(received);
         if (TERMINAL.has(updated.status)) {
           errorCode.value = null;
           return;
@@ -192,10 +197,7 @@ export const createExcelStore = (api: ExcelApi = excelApi, options: ExcelStoreOp
       const page = await api.listJobs(controller.signal, 20, 0);
       if (disposed.value || loadToken !== token) return;
       jobs.value = page.items;
-      page.items.forEach((job) => {
-        const receivedWarnings = safeWarnings(job.warnings);
-        if (receivedWarnings.length) warnings.set(job.id, receivedWarnings);
-      });
+      page.items.forEach((job) => warnings.set(job.id, boundedWarnings(job.warnings)));
       total.value = page.total;
       let preferred: string | null = null;
       try { preferred = localStorage.getItem(CURRENT_KEY); } catch { /* Ignore unavailable storage. */ }
@@ -215,23 +217,21 @@ export const createExcelStore = (api: ExcelApi = excelApi, options: ExcelStoreOp
     loadingMore.value = true;
     try {
       const page = await api.listJobs(undefined, 20, jobs.value.length);
+      if (disposed.value) return false;
       const known = new Set(jobs.value.map((job) => job.id));
       jobs.value = [...jobs.value, ...page.items.filter((job) => !known.has(job.id))];
-      page.items.forEach((job) => {
-        const receivedWarnings = safeWarnings(job.warnings);
-        if (receivedWarnings.length) warnings.set(job.id, receivedWarnings);
-      });
+      page.items.forEach((job) => warnings.set(job.id, boundedWarnings(job.warnings)));
       total.value = page.total;
       beginMonitoring();
       return true;
     } catch (error) {
-      errorCode.value = safeErrorCode(error);
+      if (!disposed.value) errorCode.value = safeErrorCode(error);
       return false;
     } finally { loadingMore.value = false; }
   };
 
   const selectJob = async (id: string) => {
-    if (!jobs.value.some((job) => job.id === id)) return;
+    if (disposed.value || !jobs.value.some((job) => job.id === id)) return;
     currentJobId.value = id;
     persistSelection(id);
     const job = jobs.value.find((item) => item.id === id)!;
@@ -242,21 +242,34 @@ export const createExcelStore = (api: ExcelApi = excelApi, options: ExcelStoreOp
     if (uploading.value || disposed.value) return false;
     const invalid = validateExcelFile(file);
     if (invalid) { errorCode.value = invalid; return false; }
+    const controller = new AbortController();
+    const token = Symbol("excel-upload");
+    uploadController = controller;
+    uploadToken = token;
     uploading.value = true;
     errorCode.value = null;
     try {
-      const job = upsert(await api.createJob(file));
+      const received = await api.createJob(file, controller.signal);
+      if (disposed.value || controller.signal.aborted || uploadToken !== token) return false;
+      const job = upsertAuthoritative(received);
       total.value = Math.max(total.value + 1, jobs.value.length);
       localFiles.set(job.id, file);
       await selectJob(job.id);
       void monitor(job);
       return true;
     } catch (error) {
+      if (disposed.value || controller.signal.aborted || uploadToken !== token) return false;
       errorCode.value = error instanceof HttpError && error.status === 507
         || Boolean(error && typeof error === "object" && "status" in error && error.status === 507)
         ? "capacity" : safeErrorCode(error);
       return false;
-    } finally { uploading.value = false; }
+    } finally {
+      if (uploadToken === token) {
+        uploadController = null;
+        uploadToken = null;
+        uploading.value = false;
+      }
+    }
   };
 
   const retryCurrent = async () => {
@@ -271,16 +284,18 @@ export const createExcelStore = (api: ExcelApi = excelApi, options: ExcelStoreOp
 
   const cancelCurrent = async () => {
     const job = currentJob.value;
-    if (!job || !ACTIVE.has(job.status) || cancelLocks.has(job.id)) return false;
+    if (disposed.value || !job || !ACTIVE.has(job.status) || cancelLocks.has(job.id)) return false;
     cancelLocks.add(job.id);
     cancelling.value = true;
     try {
-      const updated = upsert(await api.cancelJob(job.id));
+      const received = await api.cancelJob(job.id);
+      if (disposed.value) return false;
+      const updated = upsertAuthoritative(received);
       monitors.get(job.id)?.controller.abort();
       monitors.delete(job.id);
       return updated.status === "cancelled";
     } catch (error) {
-      errorCode.value = safeErrorCode(error);
+      if (!disposed.value) errorCode.value = safeErrorCode(error);
       return false;
     } finally {
       cancelLocks.delete(job.id);
@@ -290,10 +305,11 @@ export const createExcelStore = (api: ExcelApi = excelApi, options: ExcelStoreOp
 
   const downloadCurrent = async () => {
     const job = currentJob.value;
-    if (!job || job.status !== "completed" || !job.artifact || downloading.value) return false;
+    if (disposed.value || !job || job.status !== "completed" || !job.artifact || downloading.value) return false;
     downloading.value = true;
     try {
       const result = await api.downloadJob(job.id, job.source_filename);
+      if (disposed.value) return false;
       const url = URL.createObjectURL(result.blob);
       try {
         const link = document.createElement("a");
@@ -305,7 +321,7 @@ export const createExcelStore = (api: ExcelApi = excelApi, options: ExcelStoreOp
       errorCode.value = null;
       return true;
     } catch (error) {
-      errorCode.value = safeErrorCode(error);
+      if (!disposed.value) errorCode.value = safeErrorCode(error);
       return false;
     } finally { downloading.value = false; }
   };
@@ -314,24 +330,20 @@ export const createExcelStore = (api: ExcelApi = excelApi, options: ExcelStoreOp
   const dispose = () => {
     disposed.value = true;
     listController?.abort();
+    uploadController?.abort();
+    uploadController = null;
+    uploadToken = null;
+    uploading.value = false;
     monitors.forEach((handle) => handle.controller.abort());
     monitors.clear();
     cancelLocks.clear();
     localFiles.clear();
   };
 
-  const restartMonitoring = async (id: string) => {
-    const job = jobs.value.find((item) => item.id === id);
-    if (!job) return;
-    monitors.get(id)?.controller.abort();
-    monitors.delete(id);
-    await monitor(job);
-  };
-
   return reactive({
     jobs, currentJobId, currentJob, currentWarnings, retainedFileCount, total, hasMore, loading, loadingMore, uploading, cancelling, downloading,
     errorCode, disposed: readonly(disposed), initialize, loadMore, selectJob, upload, retryCurrent, cancelCurrent, downloadCurrent, clearError, dispose,
-    hasLocalFile: (id: string) => localFiles.has(id), restartMonitoring,
+    hasLocalFile: (id: string) => localFiles.has(id),
   });
 };
 
