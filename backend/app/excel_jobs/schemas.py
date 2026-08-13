@@ -62,6 +62,7 @@ class ExcelJobRead(BaseModel):
     source_size_bytes: int
     status: JobStatus
     progress_percent: int = Field(ge=0, le=100)
+    warnings: list[str] = Field(default_factory=list)
     error: JobErrorRead | None = None
     created_at: datetime
     updated_at: datetime

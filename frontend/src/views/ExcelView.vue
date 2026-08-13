@@ -13,7 +13,8 @@ const store = props.store;
 const dropzone = ref<InstanceType<typeof ExcelDropzone> | null>(null);
 const anotherDropzone = ref<InstanceType<typeof ExcelDropzone> | null>(null);
 const another = ref<HTMLDetailsElement | null>(null);
-const notice = ref<HTMLElement | null>(null);
+const alertRef = ref<HTMLElement | null>(null);
+const liveRef = ref<HTMLElement | null>(null);
 const errorCopy: Record<HttpErrorCode | "capacity" | "unsupported" | "empty" | "too_large", string> = {
   bad_request: "工作簿无法处理，请确认文件完整后重试。",
   not_found: "这条任务已不存在，请从历史任务重新选择。",
@@ -33,11 +34,12 @@ const errorMessage = computed(() => store.errorCode ? errorCopy[store.errorCode]
 const upload = async (file: File) => {
   const succeeded = await store.upload(file);
   await nextTick();
-  if (succeeded) notice.value?.focus();
+  if (succeeded) liveRef.value?.focus();
+  else if (errorMessage.value) alertRef.value?.focus();
   else dropzone.value?.focus();
 };
-const retry = async () => { await store.retryCurrent(); await nextTick(); notice.value?.focus(); };
-const download = async () => { await store.downloadCurrent(); await nextTick(); notice.value?.focus(); };
+const retry = async () => { await store.retryCurrent(); await nextTick(); liveRef.value?.focus(); };
+const download = async () => { await store.downloadCurrent(); await nextTick(); liveRef.value?.focus(); };
 const reselect = async () => {
   if (another.value) another.value.open = true;
   await nextTick();
@@ -59,12 +61,12 @@ onMounted(() => { if (!store.jobs.length && !store.loading) void store.initializ
         <FileSpreadsheet :size="23" aria-hidden="true" />
       </header>
 
-      <div v-if="errorMessage" ref="notice" class="excel-workspace__notice" role="alert" tabindex="-1">
+      <div v-if="errorMessage" ref="alertRef" class="excel-workspace__notice" role="alert" tabindex="-1">
         <CircleAlert :size="16" aria-hidden="true" /><span>{{ errorMessage }}</span>
         <button type="button" aria-label="关闭错误提醒" @click="store.clearError()">关闭</button>
       </div>
-      <div ref="notice" class="sr-only" aria-live="polite" tabindex="-1">
-        {{ store.currentJob ? `${store.currentJob.source_filename}：${store.currentJob.status}` : "" }}
+      <div ref="liveRef" class="sr-only" aria-live="polite" tabindex="-1">
+        {{ store.currentJob ? `${store.currentJob.source_filename}：${store.currentJob.status}，进度 ${store.currentJob.progress_percent}%` : "" }}
       </div>
 
       <div v-if="store.loading && !store.jobs.length" class="excel-workspace__loading">正在读取历史任务…</div>
@@ -107,7 +109,7 @@ onMounted(() => { if (!store.jobs.length && !store.loading) void store.initializ
 .excel-workspace h2 { margin: 0 0 7px; font-size: 22px; font-weight: 600; }.excel-workspace p { margin: 0; color: var(--text-secondary); font-size: 13px; }
 .excel-workspace__intro + :deep(.excel-dropzone) { padding-top: 24px; }
 .excel-workspace__notice { display: flex; min-height: 44px; align-items: center; gap: 9px; margin-top: 16px; padding: 8px 11px; border: 1px solid rgba(240, 180, 77, .34); border-radius: var(--ds-radius-control); background: rgba(240, 180, 77, .06); color: var(--warning); font-size: 12px; }
-.excel-workspace__notice span { min-width: 0; }.excel-workspace__notice button { margin-left: auto; border: 0; background: transparent; color: var(--text-secondary); cursor: pointer; }
+.excel-workspace__notice span { min-width: 0; }.excel-workspace__notice button { min-width: 44px; min-height: 44px; margin-left: auto; border: 0; background: transparent; color: var(--text-secondary); cursor: pointer; }
 .excel-workspace__loading { display: grid; min-height: 280px; place-items: center; color: var(--text-muted); }
 .excel-workspace__another { margin-top: 28px; padding-top: 16px; border-top: 1px solid var(--border); }
 .excel-workspace__another summary { min-height: 44px; color: var(--text-secondary); font-size: 12px; cursor: pointer; }

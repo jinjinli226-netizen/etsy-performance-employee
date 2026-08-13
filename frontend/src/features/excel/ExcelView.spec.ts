@@ -25,6 +25,7 @@ const makeJob = (status: ExcelJob["status"] = "queued", overrides: Partial<Excel
     size_bytes: 4_096,
     created_at: now,
   } : null,
+  warnings: [],
   ...overrides,
 });
 
@@ -162,7 +163,6 @@ describe("Excel automation workspace", () => {
   it.each([
     ["queued", "排队中"],
     ["running", "生成中"],
-    ["needs_review", "待复核"],
     ["completed", "已完成"],
     ["failed", "生成失败"],
     ["cancelled", "已取消"],
@@ -247,6 +247,47 @@ describe("Excel automation workspace", () => {
     expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:download");
     expect(wrapper.text()).not.toContain("sha256");
     expect(wrapper.text()).not.toContain(job.source_sha256);
+  });
+
+  it("refreshes authoritative detail after terminal SSE before exposing an artifact", async () => {
+    const api = new FakeExcelApi();
+    const running = makeJob("running", { artifact: null });
+    api.jobs = [running];
+    api.events.set(running.id, [{ id: 4, event: { type: "completed", status: "completed", progress_percent: 100 } }]);
+    api.getJob = async () => makeJob("completed", { id: running.id, warnings: ["Confirm measurements"] });
+    const { wrapper } = await render(api);
+    await flushPromises();
+    expect(wrapper.findAll('[data-testid="download-result"]')).toHaveLength(1);
+    expect(wrapper.text()).toContain("Confirm measurements");
+  });
+
+  it("retries a transient terminal refresh and clears the recovered connection error", async () => {
+    const api = new FakeExcelApi();
+    const running = makeJob("running", { artifact: null });
+    api.jobs = [running];
+    api.events.set(running.id, [{ id: 4, event: { type: "completed", status: "completed", progress_percent: 100 } }]);
+    let calls = 0;
+    api.getJob = async () => {
+      calls += 1;
+      if (calls === 1) throw new TypeError("temporary disconnect");
+      return makeJob("completed", { id: running.id });
+    };
+    const { wrapper, store } = await render(api);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    await flushPromises();
+    expect(calls).toBe(2);
+    expect(store.errorCode).toBeNull();
+    expect(wrapper.findAll('[data-testid="download-result"]')).toHaveLength(1);
+  });
+
+  it("focuses a visible safe alert after an upload error and announces progress meaningfully", async () => {
+    const api = new FakeExcelApi();
+    api.createJob = async () => { throw Object.assign(new Error("private"), { code: "server_error", status: 507 }); };
+    const { wrapper } = await render(api);
+    await chooseFile(wrapper, new File(["PK"], "capacity.xlsx"));
+    const alert = wrapper.get<HTMLElement>('[role="alert"]');
+    expect(document.activeElement).toBe(alert.element);
+    expect(wrapper.get('[aria-live="polite"]').text()).not.toContain("private");
   });
 
   it("offers a real same-session retry and asks for a file again after refresh", async () => {

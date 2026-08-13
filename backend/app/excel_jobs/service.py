@@ -38,6 +38,11 @@ from app.knowledge.service import KnowledgeValidationError
 
 TERMINAL = {JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED}
 _SAFE_CODE = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
+_WARNING_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+_WARNING_URL = re.compile(r"(?:https?://|www\.)", re.IGNORECASE)
+MAX_JOB_WARNINGS = 40
+MAX_JOB_WARNING_CHARS = 500
+MAX_JOB_WARNING_TOTAL_CHARS = 5_000
 
 
 class JobNotFoundError(RuntimeError):
@@ -66,6 +71,7 @@ class JobView:
     source_size_bytes: int
     status: JobStatus
     progress_percent: int
+    warnings: list[str]
     error: dict[str, str] | None
     created_at: object
     updated_at: object
@@ -145,13 +151,13 @@ class ExcelJobService:
             query = select(ExcelJob).where(ExcelJob.public_id.is_not(None))
             total = session.scalar(select(func.count()).select_from(query.subquery())) or 0
             jobs = session.scalars(
-                query.options(selectinload(ExcelJob.artifacts)).order_by(ExcelJob.id.desc()).limit(limit).offset(offset)
+                query.options(selectinload(ExcelJob.artifacts), selectinload(ExcelJob.events)).order_by(ExcelJob.id.desc()).limit(limit).offset(offset)
             ).all()
             return [self._view(job) for job in jobs], total
 
     def get_job(self, public_id: str) -> JobView:
         with self.factory() as session:
-            job = self._get(session, public_id, artifacts=True)
+            job = self._get(session, public_id, artifacts=True, events=True)
             return self._view(job)
 
     def events_after(self, public_id: str, after_id: int) -> tuple[list[JobEvent], bool]:
@@ -364,6 +370,8 @@ class ExcelJobService:
                 if isinstance(row_number, bool) or not isinstance(row_number, int) or not 1 <= row_number <= 20_000:
                     raise WorkerProtocolError("Invalid row event.")
                 payload["row_number"] = row_number
+        if kind == "row_completed":
+            payload["warnings"] = _safe_worker_warnings(event.get("warnings", []))
         await asyncio.to_thread(self._persist_worker_event_sync, public_id, kind, payload)
         self._signal(public_id)
 
@@ -428,10 +436,15 @@ class ExcelJobService:
                 session.commit()
         self._signal(public_id)
 
-    def _get(self, session: Session, public_id: str, *, artifacts: bool = False) -> ExcelJob:
+    def _get(self, session: Session, public_id: str, *, artifacts: bool = False, events: bool = False) -> ExcelJob:
         query = select(ExcelJob).where(ExcelJob.public_id == public_id)
+        options = []
         if artifacts:
-            query = query.options(selectinload(ExcelJob.artifacts))
+            options.append(selectinload(ExcelJob.artifacts))
+        if events:
+            options.append(selectinload(ExcelJob.events))
+        if options:
+            query = query.options(*options)
         job = session.scalar(query)
         if job is None:
             raise JobNotFoundError(public_id)
@@ -439,6 +452,12 @@ class ExcelJobService:
 
     def _view(self, job: ExcelJob) -> JobView:
         artifacts = list(job.artifacts) if "artifacts" in job.__dict__ else []
+        events = list(job.events) if "events" in job.__dict__ else []
+        warnings = list(dict.fromkeys(
+            warning
+            for event in events
+            for warning in _safe_worker_warnings(event.payload.get("warnings", []), reject=False)
+        ))[:MAX_JOB_WARNINGS]
         artifact_model = artifacts[0] if len(artifacts) == 1 and job.status is JobStatus.COMPLETED else None
         artifact = None
         if artifact_model is not None and artifact_model.sha256 and artifact_model.size_bytes is not None:
@@ -457,6 +476,7 @@ class ExcelJobService:
             source_size_bytes=job.source_size_bytes or 0,
             status=job.status,
             progress_percent=job.progress_percent,
+            warnings=warnings,
             error={"code": job.error_code, "message": job.error_message} if job.error_code and job.error_message else None,
             created_at=job.created_at,
             updated_at=job.updated_at,
@@ -474,6 +494,34 @@ def _display_filename(filename: str) -> str:
         return "workbook.xlsx"
     safe = re.sub(r"[^\w .()\-\u4e00-\u9fff]", "_", name, flags=re.UNICODE)
     return safe[:255] or "workbook.xlsx"
+
+
+def _safe_worker_warnings(value: object, *, reject: bool = True) -> list[str]:
+    invalid = not isinstance(value, list) or len(value) > MAX_JOB_WARNINGS
+    warnings: list[str] = []
+    total = 0
+    if not invalid:
+        for item in value:
+            if (
+                not isinstance(item, str)
+                or not item.strip()
+                or len(item) > MAX_JOB_WARNING_CHARS
+                or _WARNING_CONTROL.search(item)
+                or _WARNING_URL.search(item)
+            ):
+                invalid = True
+                break
+            cleaned = item.strip()
+            total += len(cleaned)
+            if total > MAX_JOB_WARNING_TOTAL_CHARS:
+                invalid = True
+                break
+            warnings.append(cleaned)
+    if invalid:
+        if reject:
+            raise WorkerProtocolError("Invalid worker warning payload.")
+        return []
+    return warnings
 
 
 def _safe_storage_message(code: str) -> str:

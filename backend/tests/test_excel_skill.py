@@ -668,6 +668,28 @@ def test_run_task_retries_malformed_json_keeps_rows_isolated_and_uses_one_image(
     assert "SKU-2" not in fake.calls[0][1] and "SKU-1" not in fake.calls[-1][1]
 
 
+def test_run_task_emits_only_validated_listing_warnings_on_completed_rows(tmp_path: Path, excel_modules) -> None:
+    _, _, _, run = excel_modules
+    source = make_book(tmp_path / "warnings.xlsx")
+    generated = valid_result()
+    generated["fact_warnings"] = ["Confirm fabric composition"]
+    generated["quality_warnings"] = ["Product note is brief"]
+    events: list[dict[str, object]] = []
+
+    run.run_task(
+        source,
+        tmp_path / "job-warnings",
+        knowledge_path=None,
+        rules={"rule_version": "rules-v1"},
+        command_runner=FakeHermes([json.dumps(generated)]),
+        emit=events.append,
+    )
+
+    completed = next(event for event in events if event["event"] == "row_completed")
+    assert completed["warnings"] == ["Confirm fabric composition", "Product note is brief"]
+    assert set(completed) == {"event", "row_id", "row_number", "warnings"}
+
+
 def test_run_task_emits_row_failure_and_leaves_no_partial_output(tmp_path: Path, excel_modules) -> None:
     _, _, _, run = excel_modules
     source = make_book(tmp_path / "source.xlsx")

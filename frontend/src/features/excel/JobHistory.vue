@@ -6,7 +6,7 @@ import type { ExcelJob } from "../../api/excel";
 defineProps<{ jobs: ExcelJob[]; currentId: string | null; hasMore: boolean; loadingMore: boolean }>();
 defineEmits<{ select: [id: string]; loadMore: [] }>();
 const mobileOpen = ref(false);
-const stateCopy = { queued: "排队", running: "处理中", needs_review: "待复核", completed: "完成", failed: "失败", cancelled: "取消" } as const;
+const stateCopy = { queued: "排队", running: "处理中", completed: "完成", failed: "失败", cancelled: "取消" } as const;
 const dateCopy = (value: string) => {
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? "时间未知" : new Intl.DateTimeFormat("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }).format(date);
@@ -50,8 +50,8 @@ const dateCopy = (value: string) => {
 .job-history li strong { overflow: hidden; color: var(--text-secondary); font-size: 12px; font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }
 .job-history li small { color: var(--text-muted); font-size: 10px; }
 .job-history li em { padding: 2px 5px; border-radius: var(--ds-radius-label); background: var(--surface-raised); color: var(--text-muted); font-size: 10px; font-style: normal; white-space: nowrap; }
-.job-history li em.is-running { color: var(--accent); }.job-history li em.is-completed { color: var(--success); }.job-history li em.is-failed { color: var(--danger); }.job-history li em.is-needs_review { color: var(--warning); }
+.job-history li em.is-running { color: var(--accent); }.job-history li em.is-completed { color: var(--success); }.job-history li em.is-failed { color: var(--danger); }
 .job-history__empty { padding: 26px 16px; color: var(--text-muted); font-size: 12px; text-align: center; }
-.job-history__more { width: calc(100% - 16px); min-height: 36px; margin: 0 8px 12px; border: 1px solid var(--border); border-radius: var(--ds-radius-control); background: transparent; color: var(--text-secondary); cursor: pointer; }
+.job-history__more { width: calc(100% - 16px); min-height: 44px; margin: 0 8px 12px; border: 1px solid var(--border); border-radius: var(--ds-radius-control); background: transparent; color: var(--text-secondary); cursor: pointer; }
 @media (max-width: 840px) { .job-history { border: 0; border-bottom: 1px solid var(--border); } .job-history__toggle { display: flex; width: 100%; min-height: 44px; align-items: center; justify-content: space-between; padding: 0 14px; border: 0; background: var(--canvas-soft); color: var(--text-secondary); } .job-history__toggle svg { transition: transform 180ms var(--ds-ease); } .job-history.is-open .job-history__toggle svg { transform: rotate(180deg); } .job-history__body { display: none; max-height: 264px; overflow: auto; border-top: 1px solid var(--border); } .job-history.is-open .job-history__body { display: block; } .job-history__body > header { display: none; } }
 </style>

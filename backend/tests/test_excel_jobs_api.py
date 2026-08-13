@@ -71,7 +71,7 @@ class RealProtocolRunner(FakeExcelRunner):
         self.calls.append(request)
         await emit({"event": "started"})
         await emit({"event": "row_started", "row_id": "row-1", "row_number": 3})
-        await emit({"event": "row_completed", "row_id": "row-1", "row_number": 3})
+        await emit({"event": "row_completed", "row_id": "row-1", "row_number": 3, "warnings": ["Confirm fabric details"]})
         await emit({"event": "row_started", "row_id": "row-2", "row_number": 4})
         await emit({"event": "row_completed", "row_id": "row-2", "row_number": 4})
         output = request.operation_dir / "generated.xlsx"
@@ -309,6 +309,23 @@ def test_real_multi_row_worker_protocol_reaches_terminal_and_persists_events(tmp
             "worker_row_completed", "worker_row_started", "worker_row_completed",
             "worker_completed", "completed",
         ]
+        detail = client.get(f"/api/excel-jobs/{job['id']}").json()
+        assert detail["warnings"] == ["Confirm fabric details"]
+
+
+def test_worker_warning_payload_is_bounded_and_rejects_unsafe_content(tmp_path) -> None:
+    class UnsafeWarningRunner(FakeExcelRunner):
+        async def run(self, request: RunnerRequest, emit) -> WorkerResult:
+            await emit({"event": "row_completed", "row_id": "row-1", "row_number": 3, "warnings": ["unsafe\u0007warning"]})
+            raise AssertionError("unsafe warning should reject the worker event")
+
+    settings = Settings(data_dir=tmp_path / "data", database_url=f"sqlite:///{tmp_path / 'api.db'}")
+    with TestClient(create_app(settings=settings, excel_runner=UnsafeWarningRunner())) as client:
+        job = upload(client).json()
+        terminal = wait_terminal(client, job["id"])
+        assert terminal["status"] == "failed"
+        assert terminal["error"]["code"] == "invalid_worker_event"
+        assert "unsafe" not in json.dumps(terminal)
 
 
 def test_event_persist_failure_is_caught_and_job_becomes_failed(tmp_path, monkeypatch) -> None:

@@ -9,7 +9,6 @@ defineEmits<{ cancel: [] }>();
 const copy = {
   queued: { label: "排队中", detail: "数字员工正在准备工作环境", icon: Clock3 },
   running: { label: "生成中", detail: "正在逐行生成 Listing 内容", icon: LoaderCircle },
-  needs_review: { label: "待复核", detail: "文件已生成，请检查员工提醒", icon: TriangleAlert },
   completed: { label: "已完成", detail: "新工作簿已通过校验", icon: Check },
   failed: { label: "生成失败", detail: "本次任务未生成可下载文件", icon: X },
   cancelled: { label: "已取消", detail: "数字员工已停止处理", icon: Ban },
@@ -69,7 +68,7 @@ const size = computed(() => props.job.source_size_bytes < 1024 * 1024
 .job-progress__header { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 26px 0; border-bottom: 1px solid var(--border); }
 .job-progress__identity { display: flex; min-width: 0; align-items: center; gap: 14px; }
 .job-progress__state { display: grid; width: 42px; height: 42px; flex: 0 0 auto; place-items: center; border: 1px solid var(--border-strong); border-radius: var(--ds-radius-control); background: var(--surface); color: var(--text-secondary); }
-.job-progress__state.is-completed { color: var(--success); }.job-progress__state.is-failed { color: var(--danger); }.job-progress__state.is-needs_review { color: var(--warning); }.job-progress__state.is-running { color: var(--accent); }
+.job-progress__state.is-completed { color: var(--success); }.job-progress__state.is-failed { color: var(--danger); }.job-progress__state.is-running { color: var(--accent); }
 .job-progress__identity > div { min-width: 0; }
 .job-progress__eyebrow { display: block; margin-bottom: 3px; color: var(--text-muted); font-size: 11px; }
 .job-progress h2 { overflow: hidden; margin: 0; font-size: 16px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }

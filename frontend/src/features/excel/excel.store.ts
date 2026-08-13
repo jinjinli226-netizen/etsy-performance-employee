@@ -4,7 +4,7 @@ import { excelApi, type ExcelApi, type ExcelJob, type ExcelJobEvent, type ExcelJ
 import { HttpError, type HttpErrorCode } from "../../api/client";
 
 const CURRENT_KEY = "etsy-excel-current-job";
-const TERMINAL = new Set<ExcelJobStatus>(["needs_review", "completed", "failed", "cancelled"]);
+const TERMINAL = new Set<ExcelJobStatus>(["completed", "failed", "cancelled"]);
 const ACTIVE = new Set<ExcelJobStatus>(["queued", "running"]);
 const MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
 
@@ -12,9 +12,20 @@ interface Monitor { controller: AbortController; token: symbol }
 export interface ExcelStoreOptions { pollIntervalMs?: number; pollAttempts?: number }
 
 const safeErrorCode = (error: unknown): HttpErrorCode => error instanceof HttpError ? error.code : "network";
-const safeWarnings = (value: unknown) => Array.isArray(value)
-  ? value.filter((item): item is string => typeof item === "string").map((item) => item.replace(/[\u0000-\u001f]/g, " ").trim()).filter(Boolean).slice(0, 20)
-  : [];
+const safeWarnings = (value: unknown) => {
+  if (!Array.isArray(value)) return [];
+  const result: string[] = [];
+  let total = 0;
+  for (const item of value) {
+    if (typeof item !== "string" || item.length > 500 || /[\u0000-\u001f\u007f]/.test(item) || /(?:https?:\/\/|www\.)/i.test(item)) continue;
+    const cleaned = item.trim();
+    if (!cleaned || total + cleaned.length > 5_000) continue;
+    result.push(cleaned);
+    total += cleaned.length;
+    if (result.length === 40) break;
+  }
+  return result;
+};
 
 export const validateExcelFile = (file: File) => {
   if (!file.name.toLowerCase().endsWith(".xlsx")) return "unsupported" as const;
@@ -56,6 +67,8 @@ export const createExcelStore = (api: ExcelApi = excelApi, options: ExcelStoreOp
   };
 
   const upsert = (incoming: ExcelJob) => {
+    const receivedWarnings = safeWarnings(incoming.warnings);
+    if (receivedWarnings.length) warnings.set(incoming.id, receivedWarnings);
     const index = jobs.value.findIndex((job) => job.id === incoming.id);
     if (index < 0) jobs.value = [incoming, ...jobs.value];
     else {
@@ -76,9 +89,32 @@ export const createExcelStore = (api: ExcelApi = excelApi, options: ExcelStoreOp
     if (typeof event.progress_percent === "number" && Number.isFinite(event.progress_percent)) {
       job.progress_percent = Math.max(job.progress_percent, Math.min(100, Math.max(0, Math.round(event.progress_percent))));
     }
-    if (event.status && ["queued", "running", "needs_review", "completed", "failed", "cancelled"].includes(event.status)) job.status = event.status;
+    if (event.status && ["queued", "running"].includes(event.status)) job.status = event.status;
     const receivedWarnings = safeWarnings(event.warnings);
     if (receivedWarnings.length) warnings.set(job.id, [...new Set([...(warnings.get(job.id) ?? []), ...receivedWarnings])]);
+  };
+
+  const refreshTerminal = async (job: ExcelJob, handle: Monitor) => {
+    for (let attempt = 0; attempt < pollAttempts && !handle.controller.signal.aborted; attempt += 1) {
+      try {
+        const received = await api.getJob(job.id, handle.controller.signal);
+        if (monitors.get(job.id)?.token !== handle.token) return false;
+        if (received.status === "completed" && !received.artifact) {
+          if (attempt + 1 < pollAttempts) await delay(pollIntervalMs, handle.controller.signal).catch(() => undefined);
+          continue;
+        }
+        const updated = upsert(received);
+        if (TERMINAL.has(updated.status)) {
+          errorCode.value = null;
+          return true;
+        }
+      } catch (error) {
+        if (handle.controller.signal.aborted) return false;
+        errorCode.value = safeErrorCode(error);
+      }
+      if (attempt + 1 < pollAttempts) await delay(pollIntervalMs, handle.controller.signal).catch(() => undefined);
+    }
+    return false;
   };
 
   const poll = async (job: ExcelJob, handle: Monitor) => {
@@ -86,8 +122,15 @@ export const createExcelStore = (api: ExcelApi = excelApi, options: ExcelStoreOp
       try {
         const received = await api.getJob(job.id, handle.controller.signal);
         if (monitors.get(job.id)?.token !== handle.token) return;
+        if (received.status === "completed" && !received.artifact) {
+          if (attempt + 1 < pollAttempts) await delay(pollIntervalMs, handle.controller.signal).catch(() => undefined);
+          continue;
+        }
         const updated = upsert(received);
-        if (TERMINAL.has(updated.status)) return;
+        if (TERMINAL.has(updated.status)) {
+          errorCode.value = null;
+          return;
+        }
       } catch (error) {
         if (handle.controller.signal.aborted) return;
         errorCode.value = safeErrorCode(error);
@@ -100,25 +143,27 @@ export const createExcelStore = (api: ExcelApi = excelApi, options: ExcelStoreOp
     if (disposed.value || monitors.has(job.id)) return;
     const handle: Monitor = { controller: new AbortController(), token: Symbol("excel-monitor") };
     monitors.set(job.id, handle);
-    let terminalSeen = false;
-    for (let attempt = 0; attempt < 2 && !handle.controller.signal.aborted && !terminalSeen; attempt += 1) {
+    let terminalSignal = false;
+    for (let attempt = 0; attempt < 2 && !handle.controller.signal.aborted && !terminalSignal; attempt += 1) {
       try {
         await api.streamJob(job.id, {
           lastEventId: lastEventIds.get(job.id) || undefined,
           signal: handle.controller.signal,
           onEvent: (event, id) => {
             applyEvent(job, event, id, handle);
-            terminalSeen = TERMINAL.has(job.status);
+            terminalSignal = Boolean(event.status && TERMINAL.has(event.status));
           },
         });
-        terminalSeen = TERMINAL.has(job.status);
-        if (!terminalSeen) throw new HttpError("network", 0);
+        if (!terminalSignal) throw new HttpError("network", 0);
       } catch (error) {
         if (handle.controller.signal.aborted || monitors.get(job.id)?.token !== handle.token) return;
         errorCode.value = safeErrorCode(error);
       }
     }
-    if (!handle.controller.signal.aborted && monitors.get(job.id)?.token === handle.token && !terminalSeen) await poll(job, handle);
+    if (!handle.controller.signal.aborted && monitors.get(job.id)?.token === handle.token) {
+      const refreshed = terminalSignal ? await refreshTerminal(job, handle) : false;
+      if (!refreshed) await poll(job, handle);
+    }
     if (monitors.get(job.id)?.token === handle.token) monitors.delete(job.id);
   };
 
@@ -140,6 +185,10 @@ export const createExcelStore = (api: ExcelApi = excelApi, options: ExcelStoreOp
       const page = await api.listJobs(controller.signal, 20, 0);
       if (disposed.value || loadToken !== token) return;
       jobs.value = page.items;
+      page.items.forEach((job) => {
+        const receivedWarnings = safeWarnings(job.warnings);
+        if (receivedWarnings.length) warnings.set(job.id, receivedWarnings);
+      });
       total.value = page.total;
       let preferred: string | null = null;
       try { preferred = localStorage.getItem(CURRENT_KEY); } catch { /* Ignore unavailable storage. */ }
@@ -161,6 +210,10 @@ export const createExcelStore = (api: ExcelApi = excelApi, options: ExcelStoreOp
       const page = await api.listJobs(undefined, 20, jobs.value.length);
       const known = new Set(jobs.value.map((job) => job.id));
       jobs.value = [...jobs.value, ...page.items.filter((job) => !known.has(job.id))];
+      page.items.forEach((job) => {
+        const receivedWarnings = safeWarnings(job.warnings);
+        if (receivedWarnings.length) warnings.set(job.id, receivedWarnings);
+      });
       total.value = page.total;
       beginMonitoring();
       return true;

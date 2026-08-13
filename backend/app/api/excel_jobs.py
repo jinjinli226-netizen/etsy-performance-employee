@@ -30,6 +30,7 @@ def view_payload(view) -> ExcelJobRead:
             "source_size_bytes": view.source_size_bytes,
             "status": view.status,
             "progress_percent": view.progress_percent,
+            "warnings": view.warnings,
             "error": view.error,
             "created_at": view.created_at,
             "updated_at": view.updated_at,

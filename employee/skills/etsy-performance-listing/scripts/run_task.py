@@ -567,7 +567,16 @@ def run_task(
             except TaskError as exc:
                 emit({"event": "row_failed", "row_id": row_id, "error": {"code": exc.code, "message": str(exc)}})
                 raise
-            emit({"event": "row_completed", "row_id": row_id, "row_number": row["row_number"]})
+            listing_warnings = [
+                *results[row_id]["fact_warnings"],
+                *results[row_id]["quality_warnings"],
+            ]
+            emit({
+                "event": "row_completed",
+                "row_id": row_id,
+                "row_number": row["row_number"],
+                "warnings": listing_warnings,
+            })
         expected_rule_version = rules["rule_version"]
         report = writer.write_workbook(source_path, operation, manifest, results, rules=rules, expected_rule_version=expected_rule_version)
         emit({"event": "completed", "output_path": report["output_path"], "output_sha256": report["output_sha256"]})

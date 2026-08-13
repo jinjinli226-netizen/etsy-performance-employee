@@ -1,6 +1,6 @@
 import { API_BASE, HttpError, apiRequest, openEventStream } from "./client";
 
-export type ExcelJobStatus = "queued" | "running" | "needs_review" | "completed" | "failed" | "cancelled";
+export type ExcelJobStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
 
 export interface ExcelArtifact {
   id: number;
@@ -18,6 +18,7 @@ export interface ExcelJob {
   source_size_bytes: number;
   status: ExcelJobStatus;
   progress_percent: number;
+  warnings: string[];
   error: { code: string; message: string } | null;
   created_at: string;
   updated_at: string;
