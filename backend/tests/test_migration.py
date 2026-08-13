@@ -186,6 +186,12 @@ def test_export_refuses_secret_or_tampered_repository_asset(tmp_path: Path) -> N
     engine.dispose()
 
 
+def test_secret_scan_distinguishes_python_slice_syntax_from_windows_paths() -> None:
+    _scan_logical_record({"source": "relationship_type:/safe/path and value[2:]"})
+    with pytest.raises(ExportError, match="sensitive"):
+        _scan_logical_record({"source": "C:/Users/owner/private.txt"})
+
+
 def test_import_validates_then_restores_relationships_and_guard_only(tmp_path: Path) -> None:
     package, result = _export(tmp_path)
     engine, target_factory = _database(tmp_path / "target.db")

@@ -85,5 +85,5 @@ const size = computed(() => props.job.source_size_bytes < 1024 * 1024
 .job-progress__warnings strong { display: flex; align-items: center; gap: 7px; color: var(--warning); font-size: 12px; font-weight: 500; }
 .job-progress__warnings ul { display: grid; gap: 6px; margin: 10px 0 0; padding-left: 18px; color: var(--text-secondary); font-size: 12px; }
 .spin { animation: spin .8s linear infinite; } @keyframes spin { to { transform: rotate(360deg); } }
-@media (max-width: 640px) { .job-progress__header { align-items: flex-start; } .job-progress__cancel { min-height: 44px; } .job-progress__status { grid-template-columns: 1fr auto; } .job-progress__status span { grid-column: 1 / -1; grid-row: 2; } .job-progress__status strong { font-size: 21px; } }
+@media (max-width: 640px) { .job-progress__header { align-items: flex-start; } .job-progress__identity { width: 100%; } .job-progress__identity > div { max-width: calc(100% - 56px); } .job-progress h2 { max-width: 100%; } .job-progress__cancel { min-height: 44px; } .job-progress__status { grid-template-columns: minmax(0, 1fr) auto; } .job-progress__status span { grid-column: 1 / -1; grid-row: 2; } .job-progress__status strong { font-size: 21px; } .job-progress__status b { justify-self: end; } .job-progress__rows { gap: 12px; } .job-progress__rows span { min-width: 0; } }
 </style>

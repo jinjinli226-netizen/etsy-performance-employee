@@ -75,7 +75,10 @@ _SENSITIVE_KEY = re.compile(
     re.I,
 )
 _CREDENTIAL = re.compile(r"(?:sk-[A-Za-z0-9_-]{20,}|Bearer\s+[A-Za-z0-9._~-]{16,}|-----BEGIN [A-Z ]*PRIVATE KEY-----)", re.I)
-_ABSOLUTE = re.compile(r"(?:[A-Za-z]:[\\/]|(?:^|[\s\"'])/(?:home|Users|var|tmp)/)", re.I)
+_ABSOLUTE = re.compile(
+    r"(?:(?<![A-Za-z0-9_])[A-Za-z]:[\\/]|(?:^|[\s\"'])/(?:home|Users|var|tmp)/)",
+    re.I,
+)
 _ETSY_LISTING = re.compile(r"https?://(?:www\.)?etsy\.com/listing/[^\s\"'<>]+", re.I)
 _WINDOWS_PATH = re.compile(r"[A-Za-z]:[\\/][^\r\n\"'<>]+")
 _UNIX_PATH = re.compile(r"(?<![\w:])/(?:home|Users|var|tmp)/[^\r\n\"'<>]+", re.I)

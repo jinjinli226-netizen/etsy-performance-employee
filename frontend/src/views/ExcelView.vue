@@ -115,5 +115,5 @@ onMounted(() => { if (!store.jobs.length && !store.loading) void store.initializ
 .excel-workspace__another summary { min-height: 44px; color: var(--text-secondary); font-size: 12px; cursor: pointer; }
 .excel-workspace__another :deep(.excel-dropzone__target) { min-height: 160px; }.excel-workspace__another :deep(.excel-dropzone) { padding-top: 12px; }
 @media (max-width: 840px) { .excel-workspace { grid-template-columns: 1fr; }.excel-workspace__main { min-height: auto; grid-row: 2; } }
-@media (max-width: 640px) { .excel-workspace__main { padding: 20px 14px 26px; }.excel-workspace h2 { font-size: 20px; }.excel-workspace__intro { padding-bottom: 18px; } }
+@media (max-width: 640px) { .excel-workspace { overflow-x: clip; }.excel-workspace__main { min-width: 0; padding: 20px 14px 26px; overflow-x: clip; }.excel-workspace h2 { font-size: 20px; }.excel-workspace__intro { padding-bottom: 18px; } }
 </style>

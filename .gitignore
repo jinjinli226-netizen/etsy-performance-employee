@@ -8,4 +8,9 @@ frontend/dist/
 *.tsbuildinfo
 scripts/.dev-pids.json
 scripts/.dev-pids.stale.json
+scripts/.start-pids.json
+.runtime-data/
+.e2e-data/
+test-results/
+playwright-report/
 
