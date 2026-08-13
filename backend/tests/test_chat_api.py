@@ -371,6 +371,15 @@ def test_json_control_shape_recursion_cap_fails_closed() -> None:
     assert parsed.control_errors == ["envelope_invalid"]
 
 
+def test_json_decoder_recursion_error_is_fail_closed_without_raw() -> None:
+    wrapped = "[" * 1100 + '"RAWSECRET"' + "]" * 1100
+    parsed = parse_final_envelopes("Visible\n" + wrapped)
+    assert parsed.visible_text == "Visible"
+    assert parsed.envelopes == []
+    assert parsed.control_errors == ["envelope_invalid"]
+    assert "RAWSECRET" not in parsed.visible_text
+
+
 def test_learning_batch_is_atomic_when_second_candidate_is_invalid(api) -> None:
     client, fake, _ = api
     conversation_id = create_conversation(client)

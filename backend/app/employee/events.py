@@ -87,7 +87,7 @@ def parse_final_envelopes(text: str) -> ParsedEmployeeReply:
             continue
         try:
             value = json.loads(block)
-        except (json.JSONDecodeError, UnicodeError):
+        except (json.JSONDecodeError, UnicodeError, RecursionError):
             errors.append("envelope_invalid")
             continue
         classification = _classify_control_shapes(value)
