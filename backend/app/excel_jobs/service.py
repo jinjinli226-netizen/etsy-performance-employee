@@ -43,6 +43,7 @@ _WARNING_URL = re.compile(r"(?:https?://|www\.)", re.IGNORECASE)
 MAX_JOB_WARNINGS = 40
 MAX_JOB_WARNING_CHARS = 500
 MAX_JOB_WARNING_TOTAL_CHARS = 5_000
+MAX_JOB_WARNING_EVENTS = 200
 
 
 class JobNotFoundError(RuntimeError):
@@ -151,14 +152,20 @@ class ExcelJobService:
             query = select(ExcelJob).where(ExcelJob.public_id.is_not(None))
             total = session.scalar(select(func.count()).select_from(query.subquery())) or 0
             jobs = session.scalars(
-                query.options(selectinload(ExcelJob.artifacts), selectinload(ExcelJob.events)).order_by(ExcelJob.id.desc()).limit(limit).offset(offset)
+                query.options(selectinload(ExcelJob.artifacts)).order_by(ExcelJob.id.desc()).limit(limit).offset(offset)
             ).all()
             return [self._view(job) for job in jobs], total
 
     def get_job(self, public_id: str) -> JobView:
         with self.factory() as session:
-            job = self._get(session, public_id, artifacts=True, events=True)
-            return self._view(job)
+            job = self._get(session, public_id, artifacts=True)
+            warning_payloads = session.scalars(
+                select(JobEvent.payload)
+                .where(JobEvent.excel_job_id == job.id, JobEvent.event_type == "worker_row_completed")
+                .order_by(JobEvent.id.desc())
+                .limit(MAX_JOB_WARNING_EVENTS)
+            ).all()
+            return self._view(job, warning_payloads=list(reversed(warning_payloads)))
 
     def events_after(self, public_id: str, after_id: int) -> tuple[list[JobEvent], bool]:
         with self.factory() as session:
@@ -436,28 +443,18 @@ class ExcelJobService:
                 session.commit()
         self._signal(public_id)
 
-    def _get(self, session: Session, public_id: str, *, artifacts: bool = False, events: bool = False) -> ExcelJob:
+    def _get(self, session: Session, public_id: str, *, artifacts: bool = False) -> ExcelJob:
         query = select(ExcelJob).where(ExcelJob.public_id == public_id)
-        options = []
         if artifacts:
-            options.append(selectinload(ExcelJob.artifacts))
-        if events:
-            options.append(selectinload(ExcelJob.events))
-        if options:
-            query = query.options(*options)
+            query = query.options(selectinload(ExcelJob.artifacts))
         job = session.scalar(query)
         if job is None:
             raise JobNotFoundError(public_id)
         return job
 
-    def _view(self, job: ExcelJob) -> JobView:
+    def _view(self, job: ExcelJob, *, warning_payloads: list[dict] | None = None) -> JobView:
         artifacts = list(job.artifacts) if "artifacts" in job.__dict__ else []
-        events = list(job.events) if "events" in job.__dict__ else []
-        warnings = list(dict.fromkeys(
-            warning
-            for event in events
-            for warning in _safe_worker_warnings(event.payload.get("warnings", []), reject=False)
-        ))[:MAX_JOB_WARNINGS]
+        warnings = _merge_worker_warnings(warning_payloads or [])
         artifact_model = artifacts[0] if len(artifacts) == 1 and job.status is JobStatus.COMPLETED else None
         artifact = None
         if artifact_model is not None and artifact_model.sha256 and artifact_model.size_bytes is not None:
@@ -522,6 +519,22 @@ def _safe_worker_warnings(value: object, *, reject: bool = True) -> list[str]:
             raise WorkerProtocolError("Invalid worker warning payload.")
         return []
     return warnings
+
+
+def _merge_worker_warnings(payloads: list[dict]) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    total = 0
+    for payload in payloads[:MAX_JOB_WARNING_EVENTS]:
+        if not isinstance(payload, dict):
+            continue
+        for warning in _safe_worker_warnings(payload.get("warnings", []), reject=False):
+            if warning in seen or len(merged) >= MAX_JOB_WARNINGS or total + len(warning) > MAX_JOB_WARNING_TOTAL_CHARS:
+                continue
+            seen.add(warning)
+            merged.append(warning)
+            total += len(warning)
+    return merged
 
 
 def _safe_storage_message(code: str) -> str:

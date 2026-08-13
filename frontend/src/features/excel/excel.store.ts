@@ -1,10 +1,10 @@
-import { computed, reactive, readonly, ref } from "vue";
+import { computed, reactive, readonly, ref, shallowReactive } from "vue";
 
 import { excelApi, type ExcelApi, type ExcelJob, type ExcelJobEvent, type ExcelJobStatus } from "../../api/excel";
 import { HttpError, type HttpErrorCode } from "../../api/client";
 
 const CURRENT_KEY = "etsy-excel-current-job";
-const TERMINAL = new Set<ExcelJobStatus>(["completed", "failed", "cancelled"]);
+const TERMINAL = new Set<ExcelJobStatus>(["needs_review", "completed", "failed", "cancelled"]);
 const ACTIVE = new Set<ExcelJobStatus>(["queued", "running"]);
 const MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
 
@@ -48,7 +48,7 @@ export const createExcelStore = (api: ExcelApi = excelApi, options: ExcelStoreOp
   const disposed = ref(false);
   const monitors = new Map<string, Monitor>();
   const cancelLocks = new Set<string>();
-  const localFiles = new Map<string, File>();
+  const localFiles = shallowReactive(new Map<string, File>());
   let listController: AbortController | null = null;
   let loadToken: symbol | null = null;
   const total = ref(0);
@@ -58,6 +58,7 @@ export const createExcelStore = (api: ExcelApi = excelApi, options: ExcelStoreOp
   const currentJob = computed(() => jobs.value.find((job) => job.id === currentJobId.value) ?? null);
   const hasMore = computed(() => jobs.value.length < total.value);
   const currentWarnings = computed(() => currentJobId.value ? warnings.get(currentJobId.value) ?? [] : []);
+  const retainedFileCount = computed(() => localFiles.size);
 
   const persistSelection = (id: string | null) => {
     try {
@@ -75,6 +76,7 @@ export const createExcelStore = (api: ExcelApi = excelApi, options: ExcelStoreOp
       const previous = jobs.value[index];
       jobs.value[index] = { ...incoming, progress_percent: Math.max(previous.progress_percent, incoming.progress_percent) };
     }
+    if (["completed", "cancelled", "needs_review"].includes(incoming.status)) localFiles.delete(incoming.id);
     return jobs.value.find((job) => job.id === incoming.id)!;
   };
 
@@ -91,7 +93,7 @@ export const createExcelStore = (api: ExcelApi = excelApi, options: ExcelStoreOp
     }
     if (event.status && ["queued", "running"].includes(event.status)) job.status = event.status;
     const receivedWarnings = safeWarnings(event.warnings);
-    if (receivedWarnings.length) warnings.set(job.id, [...new Set([...(warnings.get(job.id) ?? []), ...receivedWarnings])]);
+    if (receivedWarnings.length) warnings.set(job.id, safeWarnings([...new Set([...(warnings.get(job.id) ?? []), ...receivedWarnings])]));
   };
 
   const refreshTerminal = async (job: ExcelJob, handle: Monitor) => {
@@ -143,6 +145,11 @@ export const createExcelStore = (api: ExcelApi = excelApi, options: ExcelStoreOp
     if (disposed.value || monitors.has(job.id)) return;
     const handle: Monitor = { controller: new AbortController(), token: Symbol("excel-monitor") };
     monitors.set(job.id, handle);
+    if (TERMINAL.has(job.status)) {
+      await refreshTerminal(job, handle);
+      if (monitors.get(job.id)?.token === handle.token) monitors.delete(job.id);
+      return;
+    }
     let terminalSignal = false;
     for (let attempt = 0; attempt < 2 && !handle.controller.signal.aborted && !terminalSignal; attempt += 1) {
       try {
@@ -256,7 +263,10 @@ export const createExcelStore = (api: ExcelApi = excelApi, options: ExcelStoreOp
     const job = currentJob.value;
     const file = job ? localFiles.get(job.id) : undefined;
     if (!file || job?.status !== "failed") return false;
-    return upload(file);
+    const previousId = job.id;
+    const succeeded = await upload(file);
+    if (succeeded) localFiles.delete(previousId);
+    return succeeded;
   };
 
   const cancelCurrent = async () => {
@@ -307,12 +317,21 @@ export const createExcelStore = (api: ExcelApi = excelApi, options: ExcelStoreOp
     monitors.forEach((handle) => handle.controller.abort());
     monitors.clear();
     cancelLocks.clear();
+    localFiles.clear();
+  };
+
+  const restartMonitoring = async (id: string) => {
+    const job = jobs.value.find((item) => item.id === id);
+    if (!job) return;
+    monitors.get(id)?.controller.abort();
+    monitors.delete(id);
+    await monitor(job);
   };
 
   return reactive({
-    jobs, currentJobId, currentJob, currentWarnings, total, hasMore, loading, loadingMore, uploading, cancelling, downloading,
+    jobs, currentJobId, currentJob, currentWarnings, retainedFileCount, total, hasMore, loading, loadingMore, uploading, cancelling, downloading,
     errorCode, disposed: readonly(disposed), initialize, loadMore, selectJob, upload, retryCurrent, cancelCurrent, downloadCurrent, clearError, dispose,
-    hasLocalFile: (id: string) => localFiles.has(id),
+    hasLocalFile: (id: string) => localFiles.has(id), restartMonitoring,
   });
 };
 

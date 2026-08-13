@@ -163,6 +163,7 @@ describe("Excel automation workspace", () => {
   it.each([
     ["queued", "排队中"],
     ["running", "生成中"],
+    ["needs_review", "待复核（历史任务）"],
     ["completed", "已完成"],
     ["failed", "生成失败"],
     ["cancelled", "已取消"],
@@ -249,6 +250,21 @@ describe("Excel automation workspace", () => {
     expect(wrapper.text()).not.toContain(job.source_sha256);
   });
 
+  it("bounds and deduplicates warnings across many replayed events", async () => {
+    const api = new FakeExcelApi();
+    const job = makeJob("running");
+    api.jobs = [job];
+    api.events.set(job.id, Array.from({ length: 60 }, (_, index) => ({
+      id: index + 1,
+      event: { type: "worker_row_completed", status: "running", progress_percent: index, warnings: [`warning-${index}`, "same-warning"] },
+    })));
+    const { store } = await render(api);
+    await flushPromises();
+    expect(store.currentWarnings).toHaveLength(40);
+    expect(store.currentWarnings.filter((warning) => warning === "same-warning")).toHaveLength(1);
+    expect(store.currentWarnings.join("").length).toBeLessThanOrEqual(5_000);
+  });
+
   it("refreshes authoritative detail after terminal SSE before exposing an artifact", async () => {
     const api = new FakeExcelApi();
     const running = makeJob("running", { artifact: null });
@@ -301,6 +317,7 @@ describe("Excel automation workspace", () => {
     await wrapper.get('[data-testid="retry-job"]').trigger("click");
     await flushPromises();
     expect(api.uploads).toHaveLength(2);
+    expect(store.retainedFileCount).toBe(1);
 
     const refreshedApi = new FakeExcelApi();
     refreshedApi.jobs = [makeJob("failed")];
@@ -312,6 +329,21 @@ describe("Excel automation workspace", () => {
     await nextTick();
     expect(refreshed.wrapper.get("details").attributes("open")).toBeDefined();
     expect(pickerSpy).toHaveBeenCalledOnce();
+  });
+
+  it("releases large local files for completed and cancelled jobs and on dispose", async () => {
+    const api = new FakeExcelApi();
+    const { wrapper, store } = await render(api);
+    await chooseFile(wrapper, new File(["PK"], "memory.xlsx"));
+    expect(store.retainedFileCount).toBe(1);
+    const active = store.currentJob!;
+    api.getJob = async () => makeJob("completed", { id: active.id });
+    api.events.set(active.id, [{ id: 10, event: { type: "completed", status: "completed", progress_percent: 100 } }]);
+    await store.restartMonitoring(active.id);
+    await flushPromises();
+    expect(store.retainedFileCount).toBe(0);
+    store.dispose();
+    expect(store.retainedFileCount).toBe(0);
   });
 
   it("maps capacity failures to safe workspace copy and disposes all monitoring", async () => {
@@ -356,11 +388,24 @@ describe("Excel API safety", () => {
   });
 
   it("downloads a blob once and maps a 409 without exposing the response body", async () => {
+    const validZip = new Uint8Array([0x50, 0x4b, 0x03, 0x04, 1]);
     const fetchMock = vi.fn()
-      .mockResolvedValueOnce(new Response(new Blob(["PK"]), { status: 200, headers: { "Content-Disposition": 'attachment; filename="listing.xlsx"' } }))
+      .mockResolvedValueOnce(new Response(validZip, { status: 200, headers: { "Content-Disposition": 'attachment; filename="listing.xlsx"', "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" } }))
       .mockResolvedValueOnce(new Response('{"detail":"C:/private/path"}', { status: 409 }));
     vi.stubGlobal("fetch", fetchMock);
     await expect(excelApi.downloadJob("11111111-1111-4111-8111-111111111111", "source.xlsx")).resolves.toMatchObject({ filename: "listing.xlsx" });
     await expect(excelApi.downloadJob("11111111-1111-4111-8111-111111111111", "source.xlsx")).rejects.toMatchObject({ code: "conflict", status: 409 });
+  });
+
+  it("rejects empty, oversized, non-ZIP, and unsafe media downloads", async () => {
+    for (const response of [
+      new Response(new Blob([]), { status: 200, headers: { "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" } }),
+      new Response(new TextEncoder().encode("not zip"), { status: 200, headers: { "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" } }),
+      new Response(new Uint8Array([0x50, 0x4b, 0x03, 0x04]), { status: 200, headers: { "Content-Type": "text/html" } }),
+      new Response(null, { status: 200, headers: { "Content-Length": String(100 * 1024 * 1024 + 1), "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" } }),
+    ]) {
+      vi.stubGlobal("fetch", vi.fn(async () => response));
+      await expect(excelApi.downloadJob("11111111-1111-4111-8111-111111111111", "source.xlsx")).rejects.toMatchObject({ code: "server_error" });
+    }
   });
 });

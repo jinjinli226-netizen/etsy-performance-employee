@@ -313,6 +313,32 @@ def test_real_multi_row_worker_protocol_reaches_terminal_and_persists_events(tmp
         assert detail["warnings"] == ["Confirm fabric details"]
 
 
+def test_list_jobs_does_not_load_event_collections_and_detail_warnings_stay_bounded(tmp_path, monkeypatch) -> None:
+    settings = Settings(data_dir=tmp_path / "data", database_url=f"sqlite:///{tmp_path / 'api.db'}")
+    app = create_app(settings=settings, excel_runner=FakeExcelRunner())
+    with TestClient(app) as client:
+        service = app.state.excel_job_service
+        with service.factory() as session:
+            jobs = []
+            for index in range(20):
+                job = ExcelJob(
+                    public_id=f"00000000-0000-4000-8000-{index + 1:012d}", source_filename=f"{index}.xlsx",
+                    source_sha256="a" * 64, source_size_bytes=1, status=JobStatus.COMPLETED, progress_percent=100,
+                )
+                job.events.extend(JobEvent(event_type="worker_row_completed", payload={"warnings": [f"warning-{event}", "same"]}) for event in range(100))
+                jobs.append(job)
+            session.add_all(jobs)
+            session.commit()
+
+        listed, total = service.list_jobs(20, 0)
+        assert total == 20
+        assert all(item.warnings == [] for item in listed)
+        detail = service.get_job("00000000-0000-4000-8000-000000000001")
+        assert len(detail.warnings) == 40
+        assert detail.warnings.count("same") == 1
+        assert sum(map(len, detail.warnings)) <= 5_000
+
+
 def test_worker_warning_payload_is_bounded_and_rejects_unsafe_content(tmp_path) -> None:
     class UnsafeWarningRunner(FakeExcelRunner):
         async def run(self, request: RunnerRequest, emit) -> WorkerResult:

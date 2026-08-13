@@ -1,6 +1,6 @@
 import { API_BASE, HttpError, apiRequest, openEventStream } from "./client";
 
-export type ExcelJobStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
+export type ExcelJobStatus = "queued" | "running" | "needs_review" | "completed" | "failed" | "cancelled";
 
 export interface ExcelArtifact {
   id: number;
@@ -57,6 +57,12 @@ export interface ExcelApi {
 }
 
 const safeJobId = (id: string) => encodeURIComponent(id);
+const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024;
+const DOWNLOAD_MEDIA_TYPES = new Set([
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  "application/zip",
+  "application/octet-stream",
+]);
 const filenameFallback = (source: string) => {
   const basename = source.split(/[\\/]/).pop() || "etsy-listing.xlsx";
   const stem = basename.replace(/\.xlsx$/i, "").replace(/[\u0000-\u001f<>:"/\\|?*]/g, "_").trim().slice(0, 120) || "etsy-listing";
@@ -115,8 +121,18 @@ export const excelApi: ExcelApi = {
     }
     if (!response.ok) throw await boundedError(response);
     const declared = Number(response.headers.get("content-length") ?? "0");
-    if (declared > 60 * 1024 * 1024) throw new HttpError("server_error", response.status);
-    return { blob: await response.blob(), filename: safeDownloadFilename(response.headers.get("content-disposition"), sourceFilename) };
+    const mediaType = response.headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase() ?? "";
+    if (declared > MAX_DOWNLOAD_BYTES || !DOWNLOAD_MEDIA_TYPES.has(mediaType)) throw new HttpError("server_error", response.status);
+    const bytes = await response.arrayBuffer();
+    if (bytes.byteLength <= 0 || bytes.byteLength > MAX_DOWNLOAD_BYTES) throw new HttpError("server_error", response.status);
+    const signature = new Uint8Array(bytes, 0, Math.min(4, bytes.byteLength));
+    if (signature.length < 4 || signature[0] !== 0x50 || signature[1] !== 0x4b || !(
+      (signature[2] === 0x03 && signature[3] === 0x04)
+      || (signature[2] === 0x05 && signature[3] === 0x06)
+      || (signature[2] === 0x07 && signature[3] === 0x08)
+    )) throw new HttpError("server_error", response.status);
+    const blob = new Blob([bytes], { type: mediaType });
+    return { blob, filename: safeDownloadFilename(response.headers.get("content-disposition"), sourceFilename) };
   },
 };
 
