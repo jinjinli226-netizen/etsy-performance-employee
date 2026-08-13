@@ -39,6 +39,28 @@ def _portable_id(value: str) -> str:
     return value
 
 
+def _canonical_source_timestamps(values: dict[str, str]) -> dict[str, str]:
+    import re
+
+    pattern = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z")
+    checked: dict[str, str] = {}
+    for key, value in values.items():
+        _portable_id(key)
+        if not isinstance(value, str) or not pattern.fullmatch(value):
+            raise ValueError("canonical evidence timestamp required")
+        try:
+            parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+        except ValueError as error:
+            raise ValueError("valid canonical evidence timestamp required") from error
+        if parsed.utcoffset() is None or parsed.utcoffset().total_seconds() != 0:
+            raise ValueError("UTC evidence timestamp required")
+        canonical = parsed.isoformat(timespec="microseconds" if parsed.microsecond else "seconds").replace("+00:00", "Z")
+        if canonical != value:
+            raise ValueError("canonical evidence timestamp required")
+        checked[key] = value
+    return checked
+
+
 class ConversationRecord(StrictRecord):
     id: str = Field(min_length=8, max_length=64)
     title: str = Field(min_length=1, max_length=255)
@@ -98,14 +120,7 @@ class CandidateRecord(StrictRecord):
         lambda values: [_portable_id(value) for value in values]
     )
     _canonical_source_times = field_validator("source_timestamps")(
-        lambda values: {
-            key: value for key, value in values.items()
-            if _portable_id(key) and isinstance(value, str)
-            and __import__("re").fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z", value)
-        } if all(
-            isinstance(value, str) and __import__("re").fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z", value)
-            for value in values.values()
-        ) else (_ for _ in ()).throw(ValueError("canonical evidence timestamp required"))
+        lambda values: _canonical_source_timestamps(values)
     )
 
 

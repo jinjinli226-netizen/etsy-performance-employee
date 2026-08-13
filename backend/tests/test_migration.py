@@ -261,6 +261,26 @@ def test_guard_thresholds_are_finite_bounded_and_match_manifest(tmp_path: Path) 
         MigrationImporter(factory, repository_assets=tmp_path / "repo" / "employee", workspace=tmp_path / "imports").import_package(attacked, dry_run=True)
 
 
+@pytest.mark.parametrize("timestamp", [
+    "2026-13-01T00:00:00Z",
+    "2026-02-30T00:00:00Z",
+    "2026-08-13T24:00:00Z",
+    "2025-02-29T00:00:00Z",
+])
+def test_candidate_source_timestamp_rejects_invalid_calendar_values(timestamp: str) -> None:
+    from app.migration.contracts import CandidateRecord
+    record = {
+        "id": "kc-" + "1" * 32, "title": "Safe candidate", "kind": "title_structure",
+        "abstract_summary": "A safe portable abstraction.", "proposal": {}, "confidence": .9,
+        "evidence_ids": ["ev-" + "2" * 32], "source_timestamps": {"ev-" + "2" * 32: timestamp},
+        "conversation_id": None, "message_id": None, "trace_id": None,
+        "base_active_rule_public_id": None, "base_pattern_revision": None, "revision": 1,
+        "status": "active", "created_at": "2026-08-13T00:00:00Z", "updated_at": "2026-08-13T00:00:00Z",
+    }
+    with pytest.raises(ValidationError, match="source_timestamps"):
+        CandidateRecord.model_validate_json(json.dumps(record))
+
+
 def test_message_evidence_provenance_is_fail_closed(tmp_path: Path) -> None:
     package, _ = _export(tmp_path)
     attacked = _rewrite_jsonl(package, tmp_path / "message.zip", "data/messages.jsonl", lambda row: {**row, "evidence_bound": True, "content": "raw teaching text", "evidence_ids": []})
