@@ -12,6 +12,10 @@ from app.knowledge.schemas import KnowledgeKind
 MAX_ENVELOPE_BYTES = 128 * 1024
 MAX_REPLY_BYTES = 1024 * 1024
 MAX_ENVELOPE_LINES = 256
+MAX_JSON_NODES = 2048
+MAX_JSON_DEPTH = 32
+_KNOWN_CONTROL = {"knowledge_candidate", "learning_batch"}
+_RESERVED_PREFIXES = ("control", "learning", "profile", "operation")
 
 
 class KnowledgeCandidatePayload(BaseModel):
@@ -86,6 +90,10 @@ def parse_final_envelopes(text: str) -> ParsedEmployeeReply:
         except (json.JSONDecodeError, UnicodeError):
             errors.append("envelope_invalid")
             continue
+        classification = _classify_control_shapes(value)
+        if classification in {"nested", "reserved", "limit"}:
+            errors.append("envelope_invalid")
+            continue
         if not isinstance(value, dict):
             visible.extend(block.splitlines())
             continue
@@ -109,6 +117,35 @@ def parse_final_envelopes(text: str) -> ParsedEmployeeReply:
             continue
         envelopes.append({"event": event, "payload": validated.model_dump(mode="json")})
     return ParsedEmployeeReply(visible_text="\n".join(visible).strip(), envelopes=envelopes, control_errors=errors)
+
+
+def _classify_control_shapes(value: Any) -> str:
+    nodes = 0
+    found: list[tuple[int, str]] = []
+    stack: list[tuple[Any, int]] = [(value, 0)]
+    while stack:
+        current, depth = stack.pop()
+        nodes += 1
+        if nodes > MAX_JSON_NODES or depth > MAX_JSON_DEPTH:
+            return "limit"
+        if isinstance(current, dict):
+            for key in ("event", "type"):
+                name = current.get(key)
+                if not isinstance(name, str):
+                    continue
+                normalized = name.casefold()
+                if normalized in _KNOWN_CONTROL:
+                    found.append((depth, "known"))
+                elif normalized.startswith(_RESERVED_PREFIXES):
+                    found.append((depth, "reserved"))
+            stack.extend((item, depth + 1) for item in current.values() if isinstance(item, (dict, list)))
+        elif isinstance(current, list):
+            stack.extend((item, depth + 1) for item in current if isinstance(item, (dict, list)))
+    if any(kind == "reserved" for _, kind in found):
+        return "reserved"
+    if any(depth > 0 for depth, _ in found) or (found and not isinstance(value, dict)):
+        return "nested"
+    return "top" if found else "none"
 
 
 def _bounded_json_object(lines: list[str], start: int) -> tuple[str, int, bool, bool]:

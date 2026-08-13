@@ -340,6 +340,37 @@ def test_unindented_pretty_control_tracks_nested_arrays_and_braces_inside_string
     assert parsed.control_errors == []
 
 
+@pytest.mark.parametrize(
+    "wrapped",
+    [
+        '[{"event":"learning_batch","payload":{"evidence_items":[],"candidates":[],"raw":"RAWSECRET"}}]',
+        '{"wrapper":{"items":[{"event":"learning\\u005fbatch","payload":{"raw":"RAWSECRET"}}]}}',
+        '{"event":"learning_private","payload":{"raw":"RAWSECRET"}}',
+        '{"type":"operation_override","payload":{"raw":"RAWSECRET"}}',
+    ],
+)
+def test_nested_or_reserved_control_shapes_are_fail_closed(wrapped) -> None:
+    parsed = parse_final_envelopes("Visible\n" + wrapped)
+    assert parsed.visible_text == "Visible"
+    assert parsed.envelopes == []
+    assert parsed.control_errors == ["envelope_invalid"]
+    assert "RAWSECRET" not in parsed.visible_text
+
+
+def test_regular_arrays_and_business_event_json_remain_visible() -> None:
+    raw = '[{"event":"order_created","payload":{"id":42}},[1,2,3]]'
+    parsed = parse_final_envelopes(raw)
+    assert parsed.visible_text == raw
+    assert parsed.control_errors == []
+
+
+def test_json_control_shape_recursion_cap_fails_closed() -> None:
+    wrapped = "[" * 80 + '{"event":"learning_batch","payload":{"raw":"RAWSECRET"}}' + "]" * 80
+    parsed = parse_final_envelopes(wrapped)
+    assert parsed.visible_text == ""
+    assert parsed.control_errors == ["envelope_invalid"]
+
+
 def test_learning_batch_is_atomic_when_second_candidate_is_invalid(api) -> None:
     client, fake, _ = api
     conversation_id = create_conversation(client)
