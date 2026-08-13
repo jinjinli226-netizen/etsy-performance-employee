@@ -78,17 +78,59 @@ describe("WorkspaceLayout", () => {
     const wrapper = mount(App, { global: { plugins: [router] }, attachTo: document.body });
     await nextTick();
     const menu = wrapper.get('[aria-label="打开导航菜单"]');
+    const sidebar = wrapper.get("#workspace-navigation");
 
     expect(menu.attributes("aria-expanded")).toBe("false");
     expect(menu.attributes("aria-controls")).toBe("workspace-navigation");
+    expect(sidebar.attributes()).toHaveProperty("inert");
+    expect(sidebar.findAll("a, button").every((item) => item.attributes("tabindex") === "-1")).toBe(true);
     await menu.trigger("click");
-    expect(wrapper.get("#workspace-navigation").attributes("aria-hidden")).toBe("false");
+    expect(sidebar.attributes("aria-hidden")).toBe("false");
+    expect(sidebar.attributes()).not.toHaveProperty("inert");
+    expect(document.activeElement).toBe(sidebar.get("a").element);
+    expect(wrapper.get(".workspace__stage").attributes()).toHaveProperty("inert");
     expect(document.body.style.overflow).toBe("hidden");
 
     window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
     await nextTick();
-    expect(wrapper.get("#workspace-navigation").attributes("aria-hidden")).toBe("true");
+    expect(sidebar.attributes("aria-hidden")).toBe("true");
+    expect(sidebar.attributes()).toHaveProperty("inert");
+    expect(wrapper.get(".workspace__stage").attributes()).not.toHaveProperty("inert");
+    expect(document.activeElement).toBe(menu.element);
     expect(document.body.style.overflow).toBe("");
+
+    wrapper.unmount();
+  });
+
+  it("does not remove desktop sidebar controls from the tab order", async () => {
+    const router = createTestRouter();
+    await router.isReady();
+    const wrapper = mount(App, { global: { plugins: [router] } });
+
+    const sidebar = wrapper.get("#workspace-navigation");
+    expect(sidebar.attributes()).not.toHaveProperty("inert");
+    expect(sidebar.findAll("a, button").every((item) => item.attributes("tabindex") !== "-1")).toBe(true);
+  });
+
+  it("keeps keyboard focus inside the open mobile drawer", async () => {
+    setViewport(390);
+    const router = createTestRouter();
+    await router.isReady();
+    const wrapper = mount(App, { global: { plugins: [router] }, attachTo: document.body });
+    await nextTick();
+
+    await wrapper.get('[aria-label="打开导航菜单"]').trigger("click");
+    const sidebar = wrapper.get("#workspace-navigation");
+    const first = sidebar.get<HTMLElement>('[aria-label="关闭导航菜单"]').element;
+    const last = sidebar.get<HTMLElement>('a[href="/excel"]').element;
+
+    last.focus();
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", bubbles: true }));
+    expect(document.activeElement).toBe(first);
+
+    first.focus();
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", shiftKey: true, bubbles: true }));
+    expect(document.activeElement).toBe(last);
 
     wrapper.unmount();
   });
@@ -129,5 +171,17 @@ describe("EmployeeStatus", () => {
     expect(wrapper.attributes("aria-live")).toBe("polite");
     expect(wrapper.text()).toContain(label);
     expect(wrapper.get("[data-status-dot]").attributes("aria-hidden")).toBe("true");
+  });
+
+  it.each([
+    ["online", "在"],
+    ["busy", "忙"],
+    ["offline", "离"],
+    ["error", "错"],
+  ] as const)("renders the %s state visibly in compact mode", (status, shortLabel) => {
+    const wrapper = mount(EmployeeStatus, { props: { status, compact: true } });
+
+    expect(wrapper.get("[data-status-short]").text()).toBe(shortLabel);
+    expect(wrapper.get("[data-status-short]").classes()).not.toContain("sr-only");
   });
 });

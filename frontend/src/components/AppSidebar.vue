@@ -33,6 +33,7 @@ const navigation = [
     class="app-sidebar"
     :class="{ 'is-collapsed': collapsed, 'is-mobile': mobile, 'is-open': mobileOpen }"
     :aria-hidden="mobile ? !mobileOpen : false"
+    :inert="mobile && !mobileOpen ? true : undefined"
   >
     <div class="app-sidebar__identity">
       <span class="app-sidebar__monogram" aria-hidden="true">演</span>
@@ -45,6 +46,7 @@ const navigation = [
         class="icon-button app-sidebar__close"
         type="button"
         aria-label="关闭导航菜单"
+        :tabindex="mobile && !mobileOpen ? -1 : undefined"
         @click="$emit('closeMobile')"
       >
         <X :size="18" aria-hidden="true" />
@@ -59,6 +61,7 @@ const navigation = [
         class="app-sidebar__link"
         :title="collapsed && !mobile ? item.label : undefined"
         :aria-label="collapsed && !mobile ? item.label : undefined"
+        :tabindex="mobile && !mobileOpen ? -1 : undefined"
         @click="$emit('closeMobile')"
       >
         <component :is="item.icon" :size="18" aria-hidden="true" />

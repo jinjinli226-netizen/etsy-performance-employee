@@ -18,7 +18,15 @@ const labels: Record<EmployeeState, string> = {
   error: "异常",
 };
 
+const shortLabels: Record<EmployeeState, string> = {
+  online: "在",
+  busy: "忙",
+  offline: "离",
+  error: "错",
+};
+
 const label = computed(() => labels[props.status]);
+const shortLabel = computed(() => shortLabels[props.status]);
 </script>
 
 <template>
@@ -35,7 +43,9 @@ const label = computed(() => labels[props.status]);
       <strong>表演服员工</strong>
       <small>{{ label }}</small>
     </span>
-    <span v-else class="sr-only">{{ label }}</span>
+    <span v-else class="employee-status__short" data-status-short aria-hidden="true">
+      {{ shortLabel }}
+    </span>
   </div>
 </template>
 
@@ -90,5 +100,13 @@ const label = computed(() => labels[props.status]);
 
 .employee-status.is-compact {
   justify-content: center;
+  gap: 5px;
+}
+
+.employee-status__short {
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1;
 }
 </style>

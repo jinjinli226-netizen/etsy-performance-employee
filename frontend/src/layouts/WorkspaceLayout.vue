@@ -14,6 +14,7 @@ const employeeStatus: EmployeeState = "offline";
 const mobile = ref(false);
 const mobileOpen = ref(false);
 const menuButton = ref<HTMLButtonElement | null>(null);
+const focusableSelector = 'a[href], button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])';
 
 const readCollapsedPreference = () => {
   try {
@@ -55,7 +56,32 @@ const closeMobile = (restoreFocus = false) => {
 };
 
 const handleKeydown = (event: KeyboardEvent) => {
-  if (event.key === "Escape" && mobileOpen.value) closeMobile(true);
+  if (!mobileOpen.value) return;
+  if (event.key === "Escape") {
+    closeMobile(true);
+    return;
+  }
+  if (event.key !== "Tab") return;
+
+  const drawer = document.getElementById("workspace-navigation");
+  const focusables = Array.from(drawer?.querySelectorAll<HTMLElement>(focusableSelector) ?? []);
+  const first = focusables.find((element) => element.getAttribute("aria-label") === "关闭导航菜单") ?? focusables[0];
+  const last = focusables.at(-1);
+  if (!first || !last) {
+    event.preventDefault();
+    return;
+  }
+
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  } else if (!drawer?.contains(document.activeElement)) {
+    event.preventDefault();
+    first.focus();
+  }
 };
 
 watch(mobileOpen, (isOpen) => {
@@ -104,7 +130,7 @@ onBeforeUnmount(() => {
       @click="closeMobile(true)"
     />
 
-    <div class="workspace__stage">
+    <div class="workspace__stage" :inert="mobile && mobileOpen ? true : undefined">
       <header class="workspace__topbar">
         <button
           v-if="mobile"
