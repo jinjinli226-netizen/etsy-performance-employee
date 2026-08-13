@@ -4,6 +4,7 @@ import asyncio
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from sqlalchemy import func, select
@@ -113,6 +114,37 @@ class ChatService:
                 )
             )
 
+    def message_attachments(self, messages: list[Message]) -> dict[int, list[Attachment]]:
+        ids = sorted({item for message in messages for item in (message.attachment_ids or [])})
+        if not ids:
+            return {}
+        with self.session_factory() as session:
+            stored = list(session.scalars(select(Attachment).where(Attachment.id.in_(ids))))
+            by_id = {item.id: item for item in stored}
+            return {
+                message.id: [by_id[item] for item in (message.attachment_ids or []) if item in by_id]
+                for message in messages
+            }
+
+    def retry_payload(self, conversation_id: int, message_id: int) -> tuple[str, list[int], bool]:
+        with self.session_factory() as session:
+            original = session.get(Message, message_id)
+            if original is None or original.conversation_id != conversation_id or original.role != "user":
+                raise ConversationNotFoundError
+            if original.operation_status not in {"failed", "cancelled"}:
+                raise ConversationBusyError
+            payload = original.content, list(original.attachment_ids or []), bool(original.learning_mode)
+            original.operation_status = "retried"
+            session.commit()
+            return payload
+
+    def release_retry_claim(self, conversation_id: int, message_id: int) -> None:
+        with self.session_factory() as session:
+            original = session.get(Message, message_id)
+            if original is not None and original.conversation_id == conversation_id and original.operation_status == "retried":
+                original.operation_status = "failed"
+                session.commit()
+
     async def start_send(
         self, conversation_id: int, content: str, attachment_ids: list[int], *, learning_mode: bool = False
     ) -> str:
@@ -143,6 +175,8 @@ class ChatService:
                         operation_status="running",
                         evidence_bound=learning_mode,
                         evidence_ids=[],
+                        attachment_ids=attachment_ids,
+                        learning_mode=learning_mode,
                     )
                 )
                 session.commit()
@@ -158,10 +192,28 @@ class ChatService:
 
     @staticmethod
     def _learning_urls(content: str) -> frozenset[str]:
-        matches = re.findall(r"https://(?:www\.)?etsy\.com/listing/[0-9]+(?:/[^\s?#]*)?", content, re.IGNORECASE)
         canonical = []
-        for url in matches:
-            listing_id = re.search(r"/listing/([0-9]+)", url, re.IGNORECASE).group(1)
+        for raw in re.findall(r"https?://[^\s]+", content, re.IGNORECASE):
+            try:
+                parsed = urlsplit(raw)
+                port = parsed.port
+            except ValueError:
+                continue
+            if (
+                parsed.scheme != "https"
+                or parsed.hostname not in {"etsy.com", "www.etsy.com"}
+                or parsed.username is not None
+                or parsed.password is not None
+                or port is not None
+                or parsed.fragment
+            ):
+                continue
+            segments = parsed.path.split("/")
+            if len(segments) not in {3, 4} or segments[1] != "listing" or not segments[2].isdigit():
+                continue
+            if len(segments) == 4 and (not segments[3] or not re.fullmatch(r"[A-Za-z0-9_-]+", segments[3])):
+                continue
+            listing_id = segments[2]
             canonical.append(f"https://www.etsy.com/listing/{listing_id}")
         return frozenset(canonical)
 
@@ -382,31 +434,43 @@ class ChatService:
             "message_id": failure_id,
         }
 
-    async def operation_events(self, operation_id: str):
+    async def operation_events(self, operation_id: str, *, after_id: int = 0):
         operation = self.operations.get(operation_id)
+        with self.session_factory() as session:
+            user_message = session.scalar(
+                select(Message).where(
+                    Message.operation_id == operation_id,
+                    Message.role == "user",
+                ).order_by(Message.id)
+            )
+            terminal_message = session.scalar(
+                select(Message).where(
+                    Message.operation_id == operation_id,
+                    Message.role.in_(["assistant", "system"]),
+                ).order_by(Message.id.desc())
+            )
+        if user_message is None and terminal_message is None:
+            raise KeyError(operation_id)
+        if user_message is not None and user_message.id > after_id:
+            yield user_message.id, {
+                "type": "progress",
+                "status": "running",
+                "operation_id": operation_id,
+            }
         if operation is None:
-            with self.session_factory() as session:
-                message = session.scalar(
-                    select(Message)
-                    .where(
-                        Message.operation_id == operation_id,
-                        Message.role.in_(["assistant", "system"]),
-                    )
-                    .order_by(Message.id.desc())
-                )
-                if message is None:
-                    raise KeyError(operation_id)
-                yield {
+            if terminal_message is not None and terminal_message.id > after_id:
+                yield terminal_message.id, {
                     "type": "final",
-                    "status": message.operation_status,
+                    "status": terminal_message.operation_status,
                     "operation_id": operation_id,
-                    "message_id": message.id,
+                    "message_id": terminal_message.id,
                 }
-                return
+            return
         if operation.event is None:
-            yield {"type": "progress", "status": "running", "operation_id": operation_id}
             await operation.done.wait()
         try:
-            yield operation.event
+            message_id = operation.event.get("message_id") if operation.event else None
+            if isinstance(message_id, int) and message_id > after_id:
+                yield message_id, operation.event
         finally:
             self.operations.pop(operation_id, None)

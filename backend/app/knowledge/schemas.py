@@ -159,6 +159,11 @@ class CandidatePage(StrictModel):
     offset: int
 
 
+class CandidateStatusRead(StrictModel):
+    id: str
+    status: KnowledgeStatus
+
+
 class PatternTransitionRead(StrictModel):
     id: int
     public_id: str

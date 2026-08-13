@@ -131,7 +131,6 @@ export const openEventStream = async (
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
-    let generatedId = options.lastEventId ?? 0;
     while (true) {
       const { done, value } = await reader.read();
       buffer += decoder.decode(value, { stream: !done });
@@ -144,7 +143,8 @@ export const openEventStream = async (
         const data = lines.filter((line) => line.startsWith("data:")).map((line) => line.slice(5).trimStart()).join("\n");
         if (!data) continue;
         const supplied = lines.find((line) => line.startsWith("id:"))?.slice(3).trim();
-        const parsedId = supplied ? Number(supplied) : ++generatedId;
+        if (!supplied || !/^(?:0|[1-9][0-9]*)$/.test(supplied)) continue;
+        const parsedId = Number(supplied);
         if (!Number.isSafeInteger(parsedId) || parsedId < 1) continue;
         try {
           options.onEvent(JSON.parse(data), parsedId);

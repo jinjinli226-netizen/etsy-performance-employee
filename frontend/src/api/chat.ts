@@ -22,6 +22,10 @@ export interface Message {
   role: MessageRole;
   content: string;
   created_at: string;
+  operation_id?: string | null;
+  operation_status?: string | null;
+  learning_mode?: boolean;
+  attachments?: Attachment[];
 }
 
 export interface Attachment {
@@ -43,6 +47,9 @@ export interface OperationAccepted {
   status: "running";
 }
 
+export type CandidateStatus = "proposed" | "testing" | "active" | "rejected" | "rolled_back";
+export interface CandidateStatusItem { id: string; status: CandidateStatus }
+
 export type OperationStatus = "running" | "completed" | "failed" | "cancelled" | "waiting_stopped";
 export type OperationEvent = {
   type: "progress" | "final";
@@ -57,6 +64,8 @@ export interface ChatApi {
   listMessages(conversationId: number, signal?: AbortSignal): Promise<Message[]>;
   uploadAttachment(conversationId: number, file: File, signal?: AbortSignal): Promise<Attachment>;
   sendMessage(conversationId: number, input: SendMessageInput, signal?: AbortSignal): Promise<OperationAccepted>;
+  retryMessage(conversationId: number, messageId: number, signal?: AbortSignal): Promise<OperationAccepted>;
+  listCandidateStatuses(operationId: string, signal?: AbortSignal): Promise<CandidateStatusItem[]>;
   streamOperation(
     operationId: string,
     options: { lastEventId?: number; onEvent: (event: OperationEvent, id: number) => void; signal: AbortSignal },
@@ -87,6 +96,10 @@ export const chatApi: ChatApi = {
     signal,
     timeoutMs: 30_000,
   }),
+  retryMessage: (conversationId, messageId, signal) => apiRequest<OperationAccepted>(`/conversations/${conversationId}/messages/${messageId}/retry`, {
+    method: "POST", signal, timeoutMs: 30_000,
+  }),
+  listCandidateStatuses: (operationId, signal) => apiRequest<CandidateStatusItem[]>(`/knowledge/candidates/status?trace_id=${encodeURIComponent(operationId)}`, { signal }),
   streamOperation: (operationId, options) => openEventStream(`/events/${encodeURIComponent(operationId)}`, {
     ...options,
     onEvent: (value, id) => {

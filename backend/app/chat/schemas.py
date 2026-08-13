@@ -17,12 +17,26 @@ class MessageCreate(BaseModel):
     content: str
 
 
+class AttachmentRead(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    conversation_id: int
+    filename: str
+    media_type: str
+    created_at: datetime
+
+
 class MessageRead(MessageCreate):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
     conversation_id: int
     created_at: datetime
+    operation_id: str | None = None
+    operation_status: str | None = None
+    learning_mode: bool = False
+    attachments: list[AttachmentRead] = Field(default_factory=list)
 
 
 class ConversationCreate(BaseModel):
@@ -72,11 +86,6 @@ class OperationAccepted(BaseModel):
     status: str
 
 
-class AttachmentRead(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
-    id: int
-    conversation_id: int
-    filename: str
-    media_type: str
-    created_at: datetime
+class CandidateStatusRead(BaseModel):
+    id: str
+    status: str

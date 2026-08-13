@@ -541,10 +541,15 @@ def test_cancelled_operation_is_persisted_and_replayed_after_restart(tmp_path) -
         replay = wait_for_final(client, operation_id)
         assert replay == [
             {
-                "type": "final",
-                "status": "cancelled",
+                "type": "progress",
+                "status": "running",
                 "operation_id": operation_id,
-                "message_id": replay[0]["message_id"],
+            },
+            {
+                    "type": "final",
+                    "status": "cancelled",
+                    "operation_id": operation_id,
+                    "message_id": replay[1]["message_id"],
             }
         ]
 
@@ -589,6 +594,133 @@ def test_real_adapter_preflight_returns_503_without_model_call(
 def test_missing_operation_is_404(api) -> None:
     client, _, _ = api
     assert client.get("/api/events/not-found").status_code == 404
+
+
+def test_sse_uses_persisted_message_ids_and_reconnect_replays_only_new_events(api) -> None:
+    client, _, _ = api
+    conversation_id = create_conversation(client)
+    sent = client.post(
+        f"/api/conversations/{conversation_id}/messages", json={"content": "stable ids"}
+    )
+    operation_id = sent.json()["operation_id"]
+    with client.stream("GET", f"/api/events/{operation_id}") as response:
+        body = "\n".join(response.iter_lines())
+    assert "event: operation" in body
+    ids = [int(line[4:]) for line in body.splitlines() if line.startswith("id: ")]
+    assert ids == sorted(set(ids))
+    assert len(ids) == 2
+    assert ids[0] == 1
+    assert ids[1] == 2
+
+    with client.stream(
+        "GET", f"/api/events/{operation_id}", headers={"Last-Event-ID": str(ids[0])}
+    ) as response:
+        replay = "\n".join(response.iter_lines())
+    assert f"id: {ids[0]}" not in replay
+    assert f"id: {ids[1]}" in replay
+
+    with client.stream(
+        "GET", f"/api/events/{operation_id}", headers={"Last-Event-ID": str(ids[1])}
+    ) as response:
+        assert "\n".join(response.iter_lines()) == ""
+
+
+@pytest.mark.parametrize("value", ["-1", "1.5", "abc", "+1", " 1"])
+def test_sse_rejects_invalid_last_event_id(api, value) -> None:
+    client, _, _ = api
+    conversation_id = create_conversation(client)
+    sent = client.post(f"/api/conversations/{conversation_id}/messages", json={"content": "x"})
+    assert client.get(
+        f"/api/events/{sent.json()['operation_id']}", headers={"Last-Event-ID": value}
+    ).status_code == 422
+
+
+@pytest.mark.parametrize(
+    ("url", "accepted"),
+    [
+        ("https://www.etsy.com/listing/123456/valid-slug?utm_source=x", True),
+        ("https://etsy.com/listing/123456", True),
+        ("http://www.etsy.com/listing/123456", False),
+        ("https://www.etsy.com.evil/listing/123456", False),
+        ("https://user@www.etsy.com/listing/123456", False),
+        ("https://www.etsy.com:443/listing/123456", False),
+        ("https://www.etsy.com/listing/123.evil", False),
+        ("https://www.etsy.com/listing/123/slug#fragment", False),
+    ],
+)
+def test_learning_mode_uses_strict_canonical_etsy_urls(api, url, accepted) -> None:
+    client, _, _ = api
+    conversation_id = create_conversation(client)
+    response = client.post(
+        f"/api/conversations/{conversation_id}/messages",
+        json={"content": f"learn {url}", "learning_mode": True},
+    )
+    assert (response.status_code == 202) is accepted
+
+
+def test_failed_message_retry_reuses_persisted_attachments_without_reupload(api) -> None:
+    client, fake, _ = api
+    conversation_id = create_conversation(client)
+    uploaded = client.post(
+        "/api/attachments",
+        data={"conversation_id": str(conversation_id)},
+        files={"file": ("notes.txt", b"facts", "text/plain")},
+    ).json()
+
+    async def fail(*args, **kwargs):
+        raise RuntimeError("fail")
+
+    fake.send = fail
+    sent = client.post(
+        f"/api/conversations/{conversation_id}/messages",
+        json={"content": "retry with file", "attachment_ids": [uploaded["id"]]},
+    )
+    wait_for_final(client, sent.json()["operation_id"])
+    stored = client.get(f"/api/conversations/{conversation_id}/messages").json()
+    user = next(row for row in stored if row["role"] == "user")
+    assert user["attachments"][0]["filename"] == "notes.txt"
+
+    success = FakeHermes()
+    fake.send = success.send
+    retried = client.post(
+        f"/api/conversations/{conversation_id}/messages/{user['id']}/retry"
+    )
+    assert retried.status_code == 202
+    wait_for_final(client, retried.json()["operation_id"])
+    assert "notes.txt" in success.calls[-1]["prompt"]
+
+    assert client.post(
+        f"/api/conversations/{conversation_id}/messages/{user['id']}/retry"
+    ).status_code == 409
+
+
+def test_candidate_status_endpoint_returns_only_safe_status_metadata(api) -> None:
+    client, fake, _ = api
+    conversation_id = create_conversation(client)
+
+    async def learned(*args, **kwargs):
+        return EmployeeReply(
+            text=(
+                "学习完成\n"
+                '{"event":"learning_batch","payload":{"evidence_items":[],"candidates":[]}}'
+            ),
+            session_id="learned",
+        )
+
+    fake.send = learned
+    sent = client.post(
+        f"/api/conversations/{conversation_id}/messages",
+        json={
+            "content": "learn https://www.etsy.com/listing/123456/sample",
+            "learning_mode": True,
+        },
+    )
+    operation_id = sent.json()["operation_id"]
+    wait_for_final(client, operation_id)
+    response = client.get("/api/knowledge/candidates/status", params={"trace_id": operation_id})
+    assert response.status_code == 200
+    assert response.json() == []
+    assert client.get("/api/knowledge/candidates/status", params={"trace_id": "not-a-uuid"}).status_code == 422
 
 
 def test_startup_reconciles_running_operation_once_and_sse_replays(tmp_path) -> None:

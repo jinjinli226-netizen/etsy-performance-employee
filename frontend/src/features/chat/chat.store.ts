@@ -1,6 +1,15 @@
-import { computed, reactive, readonly, ref, shallowRef } from "vue";
+import { computed, reactive, readonly, ref } from "vue";
 
-import { chatApi, type Attachment, type ChatApi, type Conversation, type Message, type OperationEvent, type OperationStatus } from "../../api/chat";
+import {
+  chatApi,
+  type Attachment,
+  type CandidateStatusItem,
+  type ChatApi,
+  type Conversation,
+  type Message,
+  type OperationEvent,
+  type OperationStatus,
+} from "../../api/chat";
 import { HttpError, type HttpErrorCode } from "../../api/client";
 
 export type ConnectionStatus = "connecting" | "online" | "offline" | "error";
@@ -15,10 +24,8 @@ export interface ActiveOperation {
   userMessageId: number;
 }
 
-export interface ChatStoreOptions {
-  pollIntervalMs?: number;
-  pollAttempts?: number;
-}
+interface MonitorHandle { controller: AbortController; token: symbol; conversationId: number }
+export interface ChatStoreOptions { pollIntervalMs?: number; pollAttempts?: number }
 
 const terminal = new Set<OperationStatus>(["completed", "failed", "cancelled", "waiting_stopped"]);
 const safeErrorCode = (error: unknown): HttpErrorCode => error instanceof HttpError ? error.code : "network";
@@ -27,165 +34,164 @@ export const createChatStore = (api: ChatApi = chatApi, options: ChatStoreOption
   const conversations = ref<Conversation[]>([]);
   const currentConversationId = ref<number | null>(null);
   const messages = ref<Message[]>([]);
+  const messageCache = reactive(new Map<number, Message[]>());
   const operations = reactive(new Map<number, ActiveOperation>());
   const eventLog = ref<OperationEvent[]>([]);
   const connectionStatus = ref<ConnectionStatus>("connecting");
   const errorCode = ref<HttpErrorCode | null>(null);
-  const attachmentsByMessage = reactive(new Map<number, Attachment[]>());
+  const localAttachments = reactive(new Map<number, Attachment[]>());
+  const candidateStatuses = reactive(new Map<string, CandidateStatusItem[]>());
   const loading = ref(false);
   const disposed = ref(false);
   const pollIntervalMs = options.pollIntervalMs ?? 650;
   const pollAttempts = options.pollAttempts ?? 6;
+  const loadControllers = new Map<number, AbortController>();
+  const loadTokens = new Map<number, symbol>();
+  const monitors = new Map<string, MonitorHandle>();
   let conversationLoad: AbortController | null = null;
-  let messageLoad: AbortController | null = null;
-  let operationStream: AbortController | null = null;
-  let loadToken = 0;
-  let messageToken = 0;
+  let conversationToken: symbol | null = null;
   let temporaryMessageId = -1;
-  const seenOperationEvents = new Map<string, Set<string>>();
-
-  const recoverTerminalOperation = (conversationId: number, received: Message[]) => {
-    if (operations.has(conversationId)) return;
-    const last = received.at(-1);
-    if (!last || last.role !== "system") return;
-    const recoveredStatus = last.content === "The employee request was cancelled. Please retry."
-      ? "cancelled"
-      : last.content === "The employee could not complete the request. Please retry."
-        || last.content === "The app restarted before the employee completed the request. Please retry."
-        ? "failed"
-        : null;
-    if (!recoveredStatus) return;
-    const user = [...received].reverse().find((item) => item.role === "user" && item.id < last.id);
-    if (!user) return;
-    operations.set(conversationId, {
-      id: `recovered-${last.id}`,
-      conversationId,
-      status: recoveredStatus,
-      lastEventId: 0,
-      content: user.content,
-      learningMode: false,
-      userMessageId: user.id,
-    });
-  };
 
   const currentConversation = computed(() => conversations.value.find((item) => item.id === currentConversationId.value) ?? null);
   const operation = computed(() => currentConversationId.value === null ? null : operations.get(currentConversationId.value) ?? null);
   const isBusy = computed(() => Boolean(operation.value && !terminal.has(operation.value.status)));
+  const learningStatuses = computed(() => operation.value?.learningMode ? candidateStatuses.get(operation.value.id) ?? [] : []);
+  const operationFor = (conversationId: number) => operations.get(conversationId);
 
-  const replaceConversation = (item: Conversation) => {
-    const index = conversations.value.findIndex((row) => row.id === item.id);
-    if (index >= 0) conversations.value.splice(index, 1);
-    conversations.value.unshift(item);
+  const recoverOperation = (conversationId: number, received: Message[]) => {
+    const existing = operations.get(conversationId);
+    if (existing && !terminal.has(existing.status)) return;
+    const user = [...received].reverse().find((item) => item.role === "user" && (
+      ["failed", "cancelled"].includes(item.operation_status ?? "")
+      || (item.learning_mode && item.operation_status === "completed")
+    ));
+    if (!user) return;
+    operations.set(conversationId, {
+      id: user.operation_id ?? `recovered-${user.id}`,
+      conversationId,
+      status: user.operation_status as "completed" | "failed" | "cancelled",
+      lastEventId: 0,
+      content: user.content,
+      learningMode: Boolean(user.learning_mode),
+      userMessageId: user.id,
+    });
   };
 
-  const loadMessages = async (conversationId: number, signal?: AbortSignal) => {
-    const token = ++messageToken;
-    messageLoad?.abort();
+  const cacheMessages = (conversationId: number, received: Message[]) => {
+    messageCache.set(conversationId, received);
+    recoverOperation(conversationId, received);
+    if (currentConversationId.value === conversationId) messages.value = received;
+  };
+
+  const loadMessages = async (conversationId: number, external?: AbortSignal) => {
+    loadControllers.get(conversationId)?.abort();
     const controller = new AbortController();
-    messageLoad = controller;
+    const token = Symbol("message-load");
+    loadControllers.set(conversationId, controller);
+    loadTokens.set(conversationId, token);
     const abort = () => controller.abort();
-    signal?.addEventListener("abort", abort, { once: true });
+    external?.addEventListener("abort", abort, { once: true });
     try {
       const received = await api.listMessages(conversationId, controller.signal);
-      if (disposed.value || token !== messageToken || currentConversationId.value !== conversationId) return received;
-      messages.value = received;
-      recoverTerminalOperation(conversationId, received);
+      if (disposed.value || loadTokens.get(conversationId) !== token) return received;
+      cacheMessages(conversationId, received);
       connectionStatus.value = "online";
       errorCode.value = null;
       return received;
     } catch (error) {
-      if (!controller.signal.aborted && token === messageToken) {
+      if (!controller.signal.aborted && loadTokens.get(conversationId) === token) {
         errorCode.value = safeErrorCode(error);
-        connectionStatus.value = errorCode.value === "network" || errorCode.value === "timeout" ? "offline" : "error";
+        connectionStatus.value = ["network", "timeout"].includes(errorCode.value) ? "offline" : "error";
       }
       throw error;
     } finally {
-      signal?.removeEventListener("abort", abort);
-      if (messageLoad === controller) messageLoad = null;
+      external?.removeEventListener("abort", abort);
+      if (loadTokens.get(conversationId) === token) {
+        loadTokens.delete(conversationId);
+        loadControllers.delete(conversationId);
+      }
     }
   };
 
-  const delay = (milliseconds: number, signal: AbortSignal) => new Promise<void>((resolve, reject) => {
-    const timer = window.setTimeout(resolve, milliseconds);
+  const delay = (ms: number, signal: AbortSignal) => new Promise<void>((resolve, reject) => {
+    const timer = window.setTimeout(resolve, ms);
     signal.addEventListener("abort", () => {
       window.clearTimeout(timer);
       reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
     }, { once: true });
   });
 
-  const reconcile = async (active: ActiveOperation, signal: AbortSignal) => {
-    let previousSignature = "";
-    for (let attempt = 0; attempt < pollAttempts && !signal.aborted; attempt += 1) {
+  const reconcile = async (active: ActiveOperation, handle: MonitorHandle) => {
+    for (let attempt = 0; attempt < pollAttempts && !handle.controller.signal.aborted; attempt += 1) {
       try {
-        const received = await api.listMessages(active.conversationId, signal);
-        if (currentConversationId.value === active.conversationId) messages.value = received;
-        const signature = received.map((item) => `${item.id}:${item.role}:${item.content}`).join("|");
-        const hasTerminal = received.some((item) => item.role !== "user" && item.id > active.userMessageId && item.content.length > 0);
-        if (hasTerminal && signature !== previousSignature) {
-          active.status = received.at(-1)?.role === "assistant" ? "completed" : "failed";
+        const received = await api.listMessages(active.conversationId, handle.controller.signal);
+        if (monitors.get(active.id)?.token !== handle.token) return;
+        cacheMessages(active.conversationId, received);
+        const terminalMessage = [...received].reverse().find((item) => item.operation_id === active.id && item.role !== "user");
+        if (terminalMessage) {
+          active.status = terminalMessage.role === "assistant" ? "completed" : (terminalMessage.operation_status as "failed" | "cancelled") || "failed";
           return;
         }
-        previousSignature = signature;
       } catch (error) {
-        if (signal.aborted) return;
+        if (handle.controller.signal.aborted) return;
         errorCode.value = safeErrorCode(error);
       }
-      if (attempt + 1 < pollAttempts) await delay(pollIntervalMs, signal).catch(() => undefined);
+      if (attempt + 1 < pollAttempts) await delay(pollIntervalMs, handle.controller.signal).catch(() => undefined);
     }
-    if (!terminal.has(active.status)) active.status = "waiting_stopped";
-    connectionStatus.value = "offline";
+    if (monitors.get(active.id)?.token === handle.token && !terminal.has(active.status)) active.status = "waiting_stopped";
+  };
+
+  const loadLearningStatuses = async (active: ActiveOperation, signal: AbortSignal) => {
+    if (!active.learningMode || !/^[0-9a-f-]{36}$/.test(active.id)) return;
+    try {
+      candidateStatuses.set(active.id, await api.listCandidateStatuses(active.id, signal));
+    } catch {
+      // Learning status is supplementary; chat completion stays intact.
+    }
   };
 
   const monitorOperation = async (active: ActiveOperation) => {
-    operationStream?.abort();
-    const controller = new AbortController();
-    operationStream = controller;
+    const old = monitors.get(active.id);
+    if (old) old.controller.abort();
+    const handle: MonitorHandle = { controller: new AbortController(), token: Symbol("operation-monitor"), conversationId: active.conversationId };
+    monitors.set(active.id, handle);
     let sawFinal = false;
     const onEvent = (event: OperationEvent, eventId: number) => {
-      if (event.operation_id !== active.id || eventId <= active.lastEventId) return;
+      if (monitors.get(active.id)?.token !== handle.token || event.operation_id !== active.id || eventId <= active.lastEventId) return;
       active.lastEventId = eventId;
-      const signature = `${event.type}:${event.status}:${event.message_id ?? ""}`;
-      const seen = seenOperationEvents.get(active.id) ?? new Set<string>();
-      if (seen.has(signature)) return;
-      seen.add(signature);
-      seenOperationEvents.set(active.id, seen);
       active.status = event.status;
       eventLog.value.push(event);
       if (event.type === "final") sawFinal = true;
     };
-    for (let attempt = 0; attempt < 2 && !controller.signal.aborted && !sawFinal; attempt += 1) {
+    for (let attempt = 0; attempt < 2 && !handle.controller.signal.aborted && !sawFinal; attempt += 1) {
       try {
-        await api.streamOperation(active.id, {
-          lastEventId: active.lastEventId || undefined,
-          onEvent,
-          signal: controller.signal,
-        });
+        await api.streamOperation(active.id, { lastEventId: active.lastEventId || undefined, onEvent, signal: handle.controller.signal });
         if (!sawFinal) throw new HttpError("network", 0);
       } catch (error) {
-        if (controller.signal.aborted) return;
+        if (handle.controller.signal.aborted || monitors.get(active.id)?.token !== handle.token) return;
         errorCode.value = safeErrorCode(error);
-        if (attempt === 0) continue;
       }
     }
-    if (controller.signal.aborted) return;
+    if (handle.controller.signal.aborted || monitors.get(active.id)?.token !== handle.token) return;
     if (sawFinal) {
       await loadMessages(active.conversationId).catch(() => undefined);
-      connectionStatus.value = active.status === "completed" ? "online" : "error";
+      await loadLearningStatuses(active, handle.controller.signal);
     } else {
-      await reconcile(active, controller.signal);
+      await reconcile(active, handle);
     }
-    if (operationStream === controller) operationStream = null;
+    if (monitors.get(active.id)?.token === handle.token) monitors.delete(active.id);
   };
 
   const selectConversation = async (id: number) => {
     if (disposed.value) return;
     currentConversationId.value = id;
-    operationStream?.abort();
-    loading.value = true;
+    messages.value = messageCache.get(id) ?? [];
+    loading.value = !messageCache.has(id);
     try {
       await loadMessages(id);
       const active = operations.get(id);
-      if (active && !terminal.has(active.status)) void monitorOperation(active);
+      if (active && !terminal.has(active.status) && !monitors.has(active.id)) void monitorOperation(active);
+      if (active?.learningMode && terminal.has(active.status)) await loadLearningStatuses(active, new AbortController().signal);
     } finally {
       loading.value = false;
     }
@@ -193,138 +199,109 @@ export const createChatStore = (api: ChatApi = chatApi, options: ChatStoreOption
 
   const initialize = async () => {
     if (disposed.value) return;
-    const token = ++loadToken;
     conversationLoad?.abort();
     conversationLoad = new AbortController();
+    const token = Symbol("conversation-load");
+    conversationToken = token;
     loading.value = true;
     connectionStatus.value = "connecting";
     try {
       const page = await api.listConversations(conversationLoad.signal);
-      if (token !== loadToken || disposed.value) return;
+      if (disposed.value || conversationToken !== token) return;
       conversations.value = page.items;
       connectionStatus.value = "online";
-      errorCode.value = null;
       const selection = currentConversationId.value && page.items.some((item) => item.id === currentConversationId.value)
-        ? currentConversationId.value
-        : page.items[0]?.id;
+        ? currentConversationId.value : page.items[0]?.id;
       if (selection) await selectConversation(selection);
     } catch (error) {
-      if (!conversationLoad?.signal.aborted) {
+      if (!conversationLoad.signal.aborted) {
         errorCode.value = safeErrorCode(error);
-        connectionStatus.value = errorCode.value === "network" || errorCode.value === "timeout" ? "offline" : "error";
+        connectionStatus.value = ["network", "timeout"].includes(errorCode.value) ? "offline" : "error";
       }
     } finally {
-      if (token === loadToken) loading.value = false;
+      if (conversationToken === token) loading.value = false;
     }
   };
 
   const createConversation = async (title = "新对话") => {
-    if (disposed.value) return null;
     const item = await api.createConversation(title);
-    replaceConversation(item);
+    conversations.value = [item, ...conversations.value.filter((row) => row.id !== item.id)];
+    messageCache.set(item.id, []);
     await selectConversation(item.id);
     return item;
+  };
+
+  const beginOperation = async (active: ActiveOperation, acceptedId: string) => {
+    active.id = acceptedId;
+    await loadMessages(active.conversationId).catch(() => undefined);
+    const persisted = [...(messageCache.get(active.conversationId) ?? [])].reverse().find((item) => item.operation_id === acceptedId)
+      ?? [...(messageCache.get(active.conversationId) ?? [])].reverse().find((item) => item.role === "user" && item.content === active.content);
+    active.userMessageId = persisted?.id ?? active.userMessageId;
+    void monitorOperation(active);
   };
 
   const send = async (content: string, files: File[], learningMode: boolean) => {
     const conversationId = currentConversationId.value;
     const normalized = content.trim();
-    if (!conversationId || !normalized || isBusy.value || disposed.value) return false;
-    const accepting: ActiveOperation = {
-      id: "accepting",
-      conversationId,
-      status: "running",
-      lastEventId: 0,
-      content: normalized,
-      learningMode,
-      userMessageId: 0,
-    };
-    operations.set(conversationId, accepting);
-    const active = operations.get(conversationId)!;
-    errorCode.value = null;
-    connectionStatus.value = "connecting";
+    if (!conversationId || !normalized || disposed.value || (operations.get(conversationId) && !terminal.has(operations.get(conversationId)!.status))) return false;
+    const active: ActiveOperation = { id: "accepting", conversationId, status: "running", lastEventId: 0, content: normalized, learningMode, userMessageId: 0 };
+    operations.set(conversationId, active);
+    const storedActive = operations.get(conversationId)!;
     const pendingId = temporaryMessageId--;
-    messages.value.push({
-      id: pendingId,
-      conversation_id: conversationId,
-      role: "user",
-      content: normalized,
-      created_at: new Date().toISOString(),
-    });
+    const pending: Message = { id: pendingId, conversation_id: conversationId, role: "user", content: normalized, created_at: new Date().toISOString() };
+    cacheMessages(conversationId, [...(messageCache.get(conversationId) ?? []), pending]);
     try {
       const uploaded: Attachment[] = [];
       for (const file of files) uploaded.push(await api.uploadAttachment(conversationId, file));
-      if (uploaded.length) attachmentsByMessage.set(pendingId, uploaded);
-      const accepted = await api.sendMessage(conversationId, {
-        content: normalized,
-        attachment_ids: uploaded.map((item) => item.id),
-        learning_mode: learningMode,
-      });
-      active.id = accepted.operation_id;
-      await loadMessages(conversationId);
-      const persisted = [...messages.value].reverse().find((item) => item.role === "user" && item.content === normalized);
-      active.userMessageId = persisted?.id ?? 0;
-      if (persisted && uploaded.length) {
-        attachmentsByMessage.set(persisted.id, uploaded);
-        attachmentsByMessage.delete(pendingId);
-      }
-      void monitorOperation(active);
+      if (uploaded.length) localAttachments.set(pendingId, uploaded);
+      const accepted = await api.sendMessage(conversationId, { content: normalized, attachment_ids: uploaded.map((item) => item.id), learning_mode: learningMode });
+      await beginOperation(storedActive, accepted.operation_id);
       return true;
     } catch (error) {
-      messages.value = messages.value.filter((item) => item.id !== pendingId);
+      cacheMessages(conversationId, (messageCache.get(conversationId) ?? []).filter((item) => item.id !== pendingId));
       operations.delete(conversationId);
       errorCode.value = safeErrorCode(error);
-      connectionStatus.value = errorCode.value === "network" || errorCode.value === "timeout" ? "offline" : "error";
       return false;
     }
   };
 
   const retry = async () => {
     const previous = operation.value;
-    if (!previous || !["failed", "cancelled"].includes(previous.status)) return false;
-    operations.delete(previous.conversationId);
-    return send(previous.content, [], previous.learningMode);
+    if (!previous || !["failed", "cancelled"].includes(previous.status) || previous.userMessageId <= 0) return false;
+    const accepted = await api.retryMessage(previous.conversationId, previous.userMessageId);
+    const active: ActiveOperation = { ...previous, id: accepted.operation_id, status: "running", lastEventId: 0, userMessageId: 0 };
+    operations.set(previous.conversationId, active);
+    await beginOperation(operations.get(previous.conversationId)!, accepted.operation_id);
+    return true;
   };
 
   const stopWaiting = () => {
     const active = operation.value;
     if (!active || terminal.has(active.status)) return;
-    operationStream?.abort();
+    monitors.get(active.id)?.controller.abort();
+    monitors.delete(active.id);
     active.status = "waiting_stopped";
   };
 
-  const attachmentsFor = (messageId: number) => attachmentsByMessage.get(messageId) ?? [];
+  const attachmentsFor = (messageId: number) => {
+    const message = messages.value.find((item) => item.id === messageId);
+    return message?.attachments ?? localAttachments.get(messageId) ?? [];
+  };
 
   const dispose = () => {
     disposed.value = true;
-    loadToken += 1;
-    messageToken += 1;
     conversationLoad?.abort();
-    messageLoad?.abort();
-    operationStream?.abort();
-    seenOperationEvents.clear();
+    loadControllers.forEach((controller) => controller.abort());
+    monitors.forEach(({ controller }) => controller.abort());
+    loadControllers.clear();
+    monitors.clear();
   };
 
   return reactive({
-    conversations,
-    currentConversationId,
-    currentConversation,
-    messages,
-    operation,
-    eventLog,
-    connectionStatus,
-    errorCode,
-    loading,
-    isBusy,
-    disposed: readonly(disposed),
-    initialize,
-    selectConversation,
-    createConversation,
-    send,
-    retry,
-    stopWaiting,
-    attachmentsFor,
-    dispose,
+    conversations, currentConversationId, currentConversation, messages, operation, eventLog,
+    connectionStatus, errorCode, loading, isBusy, learningStatuses, disposed: readonly(disposed),
+    initialize, selectConversation, createConversation, send, retry, stopWaiting, attachmentsFor,
+    operationFor, dispose,
   });
 };
 

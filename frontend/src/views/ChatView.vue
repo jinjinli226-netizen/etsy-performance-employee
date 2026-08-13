@@ -33,7 +33,20 @@ const connectionCopy = computed(() => {
   return "";
 });
 
-const hasCanonicalEtsyUrl = (content: string) => /https:\/\/(?:www\.)?etsy\.com\/listing\/\d+(?:\/[^\s?#]*)?/i.test(content);
+const hasCanonicalEtsyUrl = (content: string) => {
+  for (const raw of content.match(/https?:\/\/[^\s]+/gi) ?? []) {
+    try {
+      const url = new URL(raw);
+      const authority = raw.match(/^https:\/\/([^/]+)/)?.[1]?.toLowerCase();
+      if (url.protocol !== "https:" || !["etsy.com", "www.etsy.com"].includes(authority ?? "") || !["etsy.com", "www.etsy.com"].includes(url.hostname) || url.username || url.password || url.port || url.hash) continue;
+      const segments = url.pathname.split("/");
+      if (![3, 4].includes(segments.length) || segments[1] !== "listing" || !/^\d+$/.test(segments[2])) continue;
+      if (segments.length === 4 && (!segments[3] || !/^[A-Za-z0-9_-]+$/.test(segments[3]))) continue;
+      return true;
+    } catch { /* Invalid URLs are not learning evidence. */ }
+  }
+  return false;
+};
 
 const handleSubmit = async ({ content, files }: { content: string; files: File[] }) => {
   if (learningMode.value && !hasCanonicalEtsyUrl(content)) {
@@ -102,6 +115,7 @@ watch(() => store.isBusy, async (busy, previous) => {
         <LearningStatus
           :active="learningMode"
           :busy="store.isBusy"
+          :candidate-statuses="store.learningStatuses"
           @toggle="learningMode = $event"
         />
       </header>

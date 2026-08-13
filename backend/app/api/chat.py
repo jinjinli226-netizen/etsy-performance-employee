@@ -71,7 +71,23 @@ def list_conversations(
 @router.get("/conversations/{conversation_id}/messages", response_model=list[MessageRead])
 def list_messages(conversation_id: int, request: Request):
     try:
-        return service(request).list_messages(conversation_id)
+        chat_service = service(request)
+        messages = chat_service.list_messages(conversation_id)
+        attachments = chat_service.message_attachments(messages)
+        return [
+            MessageRead(
+                id=message.id,
+                conversation_id=message.conversation_id,
+                role=message.role,
+                content=message.content,
+                created_at=message.created_at,
+                operation_id=message.operation_id,
+                operation_status=message.operation_status,
+                learning_mode=bool(message.learning_mode),
+                attachments=[AttachmentRead.model_validate(item) for item in attachments.get(message.id, [])],
+            )
+            for message in messages
+        ]
     except ConversationNotFoundError as exc:
         raise HTTPException(status_code=404, detail="Conversation not found") from exc
 
@@ -94,6 +110,31 @@ async def send_message(conversation_id: int, payload: ChatSendRequest, request: 
         raise HTTPException(status_code=409, detail="Conversation is already processing") from exc
     except EmployeeUnavailableError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return OperationAccepted(operation_id=operation_id, status="running")
+
+
+@router.post(
+    "/conversations/{conversation_id}/messages/{message_id}/retry",
+    response_model=OperationAccepted,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def retry_message(conversation_id: int, message_id: int, request: Request):
+    chat_service = service(request)
+    try:
+        content, attachment_ids, learning_mode = chat_service.retry_payload(conversation_id, message_id)
+        try:
+            operation_id = await chat_service.start_send(
+                conversation_id, content, attachment_ids, learning_mode=learning_mode
+            )
+        except Exception:
+            chat_service.release_retry_claim(conversation_id, message_id)
+            raise
+    except ConversationNotFoundError as exc:
+        raise HTTPException(404, "Message not found") from exc
+    except ConversationBusyError as exc:
+        raise HTTPException(409, "Message is not retryable") from exc
+    except (AttachmentScopeError, EmployeeUnavailableError) as exc:
+        raise HTTPException(503, "Employee unavailable") from exc
     return OperationAccepted(operation_id=operation_id, status="running")
 
 
@@ -155,16 +196,25 @@ async def upload_attachment(
 @router.get("/events/{operation_id}")
 async def stream_events(operation_id: str, request: Request):
     chat_service = service(request)
+    raw_last_id = request.headers.get("last-event-id")
+    if raw_last_id is None:
+        raw_last_id = request.query_params.get("last_event_id")
+    if raw_last_id is not None and not re.fullmatch(r"0|[1-9][0-9]*", raw_last_id):
+        raise HTTPException(422, "Invalid Last-Event-ID")
+    last_event_id = int(raw_last_id or "0")
     try:
-        generator = chat_service.operation_events(operation_id)
+        generator = chat_service.operation_events(operation_id, after_id=last_event_id)
         first = await anext(generator)
-    except (KeyError, StopAsyncIteration) as exc:
+    except KeyError as exc:
         raise HTTPException(status_code=404, detail="Operation not found") from exc
+    except StopAsyncIteration:
+        return StreamingResponse(iter(()), media_type="text/event-stream")
 
     async def generate():
-        yield f"data: {json.dumps(first, separators=(',', ':'))}\n\n"
-        async for event in generator:
-            yield f"data: {json.dumps(event, separators=(',', ':'))}\n\n"
+        for event_id, event in [first]:
+            yield f"id: {event_id}\nevent: operation\ndata: {json.dumps(event, separators=(',', ':'))}\n\n"
+        async for event_id, event in generator:
+            yield f"id: {event_id}\nevent: operation\ndata: {json.dumps(event, separators=(',', ':'))}\n\n"
 
     return StreamingResponse(
         generate(),

@@ -40,6 +40,8 @@ class FakeChatApi implements ChatApi {
   ];
   streamFailures = 0;
   streamCalls: number[] = [];
+  retries: number[] = [];
+  candidateStatuses: Array<{ id: string; status: "proposed" | "testing" | "active" | "rejected" | "rolled_back" }> = [];
   sendGate: Promise<void> | undefined;
 
   async listConversations() {
@@ -55,6 +57,15 @@ class FakeChatApi implements ChatApi {
 
   async listMessages(conversationId: number) {
     return [...(this.messages.get(conversationId) ?? [])];
+  }
+
+  async retryMessage(conversationId: number, messageId: number) {
+    this.retries.push(messageId);
+    return { operation_id: `retry-${conversationId}-${messageId}`, status: "running" as const };
+  }
+
+  async listCandidateStatuses() {
+    return this.candidateStatuses;
   }
 
   async uploadAttachment(conversationId: number, file: File) {
@@ -107,11 +118,11 @@ const renderChat = async (api = new FakeChatApi()) => {
 };
 
 beforeEach(() => {
-  vi.stubGlobal("URL", {
-    ...URL,
-    createObjectURL: vi.fn((file: File) => `blob:${file.name}`),
-    revokeObjectURL: vi.fn(),
-  });
+  class TestURL extends URL {
+    static createObjectURL = vi.fn((file: File) => `blob:${file.name}`);
+    static revokeObjectURL = vi.fn();
+  }
+  vi.stubGlobal("URL", TestURL);
 });
 
 afterEach(() => {
@@ -225,6 +236,30 @@ describe("persistent chat workspace", () => {
     expect(store.messages.some((item) => item.content === "后台继续处理")).toBe(true);
   });
 
+  it("monitors operations in two conversations independently without stale cleanup", async () => {
+    const api = new FakeChatApi();
+    api.sendMessage = async (conversationId, input) => {
+      api.sent.push({ conversationId, input });
+      return { operation_id: `op-${conversationId}`, status: "running" as const };
+    };
+    let releaseFirst!: () => void;
+    let call = 0;
+    api.streamOperation = async (operationId, options) => {
+      api.streamCalls.push(options.lastEventId ?? 0);
+      call += 1;
+      if (call === 1) await new Promise<void>((resolve) => { releaseFirst = resolve; });
+      options.onEvent({ type: "final", status: "completed", operation_id: operationId, message_id: 100 + call }, 100 + call);
+    };
+    const { store } = await renderChat(api);
+    expect(await store.send("A operation", [], false)).toBe(true);
+    await store.selectConversation(2);
+    expect(await store.send("B operation", [], false)).toBe(true);
+    releaseFirst();
+    await flushPromises();
+    expect(store.operationFor(1)?.status).toBe("completed");
+    expect(store.operationFor(2)?.status).toBe("completed");
+  });
+
   it("reconnects SSE exactly once with the last event id then falls back to bounded message polling", async () => {
     const reconnecting = new FakeChatApi();
     let partialFailure = true;
@@ -289,14 +324,92 @@ describe("persistent chat workspace", () => {
   it("recovers a persisted safe failure after remount and retries the preceding user message", async () => {
     const api = new FakeChatApi();
     api.messages.set(1, [
-      message(10, 1, "user", "恢复后重试我"),
+      { ...message(10, 1, "user", "恢复后重试我"), operation_status: "failed", operation_id: "failed-op" },
       message(11, 1, "system", "The app restarted before the employee completed the request. Please retry."),
     ]);
     const { store } = await renderChat(api);
     expect(store.operation?.status).toBe("failed");
     await store.retry();
     await flushPromises();
-    expect(api.sent.at(-1)?.input.content).toBe("恢复后重试我");
+    expect(api.retries).toEqual([10]);
+  });
+
+  it("recovers attachment metadata and retries without uploading the files again", async () => {
+    const api = new FakeChatApi();
+    api.messages.set(1, [
+      { ...message(20, 1, "user", "附件重试"), operation_status: "failed", operation_id: "failed-op", attachments: [{ id: 81, conversation_id: 1, filename: "notes.txt", media_type: "text/plain", created_at: "2026-08-12T08:00:00Z" }] },
+      message(21, 1, "system", "The employee could not complete the request. Please retry."),
+    ]);
+    const { wrapper, store } = await renderChat(api);
+    expect(wrapper.text()).toContain("notes.txt");
+    await store.retry();
+    expect(api.retries).toEqual([20]);
+    expect(api.uploaded).toHaveLength(0);
+  });
+
+  it("uses the same strict Etsy URL rules as the backend", async () => {
+    for (const invalid of [
+      "http://www.etsy.com/listing/123",
+      "https://www.etsy.com.evil/listing/123",
+      "https://user@www.etsy.com/listing/123",
+      "https://www.etsy.com:443/listing/123",
+      "https://www.etsy.com/listing/123.evil",
+      "https://www.etsy.com/listing/123/slug#x",
+    ]) {
+      const { wrapper, api } = await renderChat();
+      await wrapper.get('[data-testid="learning-toggle"]').setValue(true);
+      const input = wrapper.get<HTMLInputElement>('[data-testid="message-input"]');
+      await input.setValue(invalid);
+      await wrapper.get('[data-testid="send-message"]').trigger("click");
+      expect(api.sent).toHaveLength(0);
+    }
+    const { wrapper, api } = await renderChat();
+    await wrapper.get('[data-testid="learning-toggle"]').setValue(true);
+    const input = wrapper.get<HTMLInputElement>('[data-testid="message-input"]');
+    await input.setValue("https://www.etsy.com/listing/123/valid-slug?utm_source=x");
+    await wrapper.get('[data-testid="send-message"]').trigger("click");
+    await flushPromises();
+    expect(api.sent).toHaveLength(1);
+  });
+
+  it("renders only safe candidate lifecycle statuses for learning operations", async () => {
+    const api = new FakeChatApi();
+    api.candidateStatuses = [
+      { id: "kc-1", status: "proposed" },
+      { id: "kc-2", status: "active" },
+      { id: "kc-3", status: "rejected" },
+      { id: "kc-4", status: "rolled_back" },
+    ];
+    api.sendMessage = async (conversationId, input) => {
+      api.sent.push({ conversationId, input });
+      return { operation_id: "11111111-1111-4111-8111-111111111111", status: "running" as const };
+    };
+    api.streamOperation = async (operationId, options) => {
+      options.onEvent({ type: "final", status: "completed", operation_id: operationId, message_id: 3 }, 3);
+    };
+    const { wrapper } = await renderChat(api);
+    await wrapper.get('[data-testid="learning-toggle"]').setValue(true);
+    await wrapper.get<HTMLInputElement>('[data-testid="message-input"]').setValue("learn https://etsy.com/listing/123");
+    await wrapper.get('[data-testid="send-message"]').trigger("click");
+    await flushPromises();
+    expect(wrapper.text()).toContain("待审批");
+    expect(wrapper.text()).toContain("已学习");
+    expect(wrapper.text()).toContain("已隔离");
+    expect(wrapper.text()).toContain("已撤销");
+    expect(wrapper.text()).not.toContain("kc-1");
+  });
+
+  it("reloads safe learning status from a persisted completed teaching message", async () => {
+    const api = new FakeChatApi();
+    api.candidateStatuses = [{ id: "kc-safe", status: "active" }];
+    api.messages.set(1, [
+      { ...message(30, 1, "user", "learn https://etsy.com/listing/123"), operation_id: "11111111-1111-4111-8111-111111111111", operation_status: "completed", learning_mode: true },
+      { ...message(31, 1, "assistant", "学习完成"), operation_id: "11111111-1111-4111-8111-111111111111", operation_status: "completed" },
+    ]);
+    const { wrapper } = await renderChat(api);
+    await flushPromises();
+    expect(wrapper.text()).toContain("已学习");
+    expect(wrapper.text()).not.toContain("kc-safe");
   });
 });
 
@@ -328,7 +441,7 @@ describe("chat API event stream", () => {
     const encoder = new TextEncoder();
     const body = new ReadableStream({
       start(controller) {
-        controller.enqueue(encoder.encode('id: 12\ndata: {"type":"progress","status":"running","operation_id":"op-1"}\n\n'));
+        controller.enqueue(encoder.encode('id: 12\nevent: operation\ndata: {"type":"progress","status":"running","operation_id":"op-1"}\n\n'));
         controller.close();
       },
     });

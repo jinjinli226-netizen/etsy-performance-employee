@@ -62,7 +62,7 @@ function stripInternalFrames(content: string) {
 
 const failureCopy = computed(() => {
   if (props.operationStatus === "cancelled") return "本次请求已取消";
-  if (props.operationStatus === "waiting_stopped") return "已停止等待，可重新发送";
+  if (props.operationStatus === "waiting_stopped") return "已停止在本页等待，可稍后刷新查看结果";
   if (props.operationStatus === "failed") return "数字员工没有完成本次请求";
   return "";
 });

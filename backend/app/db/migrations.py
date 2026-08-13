@@ -602,6 +602,14 @@ def _task8_guard_threshold_constraints(connection: Connection) -> None:
         ))
 
 
+def _task10_chat_recovery(connection: Connection) -> None:
+    columns = _columns(connection, "messages")
+    if "attachment_ids" not in columns:
+        connection.execute(text("ALTER TABLE messages ADD COLUMN attachment_ids JSON NOT NULL DEFAULT '[]'"))
+    if "learning_mode" not in columns:
+        connection.execute(text("ALTER TABLE messages ADD COLUMN learning_mode BOOLEAN NOT NULL DEFAULT 0"))
+
+
 MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (1, _task4_chat_columns),
     (2, _task6_excel_job_columns),
@@ -614,6 +622,7 @@ MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (8, _task8_migration_and_fts),
     (9, _task8_portable_lineage),
     (10, _task8_guard_threshold_constraints),
+    (11, _task10_chat_recovery),
 )
 
 

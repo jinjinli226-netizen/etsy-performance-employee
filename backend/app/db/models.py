@@ -92,6 +92,8 @@ class Message(Base):
     evidence_bound: Mapped[bool] = mapped_column(default=False, nullable=False)
     contains_evidence_control: Mapped[bool] = mapped_column(default=False, nullable=False)
     evidence_ids: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    attachment_ids: Mapped[list[int]] = mapped_column(JSON, default=list, nullable=False)
+    learning_mode: Mapped[bool] = mapped_column(default=False, nullable=False)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now, nullable=False)
 
     conversation: Mapped[Conversation] = relationship(back_populates="messages")

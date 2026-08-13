@@ -24,6 +24,7 @@ from app.knowledge.schemas import (
     CandidateInput,
     CandidatePage,
     CandidateRead,
+    CandidateStatusRead,
     EvidenceInput,
     EvidenceReference,
     KnowledgeKind,
@@ -621,6 +622,18 @@ class KnowledgeService:
                 independent, edits = self._support_counts(session, candidate)
                 items.append(CandidateRead(id=candidate.id, public_id=candidate.public_id or str(candidate.id), kind=candidate.kind or "legacy", abstract=candidate.abstract_summary or "Legacy candidate pending reprocessing.", confidence=candidate.confidence or 0, evidence_count=independent, accepted_edit_count=edits, status=candidate.status, created_at=candidate.created_at, updated_at=candidate.updated_at))
             return CandidatePage(items=items, total=total, limit=limit, offset=offset)
+
+    def candidate_statuses(self, trace_id: str) -> list[CandidateStatusRead]:
+        with self.session_factory() as session:
+            candidates = list(session.scalars(
+                select(KnowledgeCandidate)
+                .where(KnowledgeCandidate.trace_id == trace_id)
+                .order_by(KnowledgeCandidate.id)
+            ))
+            return [
+                CandidateStatusRead(id=item.public_id or str(item.id), status=item.status)
+                for item in candidates
+            ]
 
     def export_active_knowledge(self, path: Path) -> KnowledgeTrust:
         records = []

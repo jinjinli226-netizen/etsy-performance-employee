@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
-from app.knowledge.schemas import CandidatePage, EvidenceInput, KnowledgeStatus, PatternPage, PatternTransitionRead
+from app.knowledge.schemas import CandidatePage, CandidateStatusRead, EvidenceInput, KnowledgeStatus, PatternPage, PatternTransitionRead
 from app.knowledge.service import KnowledgeCapacityError, KnowledgeConflictError, KnowledgeNotFoundError, KnowledgeService, KnowledgeValidationError
 
 
@@ -43,6 +43,14 @@ def list_active_patterns(
     kind: str | None = Query(None, min_length=1, max_length=127),
 ):
     return service(request).list_active(limit=limit, offset=offset, kind=kind)
+
+
+@router.get("/candidates/status", response_model=list[CandidateStatusRead])
+def candidate_statuses(
+    request: Request,
+    trace_id: str = Query(pattern=r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"),
+):
+    return service(request).candidate_statuses(trace_id)
 
 
 @router.get("/candidates", response_model=CandidatePage)
