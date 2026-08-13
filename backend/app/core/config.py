@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     excel_cancel_timeout_seconds: float = 5.0
     excel_worker_timeout_seconds: float = 900.0
     originality_threshold: float = Field(default=0.72, ge=0.1, le=1)
+    max_migration_package_bytes: int = 128 * 1024 * 1024
 
     @property
     def resolved_database_url(self) -> str:
@@ -35,6 +36,8 @@ class Settings(BaseSettings):
         (self.data_dir / "attachments").mkdir(parents=True, exist_ok=True)
         (self.data_dir / "excel-jobs").mkdir(parents=True, exist_ok=True)
         (self.data_dir / "trust").mkdir(parents=True, exist_ok=True)
+        (self.data_dir / "migration-packages").mkdir(parents=True, exist_ok=True)
+        (self.data_dir / "migration-workspace").mkdir(parents=True, exist_ok=True)
 
 
 def get_settings() -> Settings:
