@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 from pathlib import Path
 from uuid import uuid4
 
@@ -17,6 +18,7 @@ from app.chat.schemas import (
     MessageRead,
     OperationAccepted,
 )
+from app.chat.attachments import AttachmentValidationError, cleanup_staging, stage_upload
 from app.chat.service import (
     AttachmentScopeError,
     ChatService,
@@ -27,22 +29,6 @@ from app.db.models import Attachment, Conversation
 from app.employee.adapter import EmployeeUnavailableError
 
 router = APIRouter(prefix="/api")
-
-ALLOWED_MEDIA_TYPES = {
-    "image/jpeg",
-    "image/png",
-    "image/webp",
-    "image/gif",
-    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    "application/vnd.ms-excel",
-    "text/csv",
-    "text/plain",
-    "application/pdf",
-    "application/zip",
-    "application/octet-stream",
-}
-BLOCKED_SUFFIXES = {".bat", ".cmd", ".com", ".exe", ".js", ".msi", ".ps1", ".scr"}
-
 
 def service(request: Request) -> ChatService:
     return request.app.state.chat_service
@@ -124,7 +110,8 @@ async def retry_message(conversation_id: int, message_id: int, request: Request)
         content, attachment_ids, learning_mode = chat_service.retry_payload(conversation_id, message_id)
         try:
             operation_id = await chat_service.start_send(
-                conversation_id, content, attachment_ids, learning_mode=learning_mode
+                conversation_id, content, attachment_ids, learning_mode=learning_mode,
+                reuse_message_id=message_id,
             )
         except Exception:
             chat_service.release_retry_claim(conversation_id, message_id)
@@ -151,14 +138,7 @@ async def upload_attachment(
     file: UploadFile = File(...),
 ):
     settings = request.app.state.settings
-    media_type = (file.content_type or "application/octet-stream").lower()
-    if media_type not in ALLOWED_MEDIA_TYPES:
-        raise HTTPException(status_code=422, detail="Unsupported attachment type")
-
     filename = _safe_filename(file.filename)
-    suffix = Path(filename).suffix.lower()[:16]
-    if suffix in BLOCKED_SUFFIXES:
-        raise HTTPException(status_code=422, detail="Unsupported attachment type")
     storage_dir = (settings.data_dir / "attachments" / str(conversation_id)).resolve()
     attachment_root = (settings.data_dir / "attachments").resolve()
     if not storage_dir.is_relative_to(attachment_root):
@@ -168,29 +148,80 @@ async def upload_attachment(
         if session.get(Conversation, conversation_id) is None:
             raise HTTPException(status_code=404, detail="Conversation not found")
 
-    content = await file.read(settings.max_attachment_bytes + 1)
-    if len(content) > settings.max_attachment_bytes:
-        raise HTTPException(status_code=422, detail="Attachment is too large")
-    if not content:
-        raise HTTPException(status_code=422, detail="Attachment is empty")
-    storage_dir.mkdir(parents=True, exist_ok=True)
-    destination = storage_dir / f"{uuid4().hex}{suffix}"
-    destination.write_bytes(content)
-
+    staging = attachment_root / ".staging" / uuid4().hex
+    destination: Path | None = None
     try:
+        staged = await stage_upload(file, staging_root=staging, filename=filename, max_bytes=settings.max_attachment_bytes)
+        storage_dir.mkdir(parents=True, exist_ok=True)
+        destination = storage_dir / f"{uuid4().hex}{staged.suffix}"
+        shutil.move(str(staged.path), destination)
         with request.app.state.session_factory() as session:
             attachment = Attachment(
                 conversation_id=conversation_id,
                 filename=filename,
                 path=str(destination),
-                media_type=media_type,
+                media_type=staged.media_type,
             )
             session.add(attachment)
             session.commit()
             return attachment
+    except AttachmentValidationError as exc:
+        raise HTTPException(exc.status_code, {"code": exc.code, "message": str(exc)}) from exc
     except Exception:
-        destination.unlink(missing_ok=True)
+        if destination is not None:
+            destination.unlink(missing_ok=True)
         raise
+    finally:
+        cleanup_staging(staging)
+
+
+@router.post(
+    "/conversations/{conversation_id}/messages/batch",
+    response_model=OperationAccepted,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def send_message_batch(
+    conversation_id: int,
+    request: Request,
+    content: str = Form(..., min_length=1, max_length=100_000),
+    learning_mode: bool = Form(False),
+    files: list[UploadFile] = File(default=[]),
+):
+    settings = request.app.state.settings
+    staging = (settings.data_dir / "attachments" / ".staging" / uuid4().hex).resolve()
+    staged = []
+    try:
+        if not content.strip():
+            raise AttachmentValidationError("attachment_unsupported", "Message content cannot be blank.")
+        if len(files) > 20:
+            raise AttachmentValidationError("attachment_unsupported", "Too many attachments.")
+        for file in files:
+            staged.append(await stage_upload(
+                file,
+                staging_root=staging,
+                filename=_safe_filename(file.filename),
+                max_bytes=settings.max_attachment_bytes,
+            ))
+        operation_id = await service(request).start_send_staged(
+            conversation_id,
+            content.strip(),
+            staged,
+            learning_mode=learning_mode,
+            attachment_root=(settings.data_dir / "attachments").resolve(),
+        )
+    except AttachmentValidationError as exc:
+        raise HTTPException(exc.status_code, {"code": exc.code, "message": str(exc)}) from exc
+    except ConversationNotFoundError as exc:
+        raise HTTPException(404, "Conversation not found") from exc
+    except AttachmentScopeError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except ConversationBusyError as exc:
+        raise HTTPException(409, "Conversation is already processing") from exc
+    except EmployeeUnavailableError as exc:
+        raise HTTPException(503, "Employee unavailable") from exc
+    finally:
+        cleanup_staging(staging)
+    return OperationAccepted(operation_id=operation_id, status="running")
 
 
 @router.get("/events/{operation_id}")

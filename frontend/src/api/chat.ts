@@ -59,11 +59,12 @@ export type OperationEvent = {
 };
 
 export interface ChatApi {
-  listConversations(signal?: AbortSignal): Promise<ConversationPage>;
+  listConversations(signal?: AbortSignal, limit?: number, offset?: number): Promise<ConversationPage>;
   createConversation(title: string, signal?: AbortSignal): Promise<Conversation>;
   listMessages(conversationId: number, signal?: AbortSignal): Promise<Message[]>;
   uploadAttachment(conversationId: number, file: File, signal?: AbortSignal): Promise<Attachment>;
   sendMessage(conversationId: number, input: SendMessageInput, signal?: AbortSignal): Promise<OperationAccepted>;
+  sendMessageBatch(conversationId: number, input: SendMessageInput, files: File[], signal?: AbortSignal): Promise<OperationAccepted>;
   retryMessage(conversationId: number, messageId: number, signal?: AbortSignal): Promise<OperationAccepted>;
   listCandidateStatuses(operationId: string, signal?: AbortSignal): Promise<CandidateStatusItem[]>;
   streamOperation(
@@ -81,7 +82,7 @@ const isOperationEvent = (value: unknown): value is OperationEvent => {
 };
 
 export const chatApi: ChatApi = {
-  listConversations: (signal) => apiRequest<ConversationPage>("/conversations?limit=100&offset=0", { signal }),
+  listConversations: (signal, limit = 100, offset = 0) => apiRequest<ConversationPage>(`/conversations?limit=${limit}&offset=${offset}`, { signal }),
   createConversation: (title, signal) => apiRequest<Conversation>("/conversations", { method: "POST", body: { title }, signal }),
   listMessages: (conversationId, signal) => apiRequest<Message[]>(`/conversations/${conversationId}/messages`, { signal }),
   uploadAttachment: (conversationId, file, signal) => {
@@ -96,6 +97,15 @@ export const chatApi: ChatApi = {
     signal,
     timeoutMs: 30_000,
   }),
+  sendMessageBatch: (conversationId, input, files, signal) => {
+    const form = new FormData();
+    form.set("content", input.content);
+    form.set("learning_mode", String(input.learning_mode));
+    for (const file of files) form.append("files", file, file.name);
+    return apiRequest<OperationAccepted>(`/conversations/${conversationId}/messages/batch`, {
+      method: "POST", body: form, signal, timeoutMs: 60_000,
+    });
+  },
   retryMessage: (conversationId, messageId, signal) => apiRequest<OperationAccepted>(`/conversations/${conversationId}/messages/${messageId}/retry`, {
     method: "POST", signal, timeoutMs: 30_000,
   }),

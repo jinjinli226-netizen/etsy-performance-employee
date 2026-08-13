@@ -142,7 +142,7 @@ onBeforeUnmount(() => viewport.value?.removeEventListener("scroll", handleScroll
       <div v-else-if="failureCopy" class="operation-row is-error">
         <AlertTriangle :size="16" aria-hidden="true" />
         <span>{{ failureCopy }}</span>
-        <button v-if="operationStatus !== 'waiting_stopped'" type="button" @click="$emit('retry')">
+        <button v-if="operationStatus !== 'waiting_stopped'" type="button" data-testid="retry-message" @click="$emit('retry')">
           <RotateCcw :size="14" aria-hidden="true" />
           重新发送
         </button>

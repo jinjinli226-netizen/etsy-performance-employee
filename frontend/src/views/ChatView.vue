@@ -63,7 +63,8 @@ const handleSubmit = async ({ content, files }: { content: string; files: File[]
 };
 
 const retry = async () => {
-  await store.retry();
+  const retried = await store.retry();
+  if (!retried) composer.value?.setError("重试未启动，请稍后再试");
   composer.value?.focus();
 };
 
@@ -99,10 +100,13 @@ watch(() => store.isBusy, async (busy, previous) => {
       :current-id="store.currentConversationId"
       :collapsed="conversationCollapsed"
       :mobile-open="conversationMobileOpen"
+      :has-more="store.hasMoreConversations"
+      :loading-more="store.loadingMoreConversations"
       @select="selectConversation"
       @create="createConversation"
       @toggle-collapse="conversationCollapsed = !conversationCollapsed"
       @update:mobile-open="conversationMobileOpen = $event"
+      @load-more="store.loadMoreConversations()"
     />
 
     <div class="chat-stage">

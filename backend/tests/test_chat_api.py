@@ -1,15 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import sys
+import zipfile
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from openpyxl import Workbook
+from PIL import Image
+from sqlalchemy import func, select
 
 from app.core.config import Settings
-from app.db.models import AuditEvent, CompetitorEvidence, Conversation, KnowledgeCandidate, Message
+from app.db.models import Attachment, AuditEvent, CompetitorEvidence, Conversation, KnowledgeCandidate, Message
 from app.employee.adapter import (
     EmployeeReply,
     EmployeeUnavailableError,
@@ -73,6 +78,21 @@ def wait_for_final(client: TestClient, operation_id: str) -> list[dict]:
         return payloads
 
 
+def png_bytes() -> bytes:
+    output = io.BytesIO()
+    Image.new("RGB", (2, 2), "red").save(output, format="PNG")
+    return output.getvalue()
+
+
+def xlsx_bytes() -> bytes:
+    output = io.BytesIO()
+    workbook = Workbook()
+    workbook.active["A1"] = "title"
+    workbook.save(output)
+    workbook.close()
+    return output.getvalue()
+
+
 def test_create_list_and_get_empty_messages(api) -> None:
     client, _, _ = api
     first = create_conversation(client, "First")
@@ -134,7 +154,7 @@ def test_attachment_upload_is_scoped_and_only_image_is_passed_as_image(api) -> N
     image = client.post(
         "/api/attachments",
         data={"conversation_id": str(first)},
-        files={"file": ("../dress.png", b"image", "image/png")},
+        files={"file": ("../dress.png", png_bytes(), "image/png")},
     )
     spreadsheet = client.post(
         "/api/attachments",
@@ -142,7 +162,7 @@ def test_attachment_upload_is_scoped_and_only_image_is_passed_as_image(api) -> N
         files={
             "file": (
                 "listings.xlsx",
-                b"PK fake workbook",
+                xlsx_bytes(),
                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
         },
@@ -181,7 +201,7 @@ def test_send_rejects_more_than_one_image_before_persisting_or_running(api) -> N
         uploaded = client.post(
             "/api/attachments",
             data={"conversation_id": str(conversation_id)},
-            files={"file": (name, b"image", "image/png")},
+            files={"file": (name, png_bytes(), "image/png")},
         )
         image_ids.append(uploaded.json()["id"])
 
@@ -211,6 +231,109 @@ def test_attachment_rejects_disallowed_type_or_oversize(api, filename, size, med
         files={"file": (filename, b"x" * size, media_type)},
     )
     assert response.status_code == 422
+
+
+@pytest.mark.parametrize(
+    ("filename", "content", "media_type"),
+    [
+        ("fake.png", b"not an image", "image/png"),
+        ("polyglot.png", png_bytes() + b"PK\x03\x04hidden", "image/png"),
+        ("renamed.xlsx", png_bytes(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        ("photo.png", png_bytes(), "image/jpeg"),
+        ("nul.txt", b"safe\x00unsafe", "text/plain"),
+    ],
+)
+def test_attachment_rejects_content_or_declared_type_mismatch(api, filename, content, media_type) -> None:
+    client, _, settings = api
+    conversation_id = create_conversation(client)
+    response = client.post(
+        "/api/attachments",
+        data={"conversation_id": str(conversation_id)},
+        files={"file": (filename, content, media_type)},
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "attachment_content_mismatch"
+    with client.app.state.session_factory() as session:
+        assert session.scalar(select(func.count()).select_from(Attachment)) == 0
+    assert not list((settings.data_dir / "attachments" / str(conversation_id)).glob("*"))
+
+
+def test_attachment_accepts_valid_tiny_image_xlsx_pdf_and_utf8_text(api) -> None:
+    client, _, _ = api
+    conversation_id = create_conversation(client)
+    samples = [
+        ("photo.png", png_bytes(), "image/png"),
+        ("listing.xlsx", xlsx_bytes(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        ("brief.pdf", b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\n%%EOF", "application/pdf"),
+        ("notes.txt", "舞台服\nnotes".encode(), "text/plain"),
+        ("data.json", b'{"safe":true}', "application/json"),
+    ]
+    for filename, content, media_type in samples:
+        response = client.post(
+            "/api/attachments",
+            data={"conversation_id": str(conversation_id)},
+            files={"file": (filename, content, media_type)},
+        )
+        assert response.status_code == 201, response.text
+
+
+def test_atomic_batch_rejects_second_bad_file_without_rows_files_or_employee_call(api) -> None:
+    client, fake, settings = api
+    conversation_id = create_conversation(client)
+    response = client.post(
+        f"/api/conversations/{conversation_id}/messages/batch",
+        data={"content": "Review files", "learning_mode": "false"},
+        files=[
+            ("files", ("valid.png", png_bytes(), "image/png")),
+            ("files", ("bad.xlsx", b"PK fake workbook", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")),
+        ],
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "attachment_content_mismatch"
+    with client.app.state.session_factory() as session:
+        assert session.scalar(select(func.count()).select_from(Attachment)) == 0
+        assert session.scalar(select(func.count()).select_from(Message)) == 0
+    assert fake.calls == []
+    assert not list((settings.data_dir / "attachments" / str(conversation_id)).glob("*"))
+
+
+def test_attachment_rejects_xlsx_zip_bomb_before_employee_access(api) -> None:
+    client, fake, _ = api
+    conversation_id = create_conversation(client)
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("[Content_Types].xml", "<Types/>")
+        archive.writestr("xl/workbook.xml", "<workbook/>")
+        archive.writestr("xl/worksheets/sheet1.xml", b"A" * (11 * 1024 * 1024))
+    response = client.post(
+        f"/api/conversations/{conversation_id}/messages/batch",
+        data={"content": "unsafe", "learning_mode": "false"},
+        files=[("files", ("bomb.xlsx", output.getvalue(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"))],
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "attachment_content_mismatch"
+    assert fake.calls == []
+
+
+def test_atomic_batch_persists_claimed_valid_attachments_and_message(api) -> None:
+    client, fake, _ = api
+    conversation_id = create_conversation(client)
+    response = client.post(
+        f"/api/conversations/{conversation_id}/messages/batch",
+        data={"content": "Review these", "learning_mode": "false"},
+        files=[
+            ("files", ("valid.png", png_bytes(), "image/png")),
+            ("files", ("notes.txt", b"safe notes", "text/plain")),
+        ],
+    )
+    assert response.status_code == 202, response.text
+    wait_for_final(client, response.json()["operation_id"])
+    stored = client.get(f"/api/conversations/{conversation_id}/messages").json()
+    assert [item["filename"] for item in stored[0]["attachments"]] == ["valid.png", "notes.txt"]
+    with client.app.state.session_factory() as session:
+        attachments = list(session.scalars(select(Attachment).order_by(Attachment.id)))
+        assert all(item.claimed_by_message_id == stored[0]["id"] for item in attachments)
+    assert Path(fake.calls[-1]["image_path"]).name.endswith(".png")
 
 
 def test_valid_knowledge_envelope_is_stripped_and_unknown_json_is_visible(api) -> None:

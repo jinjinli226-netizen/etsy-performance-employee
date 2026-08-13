@@ -42,6 +42,9 @@ export const createChatStore = (api: ChatApi = chatApi, options: ChatStoreOption
   const localAttachments = reactive(new Map<number, Attachment[]>());
   const candidateStatuses = reactive(new Map<string, CandidateStatusItem[]>());
   const loading = ref(false);
+  const loadingMoreConversations = ref(false);
+  const conversationTotal = ref(0);
+  const hasMoreConversations = computed(() => conversations.value.length < conversationTotal.value);
   const disposed = ref(false);
   const pollIntervalMs = options.pollIntervalMs ?? 650;
   const pollAttempts = options.pollAttempts ?? 6;
@@ -209,6 +212,7 @@ export const createChatStore = (api: ChatApi = chatApi, options: ChatStoreOption
       const page = await api.listConversations(conversationLoad.signal);
       if (disposed.value || conversationToken !== token) return;
       conversations.value = page.items;
+      conversationTotal.value = page.total;
       connectionStatus.value = "online";
       const selection = currentConversationId.value && page.items.some((item) => item.id === currentConversationId.value)
         ? currentConversationId.value : page.items[0]?.id;
@@ -223,9 +227,29 @@ export const createChatStore = (api: ChatApi = chatApi, options: ChatStoreOption
     }
   };
 
+  const loadMoreConversations = async () => {
+    if (disposed.value || loadingMoreConversations.value || !hasMoreConversations.value) return false;
+    loadingMoreConversations.value = true;
+    try {
+      const page = await api.listConversations(undefined, 100, conversations.value.length);
+      const known = new Set(conversations.value.map((item) => item.id));
+      conversations.value = [...conversations.value, ...page.items.filter((item) => !known.has(item.id))];
+      conversationTotal.value = page.total;
+      errorCode.value = null;
+      return true;
+    } catch (error) {
+      errorCode.value = safeErrorCode(error);
+      return false;
+    } finally {
+      loadingMoreConversations.value = false;
+    }
+  };
+
   const createConversation = async (title = "新对话") => {
     const item = await api.createConversation(title);
+    const existed = conversations.value.some((row) => row.id === item.id);
     conversations.value = [item, ...conversations.value.filter((row) => row.id !== item.id)];
+    if (!existed) conversationTotal.value += 1;
     messageCache.set(item.id, []);
     await selectConversation(item.id);
     return item;
@@ -251,10 +275,17 @@ export const createChatStore = (api: ChatApi = chatApi, options: ChatStoreOption
     const pending: Message = { id: pendingId, conversation_id: conversationId, role: "user", content: normalized, created_at: new Date().toISOString() };
     cacheMessages(conversationId, [...(messageCache.get(conversationId) ?? []), pending]);
     try {
-      const uploaded: Attachment[] = [];
-      for (const file of files) uploaded.push(await api.uploadAttachment(conversationId, file));
-      if (uploaded.length) localAttachments.set(pendingId, uploaded);
-      const accepted = await api.sendMessage(conversationId, { content: normalized, attachment_ids: uploaded.map((item) => item.id), learning_mode: learningMode });
+      if (files.length) localAttachments.set(pendingId, files.map((file, index) => ({
+        id: pendingId - index,
+        conversation_id: conversationId,
+        filename: file.name,
+        media_type: file.type,
+        created_at: pending.created_at,
+      })));
+      const input = { content: normalized, attachment_ids: [], learning_mode: learningMode };
+      const accepted = files.length
+        ? await api.sendMessageBatch(conversationId, input, files)
+        : await api.sendMessage(conversationId, input);
       await beginOperation(storedActive, accepted.operation_id);
       return true;
     } catch (error) {
@@ -268,11 +299,18 @@ export const createChatStore = (api: ChatApi = chatApi, options: ChatStoreOption
   const retry = async () => {
     const previous = operation.value;
     if (!previous || !["failed", "cancelled"].includes(previous.status) || previous.userMessageId <= 0) return false;
-    const accepted = await api.retryMessage(previous.conversationId, previous.userMessageId);
-    const active: ActiveOperation = { ...previous, id: accepted.operation_id, status: "running", lastEventId: 0, userMessageId: 0 };
-    operations.set(previous.conversationId, active);
-    await beginOperation(operations.get(previous.conversationId)!, accepted.operation_id);
-    return true;
+    try {
+      const accepted = await api.retryMessage(previous.conversationId, previous.userMessageId);
+      const active: ActiveOperation = { ...previous, id: accepted.operation_id, status: "running", lastEventId: 0, userMessageId: 0 };
+      operations.set(previous.conversationId, active);
+      await beginOperation(operations.get(previous.conversationId)!, accepted.operation_id);
+      return true;
+    } catch (error) {
+      errorCode.value = safeErrorCode(error);
+      connectionStatus.value = ["network", "timeout"].includes(errorCode.value) ? "offline" : "error";
+      operations.set(previous.conversationId, previous);
+      return false;
+    }
   };
 
   const stopWaiting = () => {
@@ -299,8 +337,8 @@ export const createChatStore = (api: ChatApi = chatApi, options: ChatStoreOption
 
   return reactive({
     conversations, currentConversationId, currentConversation, messages, operation, eventLog,
-    connectionStatus, errorCode, loading, isBusy, learningStatuses, disposed: readonly(disposed),
-    initialize, selectConversation, createConversation, send, retry, stopWaiting, attachmentsFor,
+    connectionStatus, errorCode, loading, loadingMoreConversations, hasMoreConversations, isBusy, learningStatuses, disposed: readonly(disposed),
+    initialize, loadMoreConversations, selectConversation, createConversation, send, retry, stopWaiting, attachmentsFor,
     operationFor, dispose,
   });
 };

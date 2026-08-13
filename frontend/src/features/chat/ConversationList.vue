@@ -8,6 +8,8 @@ defineProps<{
   currentId: number | null;
   collapsed: boolean;
   mobileOpen: boolean;
+  hasMore: boolean;
+  loadingMore: boolean;
 }>();
 
 defineEmits<{
@@ -15,6 +17,7 @@ defineEmits<{
   create: [];
   "toggle-collapse": [];
   "update:mobile-open": [open: boolean];
+  "load-more": [];
 }>();
 </script>
 
@@ -84,6 +87,14 @@ defineEmits<{
         </time>
       </button>
       <p v-if="!conversations.length" class="conversation-list__empty">暂无对话</p>
+      <button
+        v-if="hasMore"
+        class="conversation-list__more"
+        type="button"
+        data-testid="load-more-conversations"
+        :disabled="loadingMore"
+        @click="$emit('load-more')"
+      >{{ loadingMore ? "正在加载" : "加载更多对话" }}</button>
     </nav>
   </aside>
 </template>
@@ -208,6 +219,19 @@ defineEmits<{
   color: var(--text-muted);
   font-size: 10px;
 }
+
+.conversation-list__more {
+  min-height: 44px;
+  border: 0;
+  border-radius: var(--ds-radius-control);
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.conversation-list__more:hover { background: var(--surface); color: var(--text); }
+.conversation-list__more:disabled { cursor: wait; opacity: 0.65; }
 
 .conversation-list__empty {
   padding: 8px 10px;

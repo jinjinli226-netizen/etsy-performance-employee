@@ -610,6 +610,13 @@ def _task10_chat_recovery(connection: Connection) -> None:
         connection.execute(text("ALTER TABLE messages ADD COLUMN learning_mode BOOLEAN NOT NULL DEFAULT 0"))
 
 
+def _task10_atomic_attachments(connection: Connection) -> None:
+    columns = _columns(connection, "attachments")
+    if "claimed_by_message_id" not in columns:
+        connection.execute(text("ALTER TABLE attachments ADD COLUMN claimed_by_message_id INTEGER REFERENCES messages(id) ON DELETE SET NULL"))
+    connection.execute(text("CREATE INDEX IF NOT EXISTS ix_attachments_claimed_by_message_id ON attachments(claimed_by_message_id)"))
+
+
 MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (1, _task4_chat_columns),
     (2, _task6_excel_job_columns),
@@ -623,6 +630,7 @@ MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (9, _task8_portable_lineage),
     (10, _task8_guard_threshold_constraints),
     (11, _task10_chat_recovery),
+    (12, _task10_atomic_attachments),
 )
 
 

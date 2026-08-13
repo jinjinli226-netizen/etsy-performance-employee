@@ -53,6 +53,7 @@ def create_app(
         )
         app.state.chat_service = ChatService(factory, runtime_employee, app.state.knowledge_service)
         app.state.chat_service.reconcile_interrupted_operations()
+        app.state.chat_service.cleanup_orphan_attachments(runtime_settings.data_dir / "attachments")
         runtime_excel_runner = excel_runner or SubprocessExcelRunner(
             repository_root=Path(__file__).resolve().parents[2],
             max_event_bytes=runtime_settings.max_worker_event_bytes,

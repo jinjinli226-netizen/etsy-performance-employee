@@ -15,6 +15,7 @@ import MessageComposer from "./MessageComposer.vue";
 import MessageStream from "./MessageStream.vue";
 import { createChatStore } from "./chat.store";
 import { openEventStream } from "../../api/client";
+import { HttpError } from "../../api/client";
 
 const conversations: Conversation[] = [
   { id: 1, title: "舞台服标题规范", created_at: "2026-08-12T08:00:00Z", updated_at: "2026-08-12T08:00:00Z" },
@@ -44,8 +45,8 @@ class FakeChatApi implements ChatApi {
   candidateStatuses: Array<{ id: string; status: "proposed" | "testing" | "active" | "rejected" | "rolled_back" }> = [];
   sendGate: Promise<void> | undefined;
 
-  async listConversations() {
-    return { items: this.conversations, total: this.conversations.length, limit: 100, offset: 0 };
+  async listConversations(_signal?: AbortSignal, limit = 100, offset = 0) {
+    return { items: this.conversations.slice(offset, offset + limit), total: this.conversations.length, limit, offset };
   }
 
   async createConversation(title: string) {
@@ -86,6 +87,11 @@ class FakeChatApi implements ChatApi {
     rows.push(message(2, conversationId, "user", input.content));
     this.messages.set(conversationId, rows);
     return { operation_id: "op-1", status: "running" as const };
+  }
+
+  async sendMessageBatch(conversationId: number, input: SendMessageInput, files: File[]) {
+    this.uploaded.push(...files);
+    return this.sendMessage(conversationId, input);
   }
 
   async streamOperation(
@@ -187,7 +193,7 @@ describe("persistent chat workspace", () => {
     await flushPromises();
 
     expect(api.uploaded.map((file) => file.name)).toEqual(["front.png", "listing.xlsx", "notes.txt"]);
-    expect(api.sent[0].input.attachment_ids).toEqual([101, 102, 103]);
+    expect(api.sent[0].input.attachment_ids).toEqual([]);
   });
 
   it("requires an explicit Etsy listing URL in teaching mode and resets the mode after success", async () => {
@@ -345,6 +351,42 @@ describe("persistent chat workspace", () => {
     await store.retry();
     expect(api.retries).toEqual([20]);
     expect(api.uploaded).toHaveLength(0);
+  });
+
+  it("loads more than 100 persisted conversations through an accessible continuation", async () => {
+    const api = new FakeChatApi();
+    api.conversations = Array.from({ length: 101 }, (_, index) => ({
+      id: index + 1,
+      title: `Conversation ${index + 1}`,
+      created_at: "2026-08-12T08:00:00Z",
+      updated_at: "2026-08-12T08:00:00Z",
+    }));
+    const { wrapper, store } = await renderChat(api);
+    expect(store.conversations).toHaveLength(100);
+    const more = wrapper.get('[data-testid="load-more-conversations"]');
+    expect(more.attributes("type")).toBe("button");
+    await more.trigger("click");
+    await flushPromises();
+    expect(store.conversations).toHaveLength(101);
+    expect(wrapper.find('[data-testid="load-more-conversations"]').exists()).toBe(false);
+  });
+
+  it("returns a safe false result when retry receives 503 and preserves the failed operation", async () => {
+    const api = new FakeChatApi();
+    api.messages.set(1, [
+      { ...message(40, 1, "user", "retry safely"), operation_status: "failed", operation_id: "failed-op" },
+      message(41, 1, "system", "internal failure"),
+    ]);
+    api.retryMessage = async () => { throw new HttpError("employee_unavailable", 503); };
+    const { wrapper, store } = await renderChat(api);
+    const result = await store.retry();
+    await flushPromises();
+    expect(result).toBe(false);
+    expect(store.operation?.status).toBe("failed");
+    expect(store.errorCode).toBe("employee_unavailable");
+    await wrapper.find('[data-testid="retry-message"]').trigger("click");
+    await flushPromises();
+    expect(wrapper.text()).toContain("重试未启动");
   });
 
   it("uses the same strict Etsy URL rules as the backend", async () => {
