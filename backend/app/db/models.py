@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from enum import Enum as PythonEnum
 from typing import Any, TypeVar
 
-from sqlalchemy import JSON, BigInteger, DateTime, Enum, ForeignKey, Integer, String, Text, TypeDecorator
+from sqlalchemy import JSON, BigInteger, CheckConstraint, DateTime, Enum, ForeignKey, Integer, String, Text, TypeDecorator
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.chat.schemas import MessageRole
@@ -170,12 +170,47 @@ class JobEvent(Base):
     excel_job: Mapped[ExcelJob] = relationship(back_populates="events")
 
 
-class KnowledgeCandidate(TimestampMixin, Base):
-    __tablename__ = "knowledge_candidates"
+class CompetitorEvidence(Base):
+    __tablename__ = "competitor_evidence"
+    __table_args__ = (
+        CheckConstraint("public_id GLOB 'ev-[0-9a-f][0-9a-f]*' AND length(public_id)=35", name="ck_evidence_public_id"),
+        CheckConstraint("canonical_url LIKE 'https://www.etsy.com/listing/%'", name="ck_evidence_url"),
+        CheckConstraint("length(content_hash)=64 AND content_hash NOT GLOB '*[^0-9a-f]*'", name="ck_evidence_hash"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    public_id: Mapped[str] = mapped_column(String(35), unique=True, index=True, nullable=False)
+    canonical_url: Mapped[str] = mapped_column(String(2048), nullable=False)
+    source_key: Mapped[str] = mapped_column(String(255), index=True, nullable=False)
+    title: Mapped[str] = mapped_column(String(500), nullable=False)
+    snapshot: Mapped[str] = mapped_column(Text, nullable=False)
+    tags: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    source_timestamp: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now, nullable=False)
+
+
+class KnowledgeCandidate(TimestampMixin, Base):
+    __tablename__ = "knowledge_candidates"
+    __table_args__ = (
+        CheckConstraint("public_id IS NULL OR (public_id GLOB 'kc-[0-9a-f][0-9a-f]*' AND length(public_id)=35)", name="ck_candidate_public_id"),
+        CheckConstraint("confidence IS NULL OR (confidence >= 0 AND confidence <= 1)", name="ck_candidate_confidence"),
+        CheckConstraint("revision >= 0", name="ck_candidate_revision"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    public_id: Mapped[str | None] = mapped_column(String(35), unique=True, index=True)
     title: Mapped[str] = mapped_column(String(255), nullable=False)
     proposal: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    kind: Mapped[str | None] = mapped_column(String(127), index=True)
+    abstract_summary: Mapped[str | None] = mapped_column(Text)
+    confidence: Mapped[float | None] = mapped_column()
+    evidence_ids: Mapped[list[str] | None] = mapped_column(JSON)
+    source_timestamps: Mapped[dict[str, str] | None] = mapped_column(JSON)
+    conversation_id: Mapped[int | None] = mapped_column(ForeignKey("conversations.id", ondelete="SET NULL"))
+    message_id: Mapped[int | None] = mapped_column(ForeignKey("messages.id", ondelete="SET NULL"))
+    trace_id: Mapped[str | None] = mapped_column(String(127), index=True)
+    revision: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     status: Mapped[KnowledgeStatus] = mapped_column(
         strict_enum(KnowledgeStatus, "ck_knowledge_candidates_status"),
         default=KnowledgeStatus.PROPOSED,
@@ -194,10 +229,14 @@ class KnowledgePattern(TimestampMixin, Base):
     __tablename__ = "knowledge_patterns"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    public_id: Mapped[str | None] = mapped_column(String(36), unique=True, index=True)
     source_candidate_id: Mapped[int | None] = mapped_column(
         ForeignKey("knowledge_candidates.id", ondelete="SET NULL")
     )
     name: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    kind: Mapped[str | None] = mapped_column(String(127), unique=True, index=True)
+    abstract_summary: Mapped[str | None] = mapped_column(Text)
+    revision: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     pattern: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     status: Mapped[KnowledgeStatus] = mapped_column(
         strict_enum(KnowledgeStatus, "ck_knowledge_patterns_status"),
@@ -217,6 +256,7 @@ class RuleVersion(Base):
     __tablename__ = "rule_versions"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    public_id: Mapped[str | None] = mapped_column(String(36), unique=True, index=True)
     pattern_id: Mapped[int] = mapped_column(
         ForeignKey("knowledge_patterns.id", ondelete="CASCADE"), nullable=False
     )
@@ -224,6 +264,7 @@ class RuleVersion(Base):
         ForeignKey("knowledge_candidates.id", ondelete="SET NULL")
     )
     version: Mapped[str] = mapped_column(String(127), nullable=False, unique=True)
+    sequence: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     rules: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     status: Mapped[KnowledgeStatus] = mapped_column(
         strict_enum(KnowledgeStatus, "ck_rule_versions_status"), nullable=False
@@ -238,6 +279,11 @@ class FeedbackEvent(Base):
     __tablename__ = "feedback_events"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    public_id: Mapped[str | None] = mapped_column(String(36), unique=True, index=True)
+    knowledge_candidate_id: Mapped[int | None] = mapped_column(ForeignKey("knowledge_candidates.id", ondelete="CASCADE"), index=True)
+    feedback_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    row_id: Mapped[str | None] = mapped_column(String(128), index=True)
+    accepted: Mapped[bool | None] = mapped_column()
     conversation_id: Mapped[int | None] = mapped_column(
         ForeignKey("conversations.id", ondelete="SET NULL")
     )

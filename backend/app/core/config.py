@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     max_worker_event_bytes: int = 64 * 1024
     excel_cancel_timeout_seconds: float = 5.0
     excel_worker_timeout_seconds: float = 900.0
+    originality_threshold: float = Field(default=0.72, ge=0.1, le=1)
 
     @property
     def resolved_database_url(self) -> str:

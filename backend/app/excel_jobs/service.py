@@ -32,6 +32,7 @@ from app.excel_jobs.storage import (
     safe_path,
     validate_artifact,
 )
+from app.knowledge.service import KnowledgeService
 
 
 TERMINAL = {JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED}
@@ -71,10 +72,11 @@ class JobView:
 
 
 class ExcelJobService:
-    def __init__(self, factory: sessionmaker[Session], runner: ExcelRunner, settings: Settings) -> None:
+    def __init__(self, factory: sessionmaker[Session], runner: ExcelRunner, settings: Settings, knowledge_service: KnowledgeService | None = None) -> None:
         self.factory = factory
         self.runner = runner
         self.settings = settings
+        self.knowledge_service = knowledge_service
         self.root = (settings.data_dir / "excel-jobs").resolve()
         self._tasks: dict[str, asyncio.Task] = {}
         self._lock = asyncio.Lock()
@@ -235,7 +237,11 @@ class ExcelJobService:
             source = safe_path(workspace / "source" / "source.xlsx", workspace, must_exist=True)
             operation = create_operation_dir(workspace, uuid4().hex)
             rules = ensure_default_rules(workspace)
-            trust = ensure_empty_knowledge_export(self.settings.data_dir)
+            trust = (
+                self.knowledge_service.export_active_knowledge(operation / "active-knowledge.json")
+                if self.knowledge_service is not None
+                else ensure_empty_knowledge_export(self.settings.data_dir)
+            )
             request = RunnerRequest(
                 public_id=public_id,
                 source_path=source,

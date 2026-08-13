@@ -8,10 +8,11 @@ from uuid import uuid4
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.db.models import Attachment, Conversation, KnowledgeCandidate, Message
+from app.db.models import Attachment, Conversation, Message
 from app.employee.adapter import HermesAdapter, HermesAdapterError
 from app.employee.events import parse_final_envelopes
-from app.knowledge.schemas import KnowledgeStatus
+from app.knowledge.schemas import CandidateInput, EvidenceReference
+from app.knowledge.service import KnowledgeService
 
 
 class ConversationNotFoundError(LookupError):
@@ -36,10 +37,12 @@ class Operation:
 
 class ChatService:
     def __init__(
-        self, session_factory: sessionmaker[Session], employee: HermesAdapter
+        self, session_factory: sessionmaker[Session], employee: HermesAdapter,
+        knowledge_service: KnowledgeService | None = None,
     ) -> None:
         self.session_factory = session_factory
         self.employee = employee
+        self.knowledge_service = knowledge_service
         self.operations: dict[str, Operation] = {}
         self.active_conversations: set[int] = set()
         self._guard = asyncio.Lock()
@@ -214,17 +217,15 @@ class ChatService:
                     operation_status="completed",
                 )
                 session.add(assistant)
-                for envelope in parsed.envelopes:
-                    payload = envelope["payload"]
-                    session.add(
-                        KnowledgeCandidate(
-                            title=payload["summary"][:255],
-                            proposal=payload,
-                            status=KnowledgeStatus.PROPOSED,
-                        )
-                    )
                 session.commit()
                 assistant_id = assistant.id
+            if self.knowledge_service is not None:
+                for envelope in parsed.envelopes:
+                    self._ingest_candidate_event(
+                        envelope["payload"],
+                        operation=operation,
+                        message_id=assistant_id,
+                    )
             operation.event = {
                 "type": "final",
                 "status": "completed",
@@ -240,6 +241,44 @@ class ChatService:
             self.active_conversations.discard(operation.conversation_id)
             operation.done.set()
             self._evict_terminal_operations()
+
+    def _ingest_candidate_event(self, payload: dict, *, operation: Operation, message_id: int) -> None:
+        """A malformed employee learning event is non-fatal to the visible chat final."""
+        try:
+            timestamps = payload.get("source_timestamps", {})
+            references = [
+                EvidenceReference(
+                    evidence_id=evidence_id,
+                    source_timestamp=timestamps[evidence_id],
+                )
+                for evidence_id in payload.get("evidence_ids", [])
+            ]
+            candidate = CandidateInput(
+                kind=payload["kind"],
+                abstract=payload["summary"],
+                confidence=payload["confidence"],
+                evidence_refs=references,
+            )
+            self.knowledge_service.ingest_candidate(
+                candidate,
+                actor="employee",
+                trace_id=operation.id,
+                conversation_id=operation.conversation_id,
+                message_id=message_id,
+            )
+        except Exception as exc:
+            # Employee envelopes are untrusted suggestions. Rejection must never roll back
+            # the durable assistant response or reveal raw event data through logs/errors.
+            reason = "unknown_evidence" if "evidence" in str(exc).casefold() else "invalid_schema"
+            try:
+                self.knowledge_service.audit_candidate_event_rejection(
+                    actor="employee",
+                    trace_id=operation.id,
+                    reason=reason,
+                )
+            except Exception:
+                pass
+            return
 
     def _evict_terminal_operations(self) -> None:
         overflow = len(self.operations) - self.operation_broker_limit

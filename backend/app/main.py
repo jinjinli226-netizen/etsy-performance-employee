@@ -7,6 +7,7 @@ from fastapi import FastAPI
 
 from app.api.chat import router as chat_router
 from app.api.excel_jobs import router as excel_jobs_router
+from app.api.knowledge import router as knowledge_router
 from app.chat.service import ChatService
 from app.core.config import Settings, get_settings
 from app.db.init_db import init_db
@@ -14,6 +15,7 @@ from app.db.session import create_engine_for_url, create_session_factory
 from app.employee.adapter import HermesAdapter, SubprocessHermesAdapter
 from app.excel_jobs.runner import ExcelRunner, SubprocessExcelRunner
 from app.excel_jobs.service import ExcelJobService
+from app.knowledge.service import KnowledgeService
 
 
 def create_app(
@@ -40,7 +42,12 @@ def create_app(
         app.state.settings = runtime_settings
         app.state.engine = engine
         app.state.session_factory = factory
-        app.state.chat_service = ChatService(factory, runtime_employee)
+        app.state.knowledge_service = KnowledgeService(
+            factory,
+            export_dir=runtime_settings.data_dir / "trust",
+            originality_threshold=runtime_settings.originality_threshold,
+        )
+        app.state.chat_service = ChatService(factory, runtime_employee, app.state.knowledge_service)
         app.state.chat_service.reconcile_interrupted_operations()
         runtime_excel_runner = excel_runner or SubprocessExcelRunner(
             repository_root=Path(__file__).resolve().parents[2],
@@ -48,7 +55,12 @@ def create_app(
             cancel_timeout_seconds=runtime_settings.excel_cancel_timeout_seconds,
             worker_timeout_seconds=runtime_settings.excel_worker_timeout_seconds,
         )
-        app.state.excel_job_service = ExcelJobService(factory, runtime_excel_runner, runtime_settings)
+        app.state.excel_job_service = ExcelJobService(
+            factory,
+            runtime_excel_runner,
+            runtime_settings,
+            app.state.knowledge_service,
+        )
         app.state.excel_job_service.reconcile_interrupted_jobs()
         try:
             yield
@@ -71,6 +83,7 @@ def create_app(
 
     application.include_router(chat_router)
     application.include_router(excel_jobs_router)
+    application.include_router(knowledge_router)
     return application
 
 

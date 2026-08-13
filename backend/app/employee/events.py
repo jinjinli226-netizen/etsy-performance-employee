@@ -17,6 +17,7 @@ class KnowledgeCandidatePayload(BaseModel):
     summary: str = Field(min_length=1, max_length=2000)
     confidence: float = Field(ge=0, le=1)
     evidence_ids: list[str] = Field(default_factory=list, max_length=100)
+    source_timestamps: dict[str, str] = Field(default_factory=dict)
 
 
 @dataclass(frozen=True)

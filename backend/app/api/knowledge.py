@@ -1,0 +1,81 @@
+from __future__ import annotations
+
+from fastapi import APIRouter, HTTPException, Query, Request
+
+from app.knowledge.schemas import CandidatePage, KnowledgeStatus, PatternPage, PatternTransitionRead
+from app.knowledge.service import KnowledgeConflictError, KnowledgeNotFoundError, KnowledgeService, KnowledgeValidationError
+
+
+router = APIRouter(prefix="/api/knowledge", tags=["knowledge"])
+
+
+def service(request: Request) -> KnowledgeService:
+    return request.app.state.knowledge_service
+
+
+@router.get("", response_model=PatternPage)
+def list_active_patterns(
+    request: Request,
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    kind: str | None = Query(None, min_length=1, max_length=127),
+):
+    return service(request).list_active(limit=limit, offset=offset, kind=kind)
+
+
+@router.get("/candidates", response_model=CandidatePage)
+def list_candidates(
+    request: Request,
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    status: KnowledgeStatus | None = None,
+):
+    return service(request).list_candidates(limit=limit, offset=offset, status=status)
+
+
+def _transition(service_: KnowledgeService, pattern_id: int) -> PatternTransitionRead:
+    # Activation endpoints only need the safe abstract response. Internal numeric id is
+    # retained as the resource id used by rollback.
+    with service_.session_factory() as session:
+        from app.db.models import KnowledgePattern, RuleVersion
+        from sqlalchemy import select
+        stored = session.get(KnowledgePattern, pattern_id)
+        if stored is None:
+            raise KnowledgeNotFoundError
+        version = session.scalar(select(RuleVersion).where(RuleVersion.pattern_id == pattern_id, RuleVersion.status == KnowledgeStatus.ACTIVE).order_by(RuleVersion.sequence.desc()))
+        if version is None:
+            raise KnowledgeConflictError("pattern has no active version")
+        return PatternTransitionRead(id=stored.id, public_id=stored.public_id or str(stored.id), kind=stored.kind or stored.name, abstract=stored.abstract_summary or "", rule_version=version.version, status=stored.status)
+
+
+@router.post("/candidates/{candidate_id}/approve", response_model=PatternTransitionRead)
+def approve_candidate(candidate_id: int, request: Request):
+    active = service(request)
+    try:
+        pattern = active.approve_candidate(candidate_id, actor="owner")
+        return _transition(active, pattern.id)
+    except KnowledgeNotFoundError as exc:
+        raise HTTPException(404, "Knowledge candidate not found") from exc
+    except (KnowledgeConflictError, KnowledgeValidationError) as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@router.post("/candidates/{candidate_id}/reject")
+def reject_candidate(candidate_id: int, request: Request):
+    try:
+        candidate = service(request).reject_candidate(candidate_id, actor="owner")
+        return {"id": candidate.id, "status": candidate.status}
+    except KnowledgeNotFoundError as exc:
+        raise HTTPException(404, "Knowledge candidate not found") from exc
+    except KnowledgeConflictError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@router.post("/patterns/{pattern_id}/rollback", response_model=PatternTransitionRead)
+def rollback_pattern(pattern_id: int, request: Request):
+    try:
+        return service(request).rollback_pattern(pattern_id, actor="owner")
+    except KnowledgeNotFoundError as exc:
+        raise HTTPException(404, "Knowledge pattern not found") from exc
+    except KnowledgeConflictError as exc:
+        raise HTTPException(409, str(exc)) from exc

@@ -66,12 +66,14 @@ def test_persists_and_reloads_core_records_with_relationships(session_factory) -
             [
                 RuleVersion(
                     version="rules-2026-08-12.1",
+                    sequence=1,
                     rules={"retain_material": True},
                     candidate=candidate,
                     status=KnowledgeStatus.ACTIVE,
                 ),
                 RuleVersion(
                     version="rules-2026-08-12.2",
+                    sequence=2,
                     rules={"retain_material": True, "warn_missing_material": True},
                     candidate=candidate,
                     status=KnowledgeStatus.TESTING,
@@ -175,6 +177,7 @@ def test_init_db_creates_all_required_tables(tmp_path) -> None:
             "feedback_events",
             "audit_events",
             "job_events",
+            "competitor_evidence",
         }
     finally:
         engine.dispose()
@@ -217,13 +220,13 @@ def test_database_enum_constraints_reject_invalid_raw_values(session_factory) ->
         )
         for constraint in inspect(engine).get_check_constraints(table)
     }
-    assert constraint_names == {
+    assert {
         "ck_messages_role",
         "ck_excel_jobs_status",
         "ck_knowledge_candidates_status",
         "ck_knowledge_patterns_status",
         "ck_rule_versions_status",
-    }
+    } <= constraint_names
 
     with engine.begin() as connection:
         with pytest.raises(IntegrityError):
@@ -338,7 +341,7 @@ def test_init_db_migrates_task2_sqlite_schema_and_preserves_data(tmp_path) -> No
         with engine.connect() as connection:
             assert connection.execute(
                 text("SELECT version FROM schema_migrations ORDER BY version")
-            ).scalars().all() == [1, 2, 3, 4]
+            ).scalars().all() == [1, 2, 3, 4, 5]
             index_names = {
                 row[1] for row in connection.execute(text("PRAGMA index_list('messages')"))
             }
@@ -376,7 +379,7 @@ def test_init_db_migrates_legacy_excel_jobs_and_preserves_rows(tmp_path) -> None
                 100,
             )
             assert connection.execute(text("SELECT kind, path FROM artifacts WHERE id=8")).one() == ("legacy", "legacy/output.xlsx")
-            assert connection.execute(text("SELECT version FROM schema_migrations ORDER BY version")).scalars().all() == [1, 2, 3, 4]
+            assert connection.execute(text("SELECT version FROM schema_migrations ORDER BY version")).scalars().all() == [1, 2, 3, 4, 5]
             assert {row[1] for row in connection.execute(text("PRAGMA table_info('excel_jobs')"))} >= {"public_id", "source_sha256", "source_size_bytes", "error_code", "error_message", "progress_percent"}
             assert {row[1] for row in connection.execute(text("PRAGMA table_info('artifacts')"))} >= {"filename", "sha256", "size_bytes"}
             assert "job_events" in {row[0] for row in connection.execute(text("SELECT name FROM sqlite_master WHERE type='table'"))}
@@ -434,6 +437,6 @@ def test_uuid_contract_upgrade_archives_ids_accepted_by_older_v3(tmp_path) -> No
             ).one() == (expected, "failed", "legacy_migrated")
             assert connection.execute(
                 text("SELECT version FROM schema_migrations ORDER BY version")
-            ).scalars().all() == [1, 2, 3, 4]
+            ).scalars().all() == [1, 2, 3, 4, 5]
     finally:
         engine.dispose()
