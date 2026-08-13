@@ -16,7 +16,9 @@ function Set-EmployeeRuntimeEnvironment {
     foreach ($name in @(
         "ETSY_EMPLOYEE_DATABASE_URL",
         "ETSY_EMPLOYEE_TEST_MODE",
-        "ETSY_EMPLOYEE_MIGRATION_CAPABILITY"
+        "ETSY_EMPLOYEE_MIGRATION_CAPABILITY",
+        "ETSY_E2E_BACKEND",
+        "ETSY_E2E_TEST_MODE"
     )) {
         Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
     }

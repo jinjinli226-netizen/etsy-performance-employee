@@ -45,7 +45,7 @@ export default defineConfig({
       url: "http://127.0.0.1:54173/chat",
       reuseExistingServer: false,
       timeout: 30_000,
-      env: { ETSY_E2E_BACKEND: "http://127.0.0.1:58765" },
+      env: { ETSY_E2E_BACKEND: "http://127.0.0.1:58765", ETSY_E2E_TEST_MODE: "1" },
     },
   ],
   metadata: { repositoryDir, dataDir, manifestPath },

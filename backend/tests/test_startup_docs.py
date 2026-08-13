@@ -103,7 +103,8 @@ def test_startup_child_environment_ignores_conflicting_parent_values(tmp_path: P
     child.write_text(
         "[ordered]@{data=$env:ETSY_EMPLOYEE_DATA_DIR; database=$env:ETSY_EMPLOYEE_DATABASE_URL; "
         "executable=$env:ETSY_EMPLOYEE_HERMES_EXECUTABLE; profile=$env:ETSY_EMPLOYEE_HERMES_PROFILE; "
-        "home=$env:HERMES_HOME; testMode=$env:ETSY_EMPLOYEE_TEST_MODE} | "
+        "home=$env:HERMES_HOME; testMode=$env:ETSY_EMPLOYEE_TEST_MODE; "
+        "e2eBackend=$env:ETSY_E2E_BACKEND; e2eMode=$env:ETSY_E2E_TEST_MODE} | "
         "ConvertTo-Json | Set-Content -LiteralPath $args[0] -Encoding utf8",
         encoding="utf-8-sig",
     )
@@ -112,7 +113,7 @@ def test_startup_child_environment_ignores_conflicting_parent_values(tmp_path: P
         "$env:ETSY_EMPLOYEE_DATABASE_URL='sqlite:///C:/wrong.db'; "
         "$env:ETSY_EMPLOYEE_HERMES_EXECUTABLE='C:\\wrong-hermes.exe'; "
         "$env:ETSY_EMPLOYEE_HERMES_PROFILE='wrong-profile'; $env:HERMES_HOME='C:\\wrong-home'; "
-        "$env:ETSY_EMPLOYEE_TEST_MODE='1'; "
+        "$env:ETSY_EMPLOYEE_TEST_MODE='1'; $env:ETSY_E2E_BACKEND='http://evil.invalid'; $env:ETSY_E2E_TEST_MODE='1'; "
         f". '{START_ENV}'; Set-EmployeeRuntimeEnvironment -DataDirectory '{data_dir}' "
         f"-HermesExecutable '{hermes}' -HermesHome '{hermes_home}'; "
         f"& '{powershell_executable}' -NoProfile -NonInteractive -File '{child}' '{capture}'"
@@ -131,6 +132,8 @@ def test_startup_child_environment_ignores_conflicting_parent_values(tmp_path: P
     assert captured["profile"] == "etsy-performance-us"
     assert Path(captured["home"]) == hermes_home
     assert captured["testMode"] is None
+    assert captured["e2eBackend"] is None
+    assert captured["e2eMode"] is None
 
 
 def test_start_script_uses_resolved_hermes_and_canonical_environment() -> None:
@@ -163,6 +166,8 @@ def test_startup_builds_and_serves_the_production_frontend_with_local_api_proxy(
     assert "preview:" in vite and "server:" in vite
     assert '"/api"' in vite
     assert '"http://127.0.0.1:8765"' in vite
+    assert 'process.env.ETSY_E2E_TEST_MODE === "1"' in vite
+    assert "ETSY_E2E_BACKEND" in vite
 
 
 def test_chinese_readme_documents_truthful_setup_start_stop_and_storage() -> None:

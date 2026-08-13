@@ -1,7 +1,9 @@
 import { configDefaults, defineConfig } from "vitest/config";
 import vue from "@vitejs/plugin-vue";
 
-const apiTarget = process.env.ETSY_E2E_BACKEND ?? "http://127.0.0.1:8765";
+const apiTarget = process.env.ETSY_E2E_TEST_MODE === "1"
+  ? process.env.ETSY_E2E_BACKEND ?? "http://127.0.0.1:8765"
+  : "http://127.0.0.1:8765";
 
 export default defineConfig({
   plugins: [vue()],
