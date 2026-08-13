@@ -240,15 +240,26 @@ class ChatService:
                 )
                 if user_message:
                     user_message.operation_status = "completed"
+                def evidence_ids(value):
+                    if isinstance(value, dict):
+                        for key, child in value.items():
+                            if key == "evidence_ids" and isinstance(child, list):
+                                yield from (item for item in child if isinstance(item, str))
+                            else:
+                                yield from evidence_ids(child)
+                    elif isinstance(value, list):
+                        for child in value:
+                            yield from evidence_ids(child)
+                assistant_evidence_ids = sorted(set(evidence_ids([envelope.get("payload", {}) for envelope in parsed.envelopes]))) if operation.learning_mode else []
                 assistant = Message(
                     conversation_id=operation.conversation_id,
                     role="assistant",
                     content=parsed.visible_text,
                     operation_id=operation.id,
                     operation_status="completed",
-                    evidence_bound=operation.learning_mode,
-                    contains_evidence_control=operation.learning_mode and bool(parsed.envelopes),
-                    evidence_ids=sorted({evidence_id for envelope in parsed.envelopes for evidence_id in envelope.get("payload", {}).get("evidence_ids", []) if isinstance(evidence_id, str)}) if operation.learning_mode else [],
+                    evidence_bound=bool(assistant_evidence_ids),
+                    contains_evidence_control=bool(assistant_evidence_ids),
+                    evidence_ids=assistant_evidence_ids,
                 )
                 session.add(assistant)
                 session.commit()

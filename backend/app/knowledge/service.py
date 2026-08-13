@@ -709,6 +709,11 @@ class KnowledgeService:
                 (item.public_id, self.originality.fingerprint_texts([item.title, item.snapshot, *item.tags]))
                 for item in session.scalars(select(CompetitorEvidence).order_by(CompetitorEvidence.public_id))
             ]
+            imported = list(session.scalars(select(ImportedEvidenceFingerprint).order_by(ImportedEvidenceFingerprint.public_id)))
+            known = {item[0] for item in evidence}
+            evidence.extend((item.public_id, item.shingles) for item in imported if item.public_id not in known)
+        threshold = min([self.originality.threshold, *(item.threshold for item in imported)])
+        originality = OriginalityGuard(threshold=threshold)
         if not evidence:
             return
         try:
@@ -725,7 +730,7 @@ class KnowledgeService:
                         continue
                     for row_number in range(header_row + 1, sheet.max_row + 1):
                         generated = {field: sheet.cell(row_number, columns[header]).value or "" for header, field in fixed.items()}
-                        result = self.originality.check_fingerprints(generated.values(), evidence)
+                        result = originality.check_fingerprints(generated.values(), evidence)
                         if not result.passed:
                             raise KnowledgeValidationError(
                                 json.dumps({"code": "originality_failed", "score": result.max_score, "evidence_id": result.evidence_id}, separators=(",", ":"))

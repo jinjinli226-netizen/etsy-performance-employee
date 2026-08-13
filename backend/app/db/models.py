@@ -319,6 +319,9 @@ class AuditEvent(Base):
 
 class ImportedEvidenceFingerprint(Base):
     __tablename__ = "imported_evidence_fingerprints"
+    __table_args__ = (
+        CheckConstraint("threshold >= 0.1 AND threshold <= 1", name="ck_imported_evidence_threshold"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     public_id: Mapped[str] = mapped_column(String(35), unique=True, index=True, nullable=False)

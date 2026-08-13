@@ -33,8 +33,8 @@ from app.migration.exporter import ExportError, MigrationExporter
 from app.migration.importer import ImportConflict, ImportValidationError, MigrationImporter
 from app.migration.secrets import SensitiveDataError, scan_for_secrets
 from app.core.config import Settings
-from app.migration.capability import create_capability_file, remove_owned_capability_file
-from app.migration.contracts import MessageRecord
+from app.migration.capability import _validate_windows_acl_snapshot, create_capability_file, remove_owned_capability_file
+from app.migration.contracts import GuardRecord, ManifestRecord, MessageRecord
 from pydantic import ValidationError
 
 
@@ -246,6 +246,29 @@ def test_contracts_reject_json_type_coercion_and_non_zulu_time() -> None:
             MessageRecord.model_validate_json(json.dumps({**valid, **patch}))
 
 
+def test_guard_thresholds_are_finite_bounded_and_match_manifest(tmp_path: Path) -> None:
+    base_guard = {"id": "ev-" + "1" * 32, "source_timestamp": "2026-08-13T00:00:00Z", "content_hash": None, "snapshot_hash": None, "shingles": [], "threshold": .72}
+    for invalid in (0, float("nan"), float("inf")):
+        with pytest.raises(ValidationError):
+            GuardRecord.model_validate({**base_guard, "threshold": invalid})
+    manifest = {"schema_version": 1, "profile_id": "etsy-performance-us", "app_version": "0.1.0", "package_id": "pkg-" + "a" * 32, "created_at": "2026-08-13T00:00:00Z", "content_sha256": "a" * 64, "credential_status": "pending", "raw_competitor_evidence_included": False, "attachments_included": False, "guard_threshold": float("nan"), "record_counts": {}, "files": [{"path": "x", "sha256": "a" * 64, "size": 0, "mode": "0644"}]}
+    with pytest.raises(ValidationError):
+        ManifestRecord.model_validate(manifest)
+    package, _ = _export(tmp_path)
+    attacked = _rewrite_jsonl(package, tmp_path / "threshold.zip", "data/evidence_guard.jsonl", lambda row: {**row, "threshold": .71})
+    _, factory = _database(tmp_path / "threshold-target.db")
+    with pytest.raises(ImportValidationError, match="threshold"):
+        MigrationImporter(factory, repository_assets=tmp_path / "repo" / "employee", workspace=tmp_path / "imports").import_package(attacked, dry_run=True)
+
+
+def test_message_evidence_provenance_is_fail_closed(tmp_path: Path) -> None:
+    package, _ = _export(tmp_path)
+    attacked = _rewrite_jsonl(package, tmp_path / "message.zip", "data/messages.jsonl", lambda row: {**row, "evidence_bound": True, "content": "raw teaching text", "evidence_ids": []})
+    _, factory = _database(tmp_path / "message-target.db")
+    with pytest.raises(ImportValidationError, match="provenance"):
+        MigrationImporter(factory, repository_assets=tmp_path / "repo" / "employee", workspace=tmp_path / "imports").import_package(attacked, dry_run=True)
+
+
 def test_imported_fingerprints_feed_runtime_originality_guard(tmp_path: Path) -> None:
     package, _ = _export(tmp_path)
     _, factory = _database(tmp_path / "target.db")
@@ -318,6 +341,26 @@ def test_imported_guard_uses_strictest_threshold(tmp_path: Path) -> None:
     service = KnowledgeService(factory, export_dir=tmp_path / "trust", originality_threshold=.99)
     envelope = json.loads(service.export_evidence_guard(tmp_path / "guard.json").path.read_text(encoding="utf-8"))
     assert envelope["threshold"] == .72
+
+
+def test_imported_fingerprint_blocks_similar_workbook_but_allows_original(tmp_path: Path) -> None:
+    package, _ = _export(tmp_path)
+    _, factory = _database(tmp_path / "fingerprint-target.db")
+    MigrationImporter(factory, repository_assets=tmp_path / "repo" / "employee", workspace=tmp_path / "imports").import_package(package)
+    service = KnowledgeService(factory, export_dir=tmp_path / "trust", originality_threshold=.99)
+    for name, title, should_fail in (("similar.xlsx", "Crystal dance costume with fringe stage sparkle", True), ("original.xlsx", "Handmade sapphire blue lyrical performance outfit", False)):
+        workbook = __import__("openpyxl").Workbook()
+        sheet = workbook.active
+        sheet.append(["head titles", "SPECIFICATION", "Instructions for buyers"])
+        sheet.append([title, "Made to order sizing", "Confirm measurements before purchase"])
+        path = tmp_path / name
+        workbook.save(path)
+        workbook.close()
+        if should_fail:
+            with pytest.raises(KnowledgeValidationError, match="originality_failed"):
+                service.validate_generated_workbook(path)
+        else:
+            service.validate_generated_workbook(path)
 
 
 def test_dry_run_rejects_broken_relationship_before_database_write(tmp_path: Path) -> None:
@@ -417,6 +460,15 @@ def test_capability_file_is_random_private_and_owner_cleanup_is_bounded(tmp_path
     first.path.write_text(token, encoding="ascii")
     remove_owned_capability_file(first)
     assert not first.path.exists()
+
+
+def test_windows_capability_acl_rejects_unexpected_allow_rules() -> None:
+    sid = "S-1-5-21-123"
+    _validate_windows_acl_snapshot({"protected": True, "allows": [sid, "S-1-5-18"]}, sid)
+    with pytest.raises(RuntimeError, match="ACL"):
+        _validate_windows_acl_snapshot({"protected": True, "allows": [sid, "S-1-1-0"]}, sid)
+    script = (Path(__file__).parents[2] / "scripts" / "package-employee.ps1").read_text(encoding="utf-8")
+    assert "unexpectedAllows" in script and "AreAccessRulesProtected" in script
 
 
 def test_export_api_persists_manifest_hash_and_refuses_symlink_download(tmp_path: Path) -> None:

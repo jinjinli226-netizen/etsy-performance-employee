@@ -7,6 +7,7 @@ import stat
 import subprocess
 import csv
 import io
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -29,14 +30,34 @@ def _lock_windows_acl(path: Path) -> None:
     if len(rows) != 1 or len(rows[0]) < 2 or not rows[0][1].startswith("S-"):
         raise RuntimeError("could not resolve the current Windows SID")
     sid = rows[0][1]
+    for principal in ("*S-1-1-0", "*S-1-5-11", "*S-1-5-32-545", "*S-1-5-32-544"):
+        subprocess.run(
+            ["icacls.exe", str(path), "/remove:g", principal],
+            check=False, capture_output=True, text=True, timeout=5,
+        )
     subprocess.run(
         ["icacls.exe", str(path), "/inheritance:r", "/grant:r", f"*{sid}:(R,W)"],
         check=True, capture_output=True, text=True, timeout=10,
     )
-    subprocess.run(
-        ["icacls.exe", str(path), "/verify"], check=True,
-        capture_output=True, text=True, timeout=5,
+    escaped = str(path).replace("'", "''")
+    acl_script = (
+        f"$acl=Get-Acl -LiteralPath '{escaped}'; "
+        "$allows=@($acl.Access|Where-Object AccessControlType -eq 'Allow'|ForEach-Object "
+        "{$_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value}); "
+        "[pscustomobject]@{protected=$acl.AreAccessRulesProtected;allows=$allows}|ConvertTo-Json -Compress"
     )
+    snapshot = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", acl_script], check=True,
+        capture_output=True, text=True, timeout=5,
+    ).stdout
+    _validate_windows_acl_snapshot(json.loads(snapshot), sid)
+
+
+def _validate_windows_acl_snapshot(snapshot: dict[str, object], current_sid: str) -> None:
+    raw = snapshot.get("allows", [])
+    allows = {raw} if isinstance(raw, str) else set(raw) if isinstance(raw, list) else set()
+    if snapshot.get("protected") is not True or current_sid not in allows or not allows.issubset({current_sid, "S-1-5-18"}):
+        raise RuntimeError("migration capability ACL verification failed")
 
 
 def create_capability_file(data_dir: Path, explicit_token: str | None = None) -> OwnedCapability:

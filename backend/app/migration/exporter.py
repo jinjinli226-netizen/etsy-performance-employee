@@ -245,6 +245,7 @@ class MigrationExporter:
             feedback = list(session.scalars(select(FeedbackEvent).order_by(FeedbackEvent.public_id, FeedbackEvent.id)))
             audits = list(session.scalars(select(AuditEvent).order_by(AuditEvent.created_at, AuditEvent.id)))
             evidence = list(session.scalars(select(CompetitorEvidence).order_by(CompetitorEvidence.public_id)))
+            evidence_by_url = {item.canonical_url: item.public_id for item in evidence}
             # Scan source values before redaction so credentials cannot be hidden by a later transform.
             try:
                 scan_for_secrets([x.content for x in messages])
@@ -260,15 +261,26 @@ class MigrationExporter:
 
             records: dict[str, list[dict[str, Any]]] = {
                 "conversations": [{"id": conversation_ids[x.id], "title": x.title, "created_at": _timestamp(x.created_at), "updated_at": _timestamp(x.updated_at)} for x in conversations],
-                "messages": [{"id": message_ids[x.id], "conversation_id": conversation_ids[x.conversation_id], "role": x.role.value if hasattr(x.role, "value") else str(x.role), "content": "[evidence content omitted]" if x.evidence_bound or x.contains_evidence_control else _redact_portable_text(x.content), "evidence_bound": bool(x.evidence_bound), "contains_evidence_control": bool(x.contains_evidence_control), "evidence_ids": sorted(x.evidence_ids or []), "created_at": _timestamp(x.created_at)} for x in messages],
+                "messages": [],
                 "attachments": [{"id": _public("attachment", None, f"attachment:{x.id}:{x.created_at.isoformat()}"), "conversation_id": conversation_ids[x.conversation_id], "filename": Path(x.filename).name, "media_type": x.media_type, "content_included": False, "created_at": _timestamp(x.created_at)} for x in attachments],
-                "knowledge_candidates": [{"id": candidate_ids[x.id], "title": x.title, "kind": x.kind, "abstract_summary": x.abstract_summary, "proposal": x.proposal, "confidence": x.confidence, "evidence_ids": sorted(x.evidence_ids or []), "source_timestamps": x.source_timestamps or {}, "conversation_id": conversation_ids.get(x.conversation_id), "message_id": message_ids.get(x.message_id), "trace_id": x.trace_id, "base_active_rule_public_id": x.base_active_rule_public_id, "base_pattern_revision": x.base_pattern_revision, "revision": x.revision, "status": x.status.value, "created_at": _timestamp(x.created_at), "updated_at": _timestamp(x.updated_at)} for x in candidates],
+                "knowledge_candidates": [{"id": candidate_ids[x.id], "title": x.title, "kind": x.kind, "abstract_summary": x.abstract_summary, "proposal": x.proposal, "confidence": x.confidence, "evidence_ids": sorted(x.evidence_ids or []), "source_timestamps": {key: _timestamp(datetime.fromisoformat(value.replace("Z", "+00:00"))) for key, value in (x.source_timestamps or {}).items()}, "conversation_id": conversation_ids.get(x.conversation_id), "message_id": message_ids.get(x.message_id), "trace_id": x.trace_id, "base_active_rule_public_id": x.base_active_rule_public_id, "base_pattern_revision": x.base_pattern_revision, "revision": x.revision, "status": x.status.value, "created_at": _timestamp(x.created_at), "updated_at": _timestamp(x.updated_at)} for x in candidates],
                 "knowledge_patterns": [{"id": pattern_ids[x.id], "source_candidate_id": candidate_ids.get(x.source_candidate_id), "name": x.name, "kind": x.kind, "abstract_summary": x.abstract_summary, "revision": x.revision, "pattern": x.pattern, "status": x.status.value, "created_at": _timestamp(x.created_at), "updated_at": _timestamp(x.updated_at)} for x in patterns],
                 "rule_versions": [{"id": rule_ids[x.id], "pattern_id": pattern_ids[x.pattern_id], "candidate_id": candidate_ids.get(x.knowledge_candidate_id), "version": x.version, "sequence": x.sequence, "rules": x.rules, "status": x.status.value, "created_at": _timestamp(x.created_at)} for x in rules],
                 "feedback_events": [{"id": _public("feedback", x.public_id, str(x.id)), "candidate_id": candidate_ids.get(x.knowledge_candidate_id), "conversation_id": conversation_ids.get(x.conversation_id), "excel_job_id": x.excel_job_ref or job_ids.get(x.excel_job_id), "unresolved_relationships": (["excel_job_external_reference"] if (x.excel_job_ref or x.excel_job_id) else []), "feedback_id": x.feedback_id, "row_id": x.row_id, "accepted": x.accepted, "event_type": x.event_type, "payload": x.payload, "created_at": _timestamp(x.created_at)} for x in feedback],
                 "audit_events": [],
                 "evidence_guard": [],
             }
+            for item in messages:
+                bound_ids = set(item.evidence_ids or [])
+                if item.evidence_bound:
+                    for url in _ETSY_LISTING.findall(item.content):
+                        canonical = re.sub(r"(/listing/[0-9]+).*", r"\1", url)
+                        if canonical in evidence_by_url:
+                            bound_ids.add(evidence_by_url[canonical])
+                protected = bool(item.evidence_bound or item.contains_evidence_control)
+                if protected and not bound_ids:
+                    raise ExportError("evidence-bound message is missing portable provenance")
+                records["messages"].append({"id": message_ids[item.id], "conversation_id": conversation_ids[item.conversation_id], "role": item.role.value if hasattr(item.role, "value") else str(item.role), "content": "[evidence content omitted]" if protected else _redact_portable_text(item.content), "evidence_bound": bool(item.evidence_bound), "contains_evidence_control": bool(item.contains_evidence_control), "evidence_ids": sorted(bound_ids), "created_at": _timestamp(item.created_at)})
             typed_maps = {"candidate": candidate_ids, "pattern": pattern_ids, "rule": rule_ids, "conversation": conversation_ids, "message": message_ids, "excel_job": job_ids}
             public_values = {kind: set(mapping.values()) for kind, mapping in typed_maps.items()}
             evidence_values = {item.public_id for item in evidence}

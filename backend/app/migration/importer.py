@@ -192,6 +192,14 @@ class MigrationImporter:
             if set(item.evidence_ids) != set(item.source_timestamps):
                 raise ImportValidationError("candidate evidence provenance is invalid")
         guard_ids = {x.id for x in records["evidence_guard"]}
+        if any(item.threshold != manifest["guard_threshold"] for item in records["evidence_guard"]):
+            raise ImportValidationError("evidence guard threshold mismatch")
+        for message in messages.values():
+            protected = message.evidence_bound or message.contains_evidence_control
+            if protected and (message.content != "[evidence content omitted]" or not message.evidence_ids or not set(message.evidence_ids).issubset(guard_ids)):
+                raise ImportValidationError("message evidence provenance is invalid")
+            if not protected and message.evidence_ids:
+                raise ImportValidationError("ordinary message evidence provenance is invalid")
         if any(not set(item.evidence_ids).issubset(guard_ids) for item in candidates.values()):
             raise ImportValidationError("candidate evidence guard relationship is invalid")
         active_by_kind: dict[str, int] = {}

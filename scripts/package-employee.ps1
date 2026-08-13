@@ -26,7 +26,10 @@ if (($capabilityItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -
 if (-not ([IO.Path]::GetFullPath($capabilityItem.FullName).StartsWith(($dataRoot.TrimEnd('\') + '\'), [StringComparison]::OrdinalIgnoreCase))) { throw "The migration capability path escaped DataDirectory." }
 $currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User
 $access = Get-Acl -LiteralPath $capabilityPath
-if (-not $access.AreAccessRulesProtected -or -not ($access.Access | Where-Object { $_.AccessControlType -eq 'Allow' -and $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]) -eq $currentSid })) { throw "The migration capability ACL is not private." }
+$allowSids = @($access.Access | Where-Object AccessControlType -eq 'Allow' | ForEach-Object { $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value })
+$permittedSids = @($currentSid.Value, 'S-1-5-18')
+$unexpectedAllows = @($allowSids | Where-Object { $_ -notin $permittedSids })
+if (-not $access.AreAccessRulesProtected -or $currentSid.Value -notin $allowSids -or $unexpectedAllows.Count -gt 0) { throw "The migration capability ACL is not private." }
 $capability = (Get-Content -LiteralPath $capabilityPath -Raw -Encoding ascii).Trim()
 if ($capability.Length -lt 32) { throw "The local migration capability file is invalid." }
 $headers = @{ "X-Migration-Capability" = $capability }

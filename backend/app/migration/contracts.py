@@ -10,7 +10,7 @@ from app.knowledge.schemas import KnowledgeStatus
 
 
 class StrictRecord(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
+    model_config = ConfigDict(extra="forbid", strict=True, allow_inf_nan=False)
 
     @field_validator("created_at", "updated_at", check_fields=False, mode="before")
     @classmethod
@@ -97,6 +97,16 @@ class CandidateRecord(StrictRecord):
     _canonical_evidence = field_validator("evidence_ids")(
         lambda values: [_portable_id(value) for value in values]
     )
+    _canonical_source_times = field_validator("source_timestamps")(
+        lambda values: {
+            key: value for key, value in values.items()
+            if _portable_id(key) and isinstance(value, str)
+            and __import__("re").fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z", value)
+        } if all(
+            isinstance(value, str) and __import__("re").fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z", value)
+            for value in values.values()
+        ) else (_ for _ in ()).throw(ValueError("canonical evidence timestamp required"))
+    )
 
 
 class PatternRecord(StrictRecord):
@@ -170,7 +180,16 @@ class GuardRecord(StrictRecord):
     content_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     snapshot_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     shingles: list[str] = Field(max_length=30_000)
-    threshold: float = Field(ge=0, le=1)
+    threshold: float = Field(ge=.1, le=1)
+
+    @field_validator("source_timestamp", mode="before")
+    @classmethod
+    def canonical_source_timestamp(cls, value: Any) -> Any:
+        if value is None:
+            return None
+        if not isinstance(value, str) or not __import__("re").fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z", value):
+            raise ValueError("canonical evidence timestamp required")
+        return datetime.fromisoformat(value[:-1] + "+00:00")
 
 
 class ManifestFileRecord(StrictRecord):
@@ -181,7 +200,7 @@ class ManifestFileRecord(StrictRecord):
 
 
 class ManifestRecord(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
+    model_config = ConfigDict(extra="forbid", strict=True, allow_inf_nan=False)
     schema_version: Literal[1]
     profile_id: Literal["etsy-performance-us"]
     app_version: Literal["0.1.0"]
@@ -191,7 +210,7 @@ class ManifestRecord(BaseModel):
     credential_status: Literal["pending"]
     raw_competitor_evidence_included: Literal[False]
     attachments_included: Literal[False]
-    guard_threshold: float = Field(ge=0, le=1)
+    guard_threshold: float = Field(ge=.1, le=1)
     record_counts: dict[str, int]
     files: list[ManifestFileRecord] = Field(min_length=1, max_length=128)
 

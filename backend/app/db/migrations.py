@@ -591,6 +591,17 @@ def _task8_portable_lineage(connection: Connection) -> None:
         connection.execute(text("ALTER TABLE messages ADD COLUMN evidence_ids JSON NOT NULL DEFAULT '[]'"))
 
 
+def _task8_guard_threshold_constraints(connection: Connection) -> None:
+    condition = "NEW.threshold IS NULL OR NEW.threshold < 0.1 OR NEW.threshold > 1"
+    for operation in ("INSERT", "UPDATE"):
+        name = f"trg_imported_evidence_threshold_{operation.casefold()}"
+        connection.execute(text(f"DROP TRIGGER IF EXISTS {name}"))
+        connection.execute(text(
+            f"CREATE TRIGGER {name} BEFORE {operation} ON imported_evidence_fingerprints WHEN {condition} "
+            "BEGIN SELECT RAISE(ABORT, 'imported evidence threshold violation'); END"
+        ))
+
+
 MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (1, _task4_chat_columns),
     (2, _task6_excel_job_columns),
@@ -602,6 +613,7 @@ MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (7, _task7_candidate_cas_and_capacity),
     (8, _task8_migration_and_fts),
     (9, _task8_portable_lineage),
+    (10, _task8_guard_threshold_constraints),
 )
 
 
