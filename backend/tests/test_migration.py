@@ -32,6 +32,7 @@ from app.knowledge.schemas import KnowledgeStatus
 from app.knowledge.service import KnowledgeService, KnowledgeValidationError
 from app.main import create_app
 from app.migration.exporter import ExportError, MigrationExporter
+from app.migration.exporter import _scan_logical_record
 from app.migration.importer import ImportConflict, ImportValidationError, MigrationImporter
 from app.migration.secrets import SensitiveDataError, scan_for_secrets
 from app.core.config import Settings
@@ -239,6 +240,23 @@ def test_secret_scanner_catches_multiple_credentials_without_hash_false_positive
         with pytest.raises(SensitiveDataError):
             scan_for_secrets({"note": value})
     scan_for_secrets({"sha256": "a" * 64, "id": str(uuid4()), "abstract": "sequence and color balance"})
+
+
+@pytest.mark.parametrize("parts", [
+    ["sk-", "A" * 24],
+    ["Bearer ", "tokenvalue123456789"],
+    ["-----BEGIN ", "PRIVATE KEY-----\nbody\n-----END PRIVATE KEY-----"],
+    ["ghp_", "a" * 40],
+    ["xoxb-", "123456789-abcdefghijklmnop"],
+    ["api key", " is ", "Q" * 32],
+])
+def test_aggregate_secret_scan_rejects_credentials_split_across_fields(parts: list[str]) -> None:
+    with pytest.raises(ExportError, match="sensitive"):
+        _scan_logical_record({f"field_{index}": value for index, value in enumerate(parts)})
+
+
+def test_aggregate_secret_scan_allows_ordinary_split_words() -> None:
+    _scan_logical_record({"first": "dance costume", "second": "made to order sizing"})
 
 
 def test_contracts_reject_json_type_coercion_and_non_zulu_time() -> None:

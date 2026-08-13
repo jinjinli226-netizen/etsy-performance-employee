@@ -85,6 +85,14 @@ def _sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _sha_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _json(value: Any) -> bytes:
     return (json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
 
@@ -143,7 +151,6 @@ def _bounded_strings(value: Any) -> list[str]:
             output.append(item)
         elif isinstance(item, dict):
             for key in sorted(item):
-                visit(str(key), depth + 1)
                 visit(item[key], depth + 1)
         elif isinstance(item, list):
             for child in item:
@@ -154,15 +161,16 @@ def _bounded_strings(value: Any) -> list[str]:
 
 
 def _scan_logical_record(value: Any, *, fingerprints: list[tuple[str, list[str]]] | None = None, threshold: float = .72) -> None:
+    _scan(value)
     strings = _bounded_strings(value)
-    for item in strings:
-        _scan(item)
+    raw_views = [*strings, "".join(strings), " ".join(strings)]
+    for view in raw_views:
+        if view:
+            _scan(view)
     aggregate = " ".join(" ".join(_evidence_words(item)) for item in strings)
-    if aggregate:
-        _scan(aggregate)
     if fingerprints:
         originality = OriginalityGuard(threshold=threshold)
-        for text_value in [*strings, aggregate]:
+        for text_value in [*raw_views, aggregate]:
             if text_value and not originality.check_fingerprints([text_value], fingerprints).passed:
                 raise ExportError("raw competitor evidence detected in portable payload")
 
@@ -247,7 +255,7 @@ class MigrationExporter:
             except FileExistsError:
                 raise ExportError("destination already exists")
             publish.unlink()
-            return ExportResult(destination, package_id, content_hash, destination.stat().st_size, counts, _sha(destination.read_bytes()))
+            return ExportResult(destination, package_id, content_hash, destination.stat().st_size, counts, _sha_file(destination))
         finally:
             if 'publish' in locals():
                 publish.unlink(missing_ok=True)
