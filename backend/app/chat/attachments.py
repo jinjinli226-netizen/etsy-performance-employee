@@ -2,14 +2,20 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
+import struct
 import warnings
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
 from fastapi import UploadFile
 from PIL import Image
+from pypdf import PdfReader
+from pypdf.errors import PdfReadError
+from pypdf.generic import ArrayObject, DictionaryObject, IndirectObject
 
 from app.excel_jobs.storage import StorageError, _validate_xlsx_package
 
@@ -28,6 +34,12 @@ TEXT_TYPES = {
     ".json": {"application/json"},
 }
 XLSX_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+ZIP_EOCD = b"PK\x05\x06"
+PDF_DANGEROUS_KEYS = {
+    "/AA", "/EF", "/EmbeddedFiles", "/Filespec", "/JavaScript", "/JS",
+    "/Launch", "/OpenAction", "/RichMedia",
+}
+PDF_DANGEROUS_ACTIONS = {"/JavaScript", "/Launch", "/RichMedia"}
 
 
 class AttachmentValidationError(ValueError):
@@ -94,22 +106,94 @@ def _validate_image(path: Path, expected_format: str) -> None:
         Image.MAX_IMAGE_PIXELS = previous
 
 
+def _validate_zip_boundaries(path: Path) -> None:
+    content = path.read_bytes()
+    eocd_offset = content.rfind(ZIP_EOCD, max(0, len(content) - 65_557))
+    if eocd_offset < 0 or len(content) - eocd_offset < 22:
+        raise AttachmentValidationError("attachment_content_mismatch", "Workbook package boundaries are invalid.")
+    try:
+        _, disk, central_disk, disk_entries, total_entries, central_size, central_offset, comment_size = struct.unpack_from(
+            "<4s4H2LH", content, eocd_offset
+        )
+    except struct.error as exc:
+        raise AttachmentValidationError("attachment_content_mismatch", "Workbook package boundaries are invalid.") from exc
+    if (
+        content[:4] != b"PK\x03\x04"
+        or disk != 0
+        or central_disk != 0
+        or disk_entries != total_entries
+        or eocd_offset + 22 + comment_size != len(content)
+        or central_offset + central_size != eocd_offset
+        or central_offset >= len(content)
+        or content[central_offset:central_offset + 4] != b"PK\x01\x02"
+    ):
+        raise AttachmentValidationError("attachment_content_mismatch", "Workbook package boundaries are invalid.")
+    try:
+        with zipfile.ZipFile(path) as archive:
+            infos = archive.infolist()
+            if len(infos) != total_entries or any(
+                info.flag_bits & 1
+                or info.header_offset < 0
+                or info.header_offset >= central_offset
+                or content[info.header_offset:info.header_offset + 4] != b"PK\x03\x04"
+                for info in infos
+            ):
+                raise AttachmentValidationError("attachment_content_mismatch", "Encrypted or malformed workbook entries are not supported.")
+    except zipfile.BadZipFile as exc:
+        raise AttachmentValidationError("attachment_content_mismatch", "Workbook package boundaries are invalid.") from exc
+
+
+def _walk_pdf(value, seen: set[tuple[int, int]]) -> None:
+    if isinstance(value, IndirectObject):
+        identity = (value.idnum, value.generation)
+        if identity in seen:
+            return
+        seen.add(identity)
+        _walk_pdf(value.get_object(), seen)
+        return
+    if isinstance(value, DictionaryObject):
+        for key, child in value.items():
+            if str(key) in PDF_DANGEROUS_KEYS or (str(key) == "/S" and str(child) in PDF_DANGEROUS_ACTIONS):
+                raise AttachmentValidationError("attachment_content_mismatch", "Interactive or embedded PDF content is not supported.")
+            _walk_pdf(child, seen)
+        return
+    if isinstance(value, ArrayObject):
+        for child in value:
+            _walk_pdf(child, seen)
+
+
+def _validate_pdf(path: Path) -> None:
+    content = path.read_bytes()
+    if not content.startswith(b"%PDF-") or not content.rstrip().endswith(b"%%EOF"):
+        raise AttachmentValidationError("attachment_content_mismatch", "PDF content is invalid.")
+    # Remove parsed stream payloads before checking for a second executable/document format.
+    outside_streams = re.sub(rb"stream\r?\n.*?\r?\nendstream", b"stream endstream", content, flags=re.DOTALL)
+    if any(magic in outside_streams for magic in (b"PK\x03\x04", b"MZ\x90\x00", b"\x7fELF", b"<html", b"<script")):
+        raise AttachmentValidationError("attachment_content_mismatch", "PDF contains an unsupported embedded payload.")
+    try:
+        reader = PdfReader(path, strict=True)
+        if reader.is_encrypted:
+            raise AttachmentValidationError("attachment_content_mismatch", "Encrypted PDFs are not supported.")
+        for page in reader.pages:
+            _walk_pdf(page, set())
+        _walk_pdf(reader.root_object, set())
+    except AttachmentValidationError:
+        raise
+    except (PdfReadError, OSError, ValueError, TypeError) as exc:
+        raise AttachmentValidationError("attachment_content_mismatch", "PDF content is invalid.") from exc
+
+
 def _validate_content(path: Path, kind: str, expected_format: str | None) -> None:
     if kind == "image":
         _validate_image(path, expected_format or "")
     elif kind == "xlsx":
-        with path.open("rb") as stream:
-            signature = stream.read(4)
-        if signature != b"PK\x03\x04":
-            raise AttachmentValidationError("attachment_content_mismatch", "Workbook content is invalid.")
+        _validate_zip_boundaries(path)
         try:
             _validate_xlsx_package(path)
         except StorageError as exc:
             raise AttachmentValidationError("attachment_content_mismatch", "Workbook content is invalid.") from exc
     elif kind == "pdf":
-        content = path.read_bytes()
-        if not content.startswith(b"%PDF-") or not content.rstrip().endswith(b"%%EOF"):
-            raise AttachmentValidationError("attachment_content_mismatch", "PDF content is invalid.")
+        _validate_pdf(path)
     else:
         try:
             value = path.read_text(encoding="utf-8")

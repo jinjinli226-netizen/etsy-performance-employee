@@ -11,6 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 from openpyxl import Workbook
 from PIL import Image
+from pypdf import PdfWriter
 from sqlalchemy import func, select
 
 from app.core.config import Settings
@@ -91,6 +92,33 @@ def xlsx_bytes() -> bytes:
     workbook.save(output)
     workbook.close()
     return output.getvalue()
+
+
+def pdf_bytes(*, javascript: bool = False, attachment: bool = False) -> bytes:
+    output = io.BytesIO()
+    writer = PdfWriter()
+    writer.add_blank_page(width=72, height=72)
+    if javascript:
+        writer.add_js("app.alert('unsafe')")
+    if attachment:
+        writer.add_attachment("hidden.txt", b"hidden")
+    writer.write(output)
+    return output.getvalue()
+
+
+def encrypted_flag_xlsx_bytes() -> bytes:
+    content = bytearray(xlsx_bytes())
+    cursor = 0
+    while (offset := content.find(b"PK\x03\x04", cursor)) >= 0:
+        flags = int.from_bytes(content[offset + 6:offset + 8], "little") | 1
+        content[offset + 6:offset + 8] = flags.to_bytes(2, "little")
+        cursor = offset + 4
+    cursor = 0
+    while (offset := content.find(b"PK\x01\x02", cursor)) >= 0:
+        flags = int.from_bytes(content[offset + 8:offset + 10], "little") | 1
+        content[offset + 8:offset + 10] = flags.to_bytes(2, "little")
+        cursor = offset + 4
+    return bytes(content)
 
 
 def test_create_list_and_get_empty_messages(api) -> None:
@@ -264,7 +292,7 @@ def test_attachment_accepts_valid_tiny_image_xlsx_pdf_and_utf8_text(api) -> None
     samples = [
         ("photo.png", png_bytes(), "image/png"),
         ("listing.xlsx", xlsx_bytes(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
-        ("brief.pdf", b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\n%%EOF", "application/pdf"),
+        ("brief.pdf", pdf_bytes(), "application/pdf"),
         ("notes.txt", "舞台服\nnotes".encode(), "text/plain"),
         ("data.json", b'{"safe":true}', "application/json"),
     ]
@@ -313,6 +341,60 @@ def test_attachment_rejects_xlsx_zip_bomb_before_employee_access(api) -> None:
     assert response.status_code == 422
     assert response.json()["detail"]["code"] == "attachment_content_mismatch"
     assert fake.calls == []
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        lambda: xlsx_bytes() + b"MZ\x90\x00appended executable",
+        lambda: b"MZ\x90\x00prepended executable" + xlsx_bytes(),
+        encrypted_flag_xlsx_bytes,
+    ],
+)
+def test_attachment_rejects_xlsx_polyglots_and_encrypted_entries(api, content) -> None:
+    client, fake, _ = api
+    conversation_id = create_conversation(client)
+    response = client.post(
+        "/api/attachments",
+        data={"conversation_id": str(conversation_id)},
+        files={"file": ("polyglot.xlsx", content(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "attachment_content_mismatch"
+    assert fake.calls == []
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        lambda: pdf_bytes() + b"MZ\x90\x00",
+        lambda: pdf_bytes().replace(b"%%EOF", b"\nPK\x03\x04hidden\n%%EOF"),
+        lambda: pdf_bytes(javascript=True),
+        lambda: pdf_bytes(attachment=True),
+    ],
+)
+def test_attachment_rejects_pdf_polyglots_actions_and_embedded_files(api, content) -> None:
+    client, fake, _ = api
+    conversation_id = create_conversation(client)
+    response = client.post(
+        "/api/attachments",
+        data={"conversation_id": str(conversation_id)},
+        files={"file": ("unsafe.pdf", content(), "application/pdf")},
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "attachment_content_mismatch"
+    assert fake.calls == []
+
+
+def test_attachment_accepts_pdf_generated_by_strict_parser(api) -> None:
+    client, _, _ = api
+    conversation_id = create_conversation(client)
+    response = client.post(
+        "/api/attachments",
+        data={"conversation_id": str(conversation_id)},
+        files={"file": ("safe.pdf", pdf_bytes(), "application/pdf")},
+    )
+    assert response.status_code == 201, response.text
 
 
 def test_atomic_batch_persists_claimed_valid_attachments_and_message(api) -> None:
