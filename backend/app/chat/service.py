@@ -141,6 +141,8 @@ class ChatService:
                         content=content,
                         operation_id=operation_id,
                         operation_status="running",
+                        evidence_bound=learning_mode,
+                        evidence_ids=[],
                     )
                 )
                 session.commit()
@@ -244,6 +246,9 @@ class ChatService:
                     content=parsed.visible_text,
                     operation_id=operation.id,
                     operation_status="completed",
+                    evidence_bound=operation.learning_mode,
+                    contains_evidence_control=operation.learning_mode and bool(parsed.envelopes),
+                    evidence_ids=sorted({evidence_id for envelope in parsed.envelopes for evidence_id in envelope.get("payload", {}).get("evidence_ids", []) if isinstance(evidence_id, str)}) if operation.learning_mode else [],
                 )
                 session.add(assistant)
                 session.commit()

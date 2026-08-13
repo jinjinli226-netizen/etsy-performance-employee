@@ -16,7 +16,7 @@ from app.db.models import (
     ImportedEvidenceFingerprint, KnowledgeCandidate, KnowledgePattern, Message,
     MigrationExport, MigrationImport, RuleVersion,
 )
-from app.migration.contracts import RECORD_MODELS
+from app.migration.contracts import ManifestRecord, RECORD_MODELS
 from app.migration.exporter import APP_VERSION, ASSET_ALLOWLIST, PROFILE_ID, SCHEMA_VERSION, _scan, _sha
 from app.migration.secrets import SensitiveDataError, scan_for_secrets
 
@@ -42,7 +42,7 @@ class ImportReport:
 
 
 @dataclass(frozen=True)
-class ImportGraph:
+class ValidatedGraph:
     manifest: dict[str, Any]
     records: dict[str, list[Any]]
 
@@ -119,6 +119,10 @@ class MigrationImporter:
                 if "manifest.json" not in names:
                     raise ImportValidationError("manifest is missing")
                 manifest = json.loads(archive.read("manifest.json"))
+                try:
+                    ManifestRecord.model_validate(manifest)
+                except ValidationError as error:
+                    raise ImportValidationError("invalid migration manifest schema") from error
                 manifest_keys = {"schema_version","profile_id","app_version","package_id","created_at","content_sha256","credential_status","raw_competitor_evidence_included","attachments_included","guard_threshold","record_counts","files"}
                 if set(manifest) != manifest_keys or manifest["schema_version"] != SCHEMA_VERSION or manifest["profile_id"] != PROFILE_ID or manifest["app_version"] != APP_VERSION:
                     raise ImportValidationError("package compatibility check failed")
@@ -156,7 +160,7 @@ class MigrationImporter:
             if local.is_symlink() or not local.is_file() or local.stat().st_nlink != 1 or _sha(local.read_bytes()) != _sha(payloads[f"assets/{relative}"]):
                 raise ImportValidationError("employee asset does not match this application version")
 
-    def _build_graph(self, manifest: dict[str, Any], payloads: dict[str, bytes]) -> ImportGraph:
+    def _build_graph(self, manifest: dict[str, Any], payloads: dict[str, bytes]) -> ValidatedGraph:
         records: dict[str, list[Any]] = {}
         try:
             for name, model in RECORD_MODELS.items():
@@ -164,7 +168,7 @@ class MigrationImporter:
                 if manifest["record_counts"].get(name) != len(raw):
                     raise ImportValidationError("record count mismatch")
                 scan_for_secrets(raw)
-                parsed = [model.model_validate(item) for item in raw]
+                parsed = [model.model_validate_json(json.dumps(item, ensure_ascii=False, separators=(",", ":"))) for item in raw]
                 ids = [item.id for item in parsed]
                 if len(ids) != len(set(ids)):
                     raise ImportValidationError(f"duplicate IDs in {name}")
@@ -196,10 +200,49 @@ class MigrationImporter:
         if any(count > 1 for count in active_by_kind.values()):
             raise ImportValidationError("multiple active patterns for one kind")
         versions: set[str] = set()
+        rules_by_pattern: dict[str, list[Any]] = {}
         for rule in records["rule_versions"]:
             if rule.version in versions: raise ImportValidationError("duplicate rule version")
             versions.add(rule.version)
-        return ImportGraph(manifest, records)
+            rules_by_pattern.setdefault(rule.pattern_id, []).append(rule)
+        for pattern_id, pattern in patterns.items():
+            rules = rules_by_pattern.get(pattern_id, [])
+            sequences = sorted(rule.sequence for rule in rules)
+            if len(sequences) != len(set(sequences)) or (sequences and sequences != list(range(sequences[0], sequences[-1] + 1))):
+                raise ImportValidationError("rule sequence is not unique and contiguous")
+            active_rules = [rule for rule in rules if rule.status.value == "active"]
+            if pattern.status.value == "active" and (pattern.source_candidate_id is None or len(active_rules) != 1):
+                raise ImportValidationError("active pattern lineage is invalid")
+            if pattern.status.value == "active" and candidates[pattern.source_candidate_id].status.value != "active":
+                raise ImportValidationError("active pattern source candidate is not active")
+            if pattern.status.value != "active" and active_rules:
+                raise ImportValidationError("active rule under non-active pattern")
+            if active_rules and active_rules[0].candidate_id != pattern.source_candidate_id:
+                raise ImportValidationError("active rule candidate lineage is invalid")
+        rule_ids = {rule.id for rule in records["rule_versions"]}
+        for candidate in candidates.values():
+            if candidate.base_active_rule_public_id and candidate.base_active_rule_public_id not in rule_ids:
+                raise ImportValidationError("candidate base rule token is invalid")
+            if candidate.base_pattern_revision is not None:
+                matching = patterns.get(next((pattern.id for pattern in patterns.values() if (pattern.kind or pattern.name) == candidate.kind), ""))
+                if matching is None or candidate.base_pattern_revision > matching.revision:
+                    raise ImportValidationError("candidate base revision is invalid")
+        for feedback in records["feedback_events"]:
+            if feedback.candidate_id and feedback.candidate_id not in candidates or feedback.conversation_id and feedback.conversation_id not in conversations:
+                raise ImportValidationError("feedback relationship is invalid")
+            if feedback.excel_job_id and "excel_job_external_reference" not in feedback.unresolved_relationships:
+                raise ImportValidationError("external Excel job reference is unresolved")
+        typed_refs = {
+            "candidate": set(candidates), "pattern": set(patterns), "rule": rule_ids,
+            "conversation": conversations, "message": set(messages), "evidence": guard_ids,
+        }
+        for audit in records["audit_events"]:
+            known = typed_refs.get(audit.entity_type)
+            if known is not None and audit.entity_public_id not in known and not audit.unresolved_reason:
+                raise ImportValidationError("audit entity relationship is invalid")
+            if audit.entity_public_id is None and audit.unresolved_reason is None:
+                raise ImportValidationError("audit unresolved relationship needs a reason")
+        return ValidatedGraph(manifest, records)
 
     def _conflicts(self, session: Session | None = None) -> list[str]:
         models = (Conversation, Message, Attachment, ExcelJob, CompetitorEvidence, KnowledgeCandidate, KnowledgePattern, RuleVersion, FeedbackEvent, AuditEvent, ImportedEvidenceFingerprint, MigrationImport, MigrationExport)
@@ -209,7 +252,7 @@ class MigrationImporter:
         finally:
             if owned: session.close()
 
-    def _commit_graph(self, graph: ImportGraph) -> None:
+    def _commit_graph(self, graph: ValidatedGraph) -> None:
         with self.session_factory.begin() as session:
             if self._conflicts(session): raise ImportConflict("target data changed during import")
             conversation_map: dict[str, Conversation] = {}
@@ -217,7 +260,7 @@ class MigrationImporter:
             for item in graph.records["conversations"]:
                 row = Conversation(title=item.title, employee_session_id=None, created_at=item.created_at, updated_at=item.updated_at); session.add(row); session.flush(); conversation_map[item.id] = row
             for item in graph.records["messages"]:
-                row = Message(conversation_id=conversation_map[item.conversation_id].id, role=item.role, content=item.content, created_at=item.created_at); session.add(row); session.flush(); message_map[item.id] = row
+                row = Message(conversation_id=conversation_map[item.conversation_id].id, role=item.role, content=item.content, evidence_bound=item.evidence_bound, contains_evidence_control=item.contains_evidence_control, evidence_ids=item.evidence_ids, created_at=item.created_at); session.add(row); session.flush(); message_map[item.id] = row
             for item in graph.records["attachments"]:
                 session.add(Attachment(conversation_id=conversation_map[item.conversation_id].id, filename=Path(item.filename).name, path=f"migration/attachments/not-included/{item.id}", media_type=item.media_type, created_at=item.created_at))
             candidate_map: dict[str, KnowledgeCandidate] = {}
@@ -227,8 +270,8 @@ class MigrationImporter:
             for item in graph.records["knowledge_patterns"]:
                 row = KnowledgePattern(public_id=item.id, source_candidate=candidate_map.get(item.source_candidate_id), name=item.name, kind=item.kind, abstract_summary=item.abstract_summary, revision=item.revision, pattern=item.pattern, status=item.status, created_at=item.created_at, updated_at=item.updated_at); session.add(row); session.flush(); pattern_map[item.id] = row
             for item in graph.records["rule_versions"]: session.add(RuleVersion(public_id=item.id, pattern=pattern_map[item.pattern_id], candidate=candidate_map.get(item.candidate_id), version=item.version, sequence=item.sequence, rules=item.rules, status=item.status, created_at=item.created_at))
-            for item in graph.records["feedback_events"]: session.add(FeedbackEvent(public_id=item.id, knowledge_candidate_id=candidate_map[item.candidate_id].id if item.candidate_id else None, conversation_id=conversation_map[item.conversation_id].id if item.conversation_id else None, feedback_id=item.feedback_id, row_id=item.row_id, accepted=item.accepted, event_type=item.event_type, payload=item.payload, created_at=item.created_at))
-            for item in graph.records["audit_events"]: session.add(AuditEvent(actor=item.actor, action=item.action, entity_type=item.entity_type, entity_id=item.entity_id, details=item.details, created_at=item.created_at))
+            for item in graph.records["feedback_events"]: session.add(FeedbackEvent(public_id=item.id, knowledge_candidate_id=candidate_map[item.candidate_id].id if item.candidate_id else None, conversation_id=conversation_map[item.conversation_id].id if item.conversation_id else None, excel_job_ref=item.excel_job_id, feedback_id=item.feedback_id, row_id=item.row_id, accepted=item.accepted, event_type=item.event_type, payload=item.payload, created_at=item.created_at))
+            for item in graph.records["audit_events"]: session.add(AuditEvent(public_id=item.id, actor=item.actor, action=item.action, entity_type=item.entity_type, entity_id=item.entity_public_id or "unresolved", details={**item.details, **({"unresolved_reason": item.unresolved_reason} if item.unresolved_reason else {})}, created_at=item.created_at))
             for item in graph.records["evidence_guard"]: session.add(ImportedEvidenceFingerprint(public_id=item.id, shingles=item.shingles, source_timestamp=item.source_timestamp, threshold=item.threshold, content_hash=item.content_hash, snapshot_hash=item.snapshot_hash))
             session.add(MigrationImport(package_id=graph.manifest["package_id"], content_sha256=graph.manifest["content_sha256"], profile_id=PROFILE_ID, credential_status="pending", record_counts=graph.manifest["record_counts"]))
             session.flush()

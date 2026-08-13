@@ -677,7 +677,8 @@ class KnowledgeService:
         records.sort(key=lambda record: record["id"])
         identity = _canonical_hash(records)
         export_id = "eg-" + identity[:32]
-        payload = {"schema_version": 1, "export_id": export_id, "issuer": "local-evidence-guard-v1", "threshold": self.originality.threshold, "records": records}
+        threshold = min([self.originality.threshold, *(item.threshold for item in imported)])
+        payload = {"schema_version": 1, "export_id": export_id, "issuer": "local-evidence-guard-v1", "threshold": threshold, "records": records}
         envelope = {**payload, "content_sha256": _canonical_hash(payload)}
         encoded = json.dumps(envelope, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
         if len(encoded) > self.max_guard_bytes:

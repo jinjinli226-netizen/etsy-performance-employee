@@ -1,6 +1,11 @@
+[CmdletBinding()]
+param([string]$DataDirectory)
+
 $ErrorActionPreference = "Stop"
 
 $projectRoot = Split-Path -Parent $PSScriptRoot
+if ([string]::IsNullOrWhiteSpace($DataDirectory)) { $DataDirectory = Join-Path $projectRoot ".runtime-data" }
+$env:ETSY_EMPLOYEE_DATA_DIR = [IO.Path]::GetFullPath($DataDirectory)
 $pidFile = Join-Path $PSScriptRoot ".dev-pids.json"
 $backendPath = Join-Path $projectRoot "backend"
 $frontendPath = Join-Path $projectRoot "frontend"

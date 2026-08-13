@@ -89,6 +89,9 @@ class Message(Base):
     content: Mapped[str] = mapped_column(Text, nullable=False)
     operation_id: Mapped[str | None] = mapped_column(String(36), index=True)
     operation_status: Mapped[str | None] = mapped_column(String(31))
+    evidence_bound: Mapped[bool] = mapped_column(default=False, nullable=False)
+    contains_evidence_control: Mapped[bool] = mapped_column(default=False, nullable=False)
+    evidence_ids: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now, nullable=False)
 
     conversation: Mapped[Conversation] = relationship(back_populates="messages")
@@ -295,6 +298,7 @@ class FeedbackEvent(Base):
     excel_job_id: Mapped[int | None] = mapped_column(
         ForeignKey("excel_jobs.id", ondelete="SET NULL")
     )
+    excel_job_ref: Mapped[str | None] = mapped_column(String(36))
     event_type: Mapped[str] = mapped_column(String(127), nullable=False)
     payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now, nullable=False)
@@ -304,6 +308,7 @@ class AuditEvent(Base):
     __tablename__ = "audit_events"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    public_id: Mapped[str | None] = mapped_column(String(36), unique=True, index=True)
     actor: Mapped[str] = mapped_column(String(127), nullable=False)
     action: Mapped[str] = mapped_column(String(127), nullable=False)
     entity_type: Mapped[str] = mapped_column(String(127), nullable=False)

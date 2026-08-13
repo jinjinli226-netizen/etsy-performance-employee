@@ -587,7 +587,7 @@ def test_v5_migration_is_idempotent_and_enforces_raw_sql_constraints(tmp_path: P
     init_db(engine)
     init_db(engine)
     with engine.begin() as connection:
-        assert connection.execute(text("SELECT version FROM schema_migrations ORDER BY version")).scalars().all() == [1, 2, 3, 4, 5, 6, 7, 8]
+        assert connection.execute(text("SELECT version FROM schema_migrations ORDER BY version")).scalars().all() == [1, 2, 3, 4, 5, 6, 7, 8, 9]
         with pytest.raises(IntegrityError):
             connection.execute(text("INSERT INTO competitor_evidence (public_id, canonical_url, source_key, title, snapshot, tags, source_timestamp, content_hash, created_at) VALUES ('bad','http://evil.test','x','t','s','[]',CURRENT_TIMESTAMP,'bad',CURRENT_TIMESTAMP)"))
         with pytest.raises(IntegrityError):

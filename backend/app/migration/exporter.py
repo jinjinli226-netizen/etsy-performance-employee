@@ -5,16 +5,18 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import stat
 import tempfile
 import zipfile
+import unicodedata
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 from uuid import uuid4
 
-from sqlalchemy import select
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.db.models import (
@@ -23,6 +25,7 @@ from app.db.models import (
     CompetitorEvidence,
     Conversation,
     FeedbackEvent,
+    ExcelJob,
     KnowledgeCandidate,
     KnowledgePattern,
     Message,
@@ -113,6 +116,11 @@ def _redact_portable_text(value: str) -> str:
     return _UNIX_PATH.sub("[local-path-redacted]", value)
 
 
+def _evidence_words(value: str) -> list[str]:
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    return re.findall(r"[^\W_]+", normalized, re.UNICODE)
+
+
 def _public(kind: str, value: str | None, fallback: str) -> str:
     if value:
         return value
@@ -185,7 +193,11 @@ class MigrationExporter:
             shutil.copyfile(archive, publish)
             with publish.open("r+b") as stream:
                 os.fsync(stream.fileno())
-            os.replace(publish, destination)
+            try:
+                os.link(publish, destination, follow_symlinks=False)
+            except FileExistsError:
+                raise ExportError("destination already exists")
+            publish.unlink()
             return ExportResult(destination, package_id, content_hash, destination.stat().st_size, counts, _sha(destination.read_bytes()))
         finally:
             if 'publish' in locals():
@@ -193,18 +205,44 @@ class MigrationExporter:
             shutil.rmtree(stage, ignore_errors=True)
 
     def _snapshot(self) -> tuple[dict[str, list[dict[str, Any]]], dict[str, int]]:
-        with self.session_factory() as session:
-            connection = session.connection()
+        engine = self.session_factory.kw.get("bind")
+        if engine is not None and engine.dialect.name == "sqlite":
+            descriptor, snapshot_name = tempfile.mkstemp(prefix="db-snapshot-", suffix=".sqlite", dir=self.workspace)
+            os.close(descriptor)
+            snapshot_path = Path(snapshot_name)
+            snapshot_engine = None
+            try:
+                source = engine.raw_connection()
+                target = sqlite3.connect(snapshot_path)
+                try:
+                    source.driver_connection.backup(target)
+                finally:
+                    target.close()
+                    source.close()
+                snapshot_engine = create_engine(f"sqlite:///{snapshot_path.as_posix()}")
+                return self._snapshot_from_factory(sessionmaker(bind=snapshot_engine, expire_on_commit=False))
+            finally:
+                if snapshot_engine is not None:
+                    snapshot_engine.dispose()
+                snapshot_path.unlink(missing_ok=True)
+        return self._snapshot_from_factory(self.session_factory)
+
+    def _snapshot_from_factory(self, factory: sessionmaker[Session]) -> tuple[dict[str, list[dict[str, Any]]], dict[str, int]]:
+        with factory() as session:
             conversations = list(session.scalars(select(Conversation).order_by(Conversation.id)))
             conversation_ids = {item.id: _public("conversation", None, f"conversation:{item.id}:{item.created_at.isoformat()}") for item in conversations}
             messages = list(session.scalars(select(Message).order_by(Message.conversation_id, Message.id)))
+            message_ids = {item.id: _public("message", None, f"message:{item.id}:{item.created_at.isoformat()}") for item in messages}
             attachments = list(session.scalars(select(Attachment).order_by(Attachment.conversation_id, Attachment.id)))
+            jobs = list(session.scalars(select(ExcelJob).order_by(ExcelJob.id)))
+            job_ids = {item.id: item.public_id for item in jobs}
             candidates = list(session.scalars(select(KnowledgeCandidate).order_by(KnowledgeCandidate.public_id, KnowledgeCandidate.id)))
             candidate_ids = {item.id: _public("candidate", item.public_id, str(item.id)) for item in candidates}
             patterns = list(session.scalars(select(KnowledgePattern).where(KnowledgePattern.status == KnowledgeStatus.ACTIVE).order_by(KnowledgePattern.public_id, KnowledgePattern.id)))
             pattern_ids = {item.id: _public("pattern", item.public_id, str(item.id)) for item in patterns}
             rules = list(session.scalars(select(RuleVersion).where(RuleVersion.pattern_id.in_(pattern_ids)).order_by(RuleVersion.pattern_id, RuleVersion.sequence, RuleVersion.id))) if pattern_ids else []
-            feedback = list(session.scalars(select(FeedbackEvent).where(FeedbackEvent.knowledge_candidate_id.in_(candidate_ids)).order_by(FeedbackEvent.public_id, FeedbackEvent.id))) if candidate_ids else []
+            rule_ids = {item.id: _public("rule", item.public_id, str(item.id)) for item in rules}
+            feedback = list(session.scalars(select(FeedbackEvent).order_by(FeedbackEvent.public_id, FeedbackEvent.id)))
             audits = list(session.scalars(select(AuditEvent).order_by(AuditEvent.created_at, AuditEvent.id)))
             evidence = list(session.scalars(select(CompetitorEvidence).order_by(CompetitorEvidence.public_id)))
             # Scan source values before redaction so credentials cannot be hidden by a later transform.
@@ -214,24 +252,37 @@ class MigrationExporter:
             except SensitiveDataError as error:
                 raise ExportError("sensitive data detected in migration export") from error
             raw_texts = [part for item in evidence for part in [item.title, item.snapshot, *(item.tags or [])] if isinstance(part, str) and len(part.strip()) >= 8]
-            serialized_portable = json.dumps([x.content for x in messages] + [x.details for x in audits], ensure_ascii=False).casefold()
-            normalized_portable = " ".join(serialized_portable.split())
+            normalized_portable = " ".join(_evidence_words(json.dumps([x.content for x in messages] + [x.details for x in audits], ensure_ascii=False)))
             for raw in raw_texts:
-                normalized = " ".join(raw.casefold().split())
+                normalized = " ".join(_evidence_words(raw))
                 if normalized and normalized in normalized_portable:
                     raise ExportError("raw competitor evidence detected in portable payload")
 
             records: dict[str, list[dict[str, Any]]] = {
                 "conversations": [{"id": conversation_ids[x.id], "title": x.title, "created_at": _timestamp(x.created_at), "updated_at": _timestamp(x.updated_at)} for x in conversations],
-                "messages": [{"id": _public("message", None, f"message:{x.id}:{x.created_at.isoformat()}"), "conversation_id": conversation_ids[x.conversation_id], "role": x.role.value if hasattr(x.role, "value") else str(x.role), "content": _redact_portable_text(x.content), "created_at": _timestamp(x.created_at)} for x in messages],
+                "messages": [{"id": message_ids[x.id], "conversation_id": conversation_ids[x.conversation_id], "role": x.role.value if hasattr(x.role, "value") else str(x.role), "content": "[evidence content omitted]" if x.evidence_bound or x.contains_evidence_control else _redact_portable_text(x.content), "evidence_bound": bool(x.evidence_bound), "contains_evidence_control": bool(x.contains_evidence_control), "evidence_ids": sorted(x.evidence_ids or []), "created_at": _timestamp(x.created_at)} for x in messages],
                 "attachments": [{"id": _public("attachment", None, f"attachment:{x.id}:{x.created_at.isoformat()}"), "conversation_id": conversation_ids[x.conversation_id], "filename": Path(x.filename).name, "media_type": x.media_type, "content_included": False, "created_at": _timestamp(x.created_at)} for x in attachments],
-                "knowledge_candidates": [{"id": candidate_ids[x.id], "title": x.title, "kind": x.kind, "abstract_summary": x.abstract_summary, "proposal": x.proposal, "confidence": x.confidence, "evidence_ids": sorted(x.evidence_ids or []), "source_timestamps": x.source_timestamps or {}, "conversation_id": conversation_ids.get(x.conversation_id), "message_id": _public("message", None, f"message:{x.message_id}:{next((m.created_at.isoformat() for m in messages if m.id == x.message_id), '')}") if x.message_id else None, "trace_id": x.trace_id, "base_active_rule_public_id": x.base_active_rule_public_id, "base_pattern_revision": x.base_pattern_revision, "revision": x.revision, "status": x.status.value, "created_at": _timestamp(x.created_at), "updated_at": _timestamp(x.updated_at)} for x in candidates],
+                "knowledge_candidates": [{"id": candidate_ids[x.id], "title": x.title, "kind": x.kind, "abstract_summary": x.abstract_summary, "proposal": x.proposal, "confidence": x.confidence, "evidence_ids": sorted(x.evidence_ids or []), "source_timestamps": x.source_timestamps or {}, "conversation_id": conversation_ids.get(x.conversation_id), "message_id": message_ids.get(x.message_id), "trace_id": x.trace_id, "base_active_rule_public_id": x.base_active_rule_public_id, "base_pattern_revision": x.base_pattern_revision, "revision": x.revision, "status": x.status.value, "created_at": _timestamp(x.created_at), "updated_at": _timestamp(x.updated_at)} for x in candidates],
                 "knowledge_patterns": [{"id": pattern_ids[x.id], "source_candidate_id": candidate_ids.get(x.source_candidate_id), "name": x.name, "kind": x.kind, "abstract_summary": x.abstract_summary, "revision": x.revision, "pattern": x.pattern, "status": x.status.value, "created_at": _timestamp(x.created_at), "updated_at": _timestamp(x.updated_at)} for x in patterns],
-                "rule_versions": [{"id": _public("rule", x.public_id, str(x.id)), "pattern_id": pattern_ids[x.pattern_id], "candidate_id": candidate_ids.get(x.knowledge_candidate_id), "version": x.version, "sequence": x.sequence, "rules": x.rules, "status": x.status.value, "created_at": _timestamp(x.created_at)} for x in rules],
-                "feedback_events": [{"id": _public("feedback", x.public_id, str(x.id)), "candidate_id": candidate_ids.get(x.knowledge_candidate_id), "conversation_id": conversation_ids.get(x.conversation_id), "excel_job_id": None, "unresolved_relationships": (["excel_job"] if x.excel_job_id else []), "feedback_id": x.feedback_id, "row_id": x.row_id, "accepted": x.accepted, "event_type": x.event_type, "payload": x.payload, "created_at": _timestamp(x.created_at)} for x in feedback],
-                "audit_events": [{"id": _public("audit", None, f"audit:{x.id}:{x.created_at.isoformat()}"), "actor": x.actor, "action": x.action, "entity_type": x.entity_type, "entity_id": x.entity_id, "details": x.details, "created_at": _timestamp(x.created_at)} for x in audits],
+                "rule_versions": [{"id": rule_ids[x.id], "pattern_id": pattern_ids[x.pattern_id], "candidate_id": candidate_ids.get(x.knowledge_candidate_id), "version": x.version, "sequence": x.sequence, "rules": x.rules, "status": x.status.value, "created_at": _timestamp(x.created_at)} for x in rules],
+                "feedback_events": [{"id": _public("feedback", x.public_id, str(x.id)), "candidate_id": candidate_ids.get(x.knowledge_candidate_id), "conversation_id": conversation_ids.get(x.conversation_id), "excel_job_id": x.excel_job_ref or job_ids.get(x.excel_job_id), "unresolved_relationships": (["excel_job_external_reference"] if (x.excel_job_ref or x.excel_job_id) else []), "feedback_id": x.feedback_id, "row_id": x.row_id, "accepted": x.accepted, "event_type": x.event_type, "payload": x.payload, "created_at": _timestamp(x.created_at)} for x in feedback],
+                "audit_events": [],
                 "evidence_guard": [],
             }
+            typed_maps = {"candidate": candidate_ids, "pattern": pattern_ids, "rule": rule_ids, "conversation": conversation_ids, "message": message_ids, "excel_job": job_ids}
+            public_values = {kind: set(mapping.values()) for kind, mapping in typed_maps.items()}
+            evidence_values = {item.public_id for item in evidence}
+            for item in audits:
+                entity_type = item.entity_type if item.entity_type in {"candidate", "pattern", "rule", "conversation", "message", "excel_job", "evidence", "learning", "config"} else "config"
+                entity_public_id = str(item.entity_id)
+                if entity_type in typed_maps and entity_public_id not in public_values[entity_type]:
+                    entity_public_id = typed_maps[entity_type].get(int(entity_public_id)) if entity_public_id.isdigit() else None
+                elif entity_type == "evidence" and entity_public_id not in evidence_values:
+                    entity_public_id = None
+                elif entity_type in {"learning", "config"}:
+                    entity_public_id = None
+                unresolved = None if entity_public_id else "unresolved_legacy_reference"
+                records["audit_events"].append({"id": _public("audit", item.public_id, f"audit:{item.id}:{item.created_at.isoformat()}"), "actor": item.actor, "action": item.action, "entity_type": entity_type, "entity_public_id": entity_public_id, "unresolved_reason": unresolved, "details": item.details, "created_at": _timestamp(item.created_at)})
             guard = OriginalityGuard()
             for item in evidence:
                 records["evidence_guard"].append({"id": item.public_id, "source_timestamp": _timestamp(item.source_timestamp), "content_hash": item.content_hash, "snapshot_hash": item.snapshot_hash, "shingles": guard.fingerprint_texts([item.title, item.snapshot, *item.tags]), "threshold": guard.threshold})
@@ -242,5 +293,18 @@ class MigrationExporter:
                         records["evidence_guard"].append({"id": evidence_id, "source_timestamp": (candidate.source_timestamps or {}).get(evidence_id), "content_hash": None, "snapshot_hash": None, "shingles": [], "threshold": guard.threshold})
                         known.add(evidence_id)
             records["evidence_guard"].sort(key=lambda item: item["id"])
+            def portable_strings(value: Any) -> Iterable[str]:
+                if isinstance(value, str):
+                    yield value
+                elif isinstance(value, dict):
+                    for child in value.values():
+                        yield from portable_strings(child)
+                elif isinstance(value, list):
+                    for child in value:
+                        yield from portable_strings(child)
+            evidence_fingerprints = [(item.public_id, guard.fingerprint_texts([item.title, item.snapshot, *item.tags])) for item in evidence]
+            for portable_text in portable_strings({name: rows for name, rows in records.items() if name != "evidence_guard"}):
+                if not guard.check_fingerprints([portable_text], evidence_fingerprints).passed:
+                    raise ExportError("raw competitor evidence detected in portable payload")
             counts = {name: len(items) for name, items in records.items()}
             return records, counts

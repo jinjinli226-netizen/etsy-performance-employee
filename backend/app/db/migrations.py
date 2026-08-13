@@ -543,6 +543,13 @@ def _legacy_guard_too_large(evidence: list[dict]) -> bool:
 
 
 def _task8_migration_and_fts(connection: Connection) -> None:
+    message_columns = _columns(connection, "messages")
+    if "evidence_bound" not in message_columns:
+        connection.execute(text("ALTER TABLE messages ADD COLUMN evidence_bound BOOLEAN NOT NULL DEFAULT 0"))
+    if "contains_evidence_control" not in message_columns:
+        connection.execute(text("ALTER TABLE messages ADD COLUMN contains_evidence_control BOOLEAN NOT NULL DEFAULT 0"))
+    if "evidence_ids" not in message_columns:
+        connection.execute(text("ALTER TABLE messages ADD COLUMN evidence_ids JSON NOT NULL DEFAULT '[]'"))
     connection.execute(text(
         "CREATE TABLE IF NOT EXISTS imported_evidence_fingerprints ("
         "id INTEGER PRIMARY KEY, public_id VARCHAR(35) NOT NULL UNIQUE, shingles JSON NOT NULL, "
@@ -566,6 +573,24 @@ def _task8_migration_and_fts(connection: Connection) -> None:
         raise RuntimeError("SQLite FTS5 support is required") from error
 
 
+def _task8_portable_lineage(connection: Connection) -> None:
+    feedback_columns = _columns(connection, "feedback_events")
+    if "excel_job_ref" not in feedback_columns:
+        connection.execute(text("ALTER TABLE feedback_events ADD COLUMN excel_job_ref VARCHAR(36)"))
+    audit_columns = _columns(connection, "audit_events")
+    if "public_id" not in audit_columns:
+        connection.execute(text("ALTER TABLE audit_events ADD COLUMN public_id VARCHAR(36)"))
+        connection.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_audit_events_public_id ON audit_events(public_id)"))
+    # Databases which applied the original v8 still need message provenance columns.
+    message_columns = _columns(connection, "messages")
+    if "evidence_bound" not in message_columns:
+        connection.execute(text("ALTER TABLE messages ADD COLUMN evidence_bound BOOLEAN NOT NULL DEFAULT 0"))
+    if "contains_evidence_control" not in message_columns:
+        connection.execute(text("ALTER TABLE messages ADD COLUMN contains_evidence_control BOOLEAN NOT NULL DEFAULT 0"))
+    if "evidence_ids" not in message_columns:
+        connection.execute(text("ALTER TABLE messages ADD COLUMN evidence_ids JSON NOT NULL DEFAULT '[]'"))
+
+
 MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (1, _task4_chat_columns),
     (2, _task6_excel_job_columns),
@@ -576,6 +601,7 @@ MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (6, _task7_trust_hardening),
     (7, _task7_candidate_cas_and_capacity),
     (8, _task8_migration_and_fts),
+    (9, _task8_portable_lineage),
 )
 
 
