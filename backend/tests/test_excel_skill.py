@@ -140,6 +140,19 @@ def write_knowledge_export(path: Path, *, abstract: str = "Use occasion-specific
     }
 
 
+def write_evidence_guard(path: Path, raw: str) -> dict[str, str]:
+    record_payload = {"id": "ev-" + "a" * 32, "text": raw}
+    record = {**record_payload, "content_sha256": canonical_sha(record_payload)}
+    payload = {"schema_version": 1, "export_id": "eg-" + "1" * 32, "issuer": "local-evidence-guard-v1", "threshold": 0.72, "records": [record]}
+    envelope = {**payload, "content_sha256": canonical_sha(payload)}
+    path.write_text(json.dumps(envelope), encoding="utf-8")
+    return {
+        "expected_guard_export_id": envelope["export_id"],
+        "expected_guard_payload_sha256": envelope["content_sha256"],
+        "expected_guard_file_sha256": sha(path),
+    }
+
+
 def inject_relationship(path: Path, relationship_type: str, target: str, *, target_mode: str | None = None) -> None:
     relationship_name = "xl/worksheets/_rels/sheet1.xml.rels"
     with ZipFile(path, "r") as source:
@@ -693,6 +706,45 @@ def test_run_task_repairs_well_formed_but_invalid_output_once(tmp_path: Path, ex
     assert "head_titles" in fake.calls[1][1]
     assert "formula prefix" in fake.calls[1][1]
     assert "SECRET" not in fake.calls[1][1]
+
+
+def test_run_task_retries_originality_failure_without_putting_raw_evidence_in_prompt(tmp_path: Path, excel_modules) -> None:
+    _, _, _, run = excel_modules
+    source = make_book(tmp_path / "source.xlsx")
+    copied = valid_result(title="Velvet Vampire Cape for Women Dramatic Gothic Halloween Costume")
+    repaired = valid_result(title="Adult Gothic Stage Cape Dramatic Dance Performance Costume")
+    raw = "Velvet Vampire Cape for Women Dramatic Gothic Halloween Costume"
+    guard = tmp_path / "guard.json"
+    trust = write_evidence_guard(guard, raw)
+    fake = FakeHermes([json.dumps(copied), json.dumps(repaired)])
+    report = run.run_task(
+        source, tmp_path / "job", knowledge_path=None, guard_path=guard,
+        rules={"rule_version": "rules-v1"}, command_runner=fake, emit=lambda event: None, **trust,
+    )
+    assert Path(report["output_path"]).is_file()
+    assert len(fake.calls) == 2
+    assert raw not in fake.calls[0][1] and raw not in fake.calls[1][1]
+    assert "originality_failed" in fake.calls[1][1]
+    assert "ev-" + "a" * 32 in fake.calls[1][1]
+    assert "matched_text" not in fake.calls[1][1]
+
+
+def test_run_task_rejects_second_originality_failure_without_workbook_or_raw_leak(tmp_path: Path, excel_modules) -> None:
+    _, _, _, run = excel_modules
+    source = make_book(tmp_path / "source.xlsx")
+    raw = "Velvet Vampire Cape for Women Dramatic Gothic Halloween Costume"
+    guard = tmp_path / "guard.json"
+    trust = write_evidence_guard(guard, raw)
+    fake = FakeHermes([json.dumps(valid_result(title=raw)), json.dumps(valid_result(title=raw))])
+    events = []
+    with pytest.raises(run.TaskError) as raised:
+        run.run_task(
+            source, tmp_path / "job", knowledge_path=None, guard_path=guard,
+            rules={"rule_version": "rules-v1"}, command_runner=fake, emit=events.append, **trust,
+        )
+    assert raised.value.code == "originality_failed"
+    assert raw not in json.dumps(events) and raw not in str(raised.value)
+    assert not list((tmp_path / "job").glob("*.xlsx"))
 
 
 def test_run_task_limits_schema_repair_to_one_retry(tmp_path: Path, excel_modules) -> None:

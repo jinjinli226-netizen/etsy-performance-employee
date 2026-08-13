@@ -1,12 +1,26 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
-from app.knowledge.schemas import CandidatePage, KnowledgeStatus, PatternPage, PatternTransitionRead
+from app.knowledge.schemas import CandidatePage, EvidenceInput, KnowledgeStatus, PatternPage, PatternTransitionRead
 from app.knowledge.service import KnowledgeConflictError, KnowledgeNotFoundError, KnowledgeService, KnowledgeValidationError
 
 
 router = APIRouter(prefix="/api/knowledge", tags=["knowledge"])
+
+
+def require_evidence_capability() -> None:
+    raise HTTPException(403, "Trusted employee evidence capability required")
+
+
+@router.post("/evidence", include_in_schema=False)
+def ingest_evidence(
+    payload: EvidenceInput,
+    request: Request,
+    _capability: None = Depends(require_evidence_capability),
+):
+    record = service(request).ingest_evidence(payload)
+    return {"id": record.public_id, "source_timestamp": record.source_timestamp}
 
 
 def service(request: Request) -> KnowledgeService:

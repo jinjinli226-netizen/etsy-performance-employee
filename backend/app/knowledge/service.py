@@ -5,6 +5,7 @@ import json
 import os
 import stat
 import threading
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -16,7 +17,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.db.models import AuditEvent, CompetitorEvidence, FeedbackEvent, KnowledgeCandidate, KnowledgePattern, RuleVersion
 from app.knowledge.originality import OriginalityGuard
-from app.knowledge.promotion import decide_promotion
+from app.knowledge.promotion import PolicyValidationError, PolicyValidator, PolicyValidatorProtocol, decide_promotion
 from app.knowledge.schemas import (
     ActivePatternRead,
     CandidateInput,
@@ -54,6 +55,13 @@ def _canonical_hash(value: object) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _snapshot_hash(title: str, snapshot: str, tags: list[str]) -> str:
+    def clean(value: str) -> str:
+        return " ".join(unicodedata.normalize("NFKC", value).casefold().split())
+
+    return _canonical_hash({"title": clean(title), "snapshot": clean(snapshot), "tags": [clean(tag) for tag in tags]})
+
+
 def _audit(session: Session, *, actor: str, action: str, entity_type: str, entity_id: str, previous: str | None, new: str | None, trace_id: str | None = None, score: float | None = None) -> None:
     details: dict[str, object] = {"previous": previous, "new": new}
     if trace_id:
@@ -71,20 +79,23 @@ class KnowledgeService:
         export_dir: Path,
         originality_threshold: float = 0.72,
         regression_check: Callable[[str, str], bool] | None = None,
+        policy_validator: PolicyValidatorProtocol | None = None,
     ) -> None:
         self.session_factory = session_factory
         self.export_dir = export_dir
         self.originality = OriginalityGuard(threshold=originality_threshold)
-        self.regression_check = regression_check or (lambda _kind, _abstract: True)
-        self.hard_rule_kinds = {"product_fact", "material_fact", "safety", "copyright", "fixed_output_contract"}
+        self.regression_check = regression_check
+        self.policy_validator = policy_validator or PolicyValidator()
         self._lock = threading.RLock()
 
     def ingest_evidence(self, payload: EvidenceInput) -> CompetitorEvidence:
         parsed = urlsplit(payload.url)
         listing_id = parsed.path.split("/")[2]
         canonical = f"https://www.etsy.com/listing/{listing_id}"
-        raw_payload = {"url": canonical, "title": payload.title, "snapshot": payload.snapshot, "tags": payload.tags}
+        snapshot_payload = {"title": payload.title, "snapshot": payload.snapshot, "tags": payload.tags}
+        raw_payload = {"url": canonical, **snapshot_payload}
         digest = _canonical_hash(raw_payload)
+        snapshot_digest = _snapshot_hash(payload.title, payload.snapshot, payload.tags)
         with self._lock, self.session_factory() as session:
             existing = session.scalar(
                 select(CompetitorEvidence).where(
@@ -103,6 +114,7 @@ class KnowledgeService:
                 tags=payload.tags,
                 source_timestamp=payload.source_timestamp,
                 content_hash=digest,
+                snapshot_hash=snapshot_digest,
             )
             session.add(record)
             session.flush()
@@ -130,7 +142,7 @@ class KnowledgeService:
 
     @staticmethod
     def _independent_count(records: list[CompetitorEvidence]) -> int:
-        return min(len({record.source_key for record in records}), len({record.content_hash for record in records}))
+        return min(len({record.source_key for record in records}), len({record.snapshot_hash for record in records}))
 
     def ingest_candidate(
         self,
@@ -170,10 +182,15 @@ class KnowledgeService:
             return candidate
 
     def audit_candidate_event_rejection(self, *, actor: str, trace_id: str, reason: str) -> None:
-        allowed = {"invalid_schema", "unknown_evidence", "timestamp_mismatch", "unsafe_content", "ingestion_failed"}
+        allowed = {"invalid_schema", "unknown_evidence", "timestamp_mismatch", "unsafe_content", "ingestion_failed", "learning_mode_required"}
         safe_reason = reason if reason in allowed else "ingestion_failed"
         with self.session_factory() as session:
             _audit(session, actor=actor, action="candidate_event_rejected", entity_type="candidate", entity_id="untrusted-event", previous=None, new=safe_reason, trace_id=trace_id)
+            session.commit()
+
+    def audit_learning_event_rejection(self, *, actor: str, trace_id: str) -> None:
+        with self.session_factory() as session:
+            _audit(session, actor=actor, action="learning_event_rejected", entity_type="learning", entity_id="untrusted-event", previous=None, new="learning_mode_required", trace_id=trace_id)
             session.commit()
 
     def _support_counts(self, session: Session, candidate: KnowledgeCandidate, evidence: list[CompetitorEvidence] | None = None) -> tuple[int, int]:
@@ -194,10 +211,18 @@ class KnowledgeService:
             )
         except (TypeError, ValueError):
             return False, "candidate_not_sanitized"
-        if candidate.kind in self.hard_rule_kinds:
-            return False, "hard_rule_conflict"
-        if not self.regression_check(candidate.kind or "", candidate.abstract_summary or ""):
-            return False, "regression_failed"
+        try:
+            self.policy_validator.validate(candidate.kind or "", candidate.abstract_summary or "")
+        except PolicyValidationError as exc:
+            return False, str(exc) or "policy_failed"
+        except Exception:
+            return False, "policy_unavailable"
+        if self.regression_check is not None:
+            try:
+                if not self.regression_check(candidate.kind or "", candidate.abstract_summary or ""):
+                    return False, "regression_failed"
+            except Exception:
+                return False, "regression_unavailable"
         if not self._raw_similarity(candidate.abstract_summary or "", evidence).passed:
             return False, "raw_similarity"
         return True, "passed"
@@ -209,8 +234,8 @@ class KnowledgeService:
             confidence=candidate.confidence or 0,
             independent_evidence=independent,
             accepted_edits=edits,
-            hard_conflict=reason == "hard_rule_conflict",
-            regression_passed=reason != "regression_failed",
+            hard_conflict=reason.startswith("policy_"),
+            regression_passed=reason not in {"regression_failed", "regression_unavailable"},
             originality_passed=reason != "raw_similarity",
         )
         if constraints and decision.eligible:
@@ -389,9 +414,20 @@ class KnowledgeService:
             patterns = list(session.scalars(select(KnowledgePattern).where(KnowledgePattern.status == KnowledgeStatus.ACTIVE).order_by(KnowledgePattern.kind, KnowledgePattern.id)))
             output = []
             for pattern in patterns:
-                version = session.scalar(select(RuleVersion).where(RuleVersion.pattern_id == pattern.id, RuleVersion.status == KnowledgeStatus.ACTIVE).order_by(RuleVersion.sequence.desc()))
+                versions = list(session.scalars(select(RuleVersion).where(RuleVersion.pattern_id == pattern.id, RuleVersion.status == KnowledgeStatus.ACTIVE)))
+                if len(versions) != 1 or pattern.source_candidate_id is None or versions[0].knowledge_candidate_id != pattern.source_candidate_id:
+                    raise KnowledgeValidationError("invalid active rule lineage")
+                version = versions[0]
                 if version:
-                    output.append({"id": "rec-" + hashlib.sha256((pattern.public_id or str(pattern.id)).encode()).hexdigest()[:16], "kind": pattern.kind or pattern.name, "abstract": pattern.abstract_summary or "", "rule_version": version.version})
+                    rules = version.rules
+                    if not isinstance(rules, dict) or set(rules) - {"kind", "abstract", "rollback_of"}:
+                        raise KnowledgeValidationError("invalid active rule snapshot")
+                    try:
+                        validated = CandidateInput(kind=rules.get("kind"), abstract=rules.get("abstract"), confidence=1, evidence_refs=[])
+                        self.policy_validator.validate(validated.kind, validated.abstract)
+                    except Exception as exc:
+                        raise KnowledgeValidationError("invalid active rule snapshot") from exc
+                    output.append({"id": "rec-" + hashlib.sha256((pattern.public_id or str(pattern.id)).encode()).hexdigest()[:16], "kind": validated.kind, "abstract": validated.abstract, "rule_version": version.version})
             return output
 
     def list_active(self, *, limit: int, offset: int, kind: str | None = None) -> PatternPage:
@@ -433,3 +469,74 @@ class KnowledgeService:
         os.replace(temporary, path)
         os.chmod(path, stat.S_IREAD)
         return KnowledgeTrust(path.resolve(), export_id, envelope["content_sha256"], hashlib.sha256(encoded).hexdigest())
+
+    def export_evidence_guard(self, path: Path) -> KnowledgeTrust:
+        with self.session_factory() as session:
+            evidence = list(session.scalars(select(CompetitorEvidence).order_by(CompetitorEvidence.public_id)))
+        records = []
+        for item in evidence:
+            record_payload = {"id": item.public_id, "text": f"{item.title} {item.snapshot} {' '.join(item.tags)}"}
+            records.append({**record_payload, "content_sha256": _canonical_hash(record_payload)})
+        identity = _canonical_hash(records)
+        export_id = "eg-" + identity[:32]
+        payload = {"schema_version": 1, "export_id": export_id, "issuer": "local-evidence-guard-v1", "threshold": self.originality.threshold, "records": records}
+        envelope = {**payload, "content_sha256": _canonical_hash(payload)}
+        encoded = json.dumps(envelope, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(path.name + ".tmp-" + uuid4().hex)
+        temporary.write_bytes(encoded)
+        if path.exists():
+            os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+        os.replace(temporary, path)
+        os.chmod(path, stat.S_IREAD)
+        return KnowledgeTrust(path.resolve(), export_id, envelope["content_sha256"], hashlib.sha256(encoded).hexdigest())
+
+    def resolve_bound_evidence(self, evidence_ids: list[str], allowed_urls: frozenset[str]) -> list[CompetitorEvidence]:
+        if not evidence_ids:
+            return []
+        with self.session_factory() as session:
+            records = list(session.scalars(select(CompetitorEvidence).where(CompetitorEvidence.public_id.in_(set(evidence_ids)))))
+            expected_keys = {"etsy-listing:" + url.split("/listing/", 1)[1] for url in allowed_urls}
+            if len(records) != len(set(evidence_ids)) or any(record.source_key not in expected_keys for record in records):
+                raise KnowledgeValidationError("evidence is not bound to the learning operation")
+            session.expunge_all()
+            return records
+
+    def validate_generated_workbook(self, path: Path) -> None:
+        from openpyxl import load_workbook
+
+        fixed = {
+            "head titles": "head_titles",
+            "SPECIFICATION": "specification",
+            "Instructions for buyers": "instructions_for_buyers",
+        }
+        with self.session_factory() as session:
+            evidence = [
+                (item.public_id, f"{item.title} {item.snapshot} {' '.join(item.tags)}")
+                for item in session.scalars(select(CompetitorEvidence).order_by(CompetitorEvidence.public_id))
+            ]
+        if not evidence:
+            return
+        try:
+            workbook = load_workbook(path, read_only=True, data_only=False)
+            for sheet in workbook.worksheets:
+                header_row, columns = None, {}
+                for row in sheet.iter_rows(min_row=1, max_row=min(sheet.max_row, 200)):
+                    found = {str(cell.value).strip(): cell.column for cell in row if isinstance(cell.value, str)}
+                    if set(fixed).issubset(found):
+                        header_row, columns = row[0].row, found
+                        break
+                if header_row is None:
+                    continue
+                for row_number in range(header_row + 1, sheet.max_row + 1):
+                    generated = {field: sheet.cell(row_number, columns[header]).value or "" for header, field in fixed.items()}
+                    result = self.originality.check(generated, evidence)
+                    if not result.passed:
+                        raise KnowledgeValidationError(
+                            json.dumps({"code": "originality_failed", "score": result.max_score, "evidence_id": result.evidence_id}, separators=(",", ":"))
+                        )
+            workbook.close()
+        except KnowledgeValidationError:
+            raise
+        except Exception as exc:
+            raise KnowledgeValidationError("generated workbook originality validation failed") from exc

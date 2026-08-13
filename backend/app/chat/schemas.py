@@ -64,6 +64,7 @@ class ConversationPage(BaseModel):
 class ChatSendRequest(BaseModel):
     content: str = Field(min_length=1, max_length=100_000)
     attachment_ids: list[int] = Field(default_factory=list, max_length=20)
+    learning_mode: bool = False
 
 
 class OperationAccepted(BaseModel):

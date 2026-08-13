@@ -9,7 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.core.config import Settings
-from app.db.models import Conversation, Message
+from app.db.models import AuditEvent, CompetitorEvidence, Conversation, KnowledgeCandidate, Message
 from app.employee.adapter import (
     EmployeeReply,
     EmployeeUnavailableError,
@@ -238,6 +238,72 @@ def test_valid_knowledge_envelope_is_stripped_and_unknown_json_is_visible(api) -
     assert stored[-1]["content"] == (
         'Visible answer\n{"event":"not_allowed","payload":{"text":"keep me"}}'
     )
+
+
+def test_explicit_learning_mode_ingests_whitelisted_evidence_then_bound_candidate(api) -> None:
+    client, fake, _ = api
+    conversation_id = create_conversation(client)
+    timestamp = "2026-08-10T12:00:00Z"
+
+    async def learning_reply(prompt, session_id, image_path, source):
+        assert "LEARNING_MODE" in prompt
+        return EmployeeReply(text=(
+            "Learned safely.\n"
+            '{"event":"learning_batch","payload":{"evidence_items":[{'
+            '"url":"https://www.etsy.com/listing/123/sample","title":"Competitor stage cape",'
+            '"snapshot":"Public stage cape snapshot with dramatic costume details.",'
+            '"tags":["stage cape"],"source_timestamp":"2026-08-10T12:00:00Z"}],'
+            '"candidates":[{"kind":"title_structure","summary":"Lead with occasion, garment type, silhouette, and intended audience.",'
+            '"confidence":0.9,"evidence_urls":["https://www.etsy.com/listing/123/sample"]}]}}'
+        ), session_id="learning-session")
+
+    fake.send = learning_reply
+    sent = client.post(f"/api/conversations/{conversation_id}/messages", json={
+        "content": "学习这个 https://www.etsy.com/listing/123/sample",
+        "learning_mode": True,
+    })
+    assert wait_for_final(client, sent.json()["operation_id"])[-1]["status"] == "completed"
+    assert client.get(f"/api/conversations/{conversation_id}/messages").json()[-1]["content"] == "Learned safely."
+    with client.app.state.session_factory() as session:
+        assert session.query(CompetitorEvidence).count() == 1
+        assert session.query(KnowledgeCandidate).count() == 1
+        audit = json.dumps([row.details for row in session.query(AuditEvent).all()])
+        assert "Competitor stage cape" not in audit and "etsy.com" not in audit
+
+
+def test_learning_envelopes_are_ignored_without_server_learning_mode(api) -> None:
+    client, fake, _ = api
+    conversation_id = create_conversation(client)
+
+    async def untrusted_reply(prompt, session_id, image_path, source):
+        return EmployeeReply(text=(
+            "Normal answer.\n"
+            '{"event":"learning_batch","payload":{"evidence_items":[{'
+            '"url":"https://www.etsy.com/listing/123/sample","title":"Raw title",'
+            '"snapshot":"Raw snapshot should never be learned.","tags":[],"source_timestamp":"2026-08-10T12:00:00Z"}],'
+            '"candidates":[{"kind":"title_structure","summary":"Lead with occasion and garment type for search clarity.",'
+            '"confidence":0.9,"evidence_urls":["https://www.etsy.com/listing/123/sample"]}]}}'
+        ), session_id="normal-session")
+
+    fake.send = untrusted_reply
+    sent = client.post(f"/api/conversations/{conversation_id}/messages", json={
+        "content": "chat normally about this", "learning_mode": False,
+    })
+    assert wait_for_final(client, sent.json()["operation_id"])[-1]["status"] == "completed"
+    with client.app.state.session_factory() as session:
+        assert session.query(CompetitorEvidence).count() == 0
+        assert session.query(KnowledgeCandidate).count() == 0
+        assert session.query(AuditEvent).filter_by(action="learning_event_rejected").count() == 1
+
+
+def test_learning_mode_requires_canonical_etsy_listing_url_before_employee_call(api) -> None:
+    client, fake, _ = api
+    conversation_id = create_conversation(client)
+    response = client.post(f"/api/conversations/{conversation_id}/messages", json={
+        "content": "learn https://evil.test/listing/123", "learning_mode": True,
+    })
+    assert response.status_code == 422
+    assert fake.calls == []
 
 
 def test_concurrent_send_rejected_and_failed_operation_can_retry(api) -> None:

@@ -27,6 +27,10 @@ class RunnerRequest:
     knowledge_export_id: str
     knowledge_payload_sha256: str
     knowledge_file_sha256: str
+    guard_path: Path | None = None
+    guard_export_id: str | None = None
+    guard_payload_sha256: str | None = None
+    guard_file_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -53,7 +57,7 @@ def build_employee_command(
     python_executable: str = sys.executable,
 ) -> list[str]:
     entry = repository_root / "employee" / "skills" / "etsy-performance-listing" / "scripts" / "run_task.py"
-    return [
+    command = [
         python_executable,
         str(entry.resolve()),
         str(request.source_path.resolve()),
@@ -69,6 +73,16 @@ def build_employee_command(
         "--expected-knowledge-file-sha256",
         request.knowledge_file_sha256,
     ]
+    if request.guard_path is not None:
+        if not all(isinstance(value, str) for value in (request.guard_export_id, request.guard_payload_sha256, request.guard_file_sha256)):
+            raise WorkerProtocolError("Evidence guard detached trust is incomplete.")
+        command.extend([
+            "--guard", str(request.guard_path.resolve()),
+            "--expected-guard-export-id", request.guard_export_id,
+            "--expected-guard-payload-sha256", request.guard_payload_sha256,
+            "--expected-guard-file-sha256", request.guard_file_sha256,
+        ])
+    return command
 
 
 async def _bounded_stream(stream: asyncio.StreamReader, *, max_bytes: int) -> bytes:

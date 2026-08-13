@@ -20,7 +20,7 @@ from app.db.models import AuditEvent, CompetitorEvidence, FeedbackEvent, Knowled
 from app.db.session import create_engine_for_url, create_session_factory
 from app.employee.adapter import EmployeeReply, HermesAdapter
 from app.knowledge.schemas import CandidateInput, EvidenceInput, KnowledgeStatus
-from app.knowledge.service import KnowledgeConflictError, KnowledgeService
+from app.knowledge.service import KnowledgeConflictError, KnowledgeService, KnowledgeValidationError
 from app.main import create_app
 
 
@@ -110,6 +110,45 @@ def test_duplicate_ids_and_snapshots_from_same_listing_do_not_satisfy_independen
     assert candidate.status is KnowledgeStatus.PROPOSED
 
 
+def test_identical_snapshots_at_different_urls_do_not_satisfy_independence(knowledge) -> None:
+    service, _, _ = knowledge
+    evidence = []
+    for index in range(3):
+        payload = evidence_payload(index)
+        evidence.append(service.ingest_evidence(EvidenceInput(**{
+            **payload.model_dump(), "title": "Same title",
+            "snapshot": "Exactly the same normalized public snapshot.", "tags": ["same tag"],
+        })))
+    candidate = service.ingest_candidate(
+        candidate_payload(evidence, kind="duplicate_snapshot"), actor="employee", trace_id="duplicate-snapshot"
+    )
+    assert candidate.status is KnowledgeStatus.PROPOSED
+    assert len({item.snapshot_hash for item in evidence}) == 1
+
+
+def test_generation_uses_only_valid_immutable_active_rule_snapshot(knowledge) -> None:
+    service, factory, _ = knowledge
+    candidate = service.ingest_candidate(
+        candidate_payload([], confidence=0.4, kind="immutable_source"), actor="employee", trace_id="immutable"
+    )
+    pattern = service.approve_candidate(candidate.id, actor="owner")
+    expected = service.generation_patterns()
+    with factory() as session:
+        stored = session.get(KnowledgePattern, pattern.id)
+        stored.abstract_summary = "https://www.etsy.com/listing/999/raw snapshot"
+        stored.pattern = {"kind": "raw", "abstract": "raw competitor snapshot"}
+        session.commit()
+    assert service.generation_patterns() == expected
+    with factory() as session:
+        session.execute(text("DROP TRIGGER trg_rule_versions_v5_immutable"))
+        session.execute(text("UPDATE rule_versions SET rules=:rules WHERE pattern_id=:id AND status='active'"), {
+            "rules": json.dumps({"kind": "raw", "abstract": "https://www.etsy.com/listing/999/raw"}), "id": pattern.id,
+        })
+        session.commit()
+    with pytest.raises(KnowledgeValidationError):
+        service.generation_patterns()
+
+
 def test_three_distinct_accepted_edits_can_promote_high_confidence_candidate(knowledge) -> None:
     service, _, _ = knowledge
     candidate = service.ingest_candidate(candidate_payload([], kind="tag_strategy"), actor="employee", trace_id="t")
@@ -153,8 +192,7 @@ def test_medium_confidence_conflict_regression_and_raw_leakage_never_auto_activa
     service, _, _ = knowledge
     evidence = add_evidence(service)
     medium = service.ingest_candidate(candidate_payload(evidence, confidence=0.84, kind="medium"), actor="employee", trace_id="m")
-    service.hard_rule_kinds.add("fact_claim")
-    conflict = service.ingest_candidate(candidate_payload(evidence, kind="fact_claim"), actor="employee", trace_id="c")
+    conflict = service.ingest_candidate(candidate_payload(evidence, kind="fact_claim", abstract="Always claim genuine silk material."), actor="employee", trace_id="c")
     service.regression_check = lambda kind, abstract: kind != "regression"
     regression = service.ingest_candidate(candidate_payload(evidence, kind="regression"), actor="employee", trace_id="r")
 
@@ -170,6 +208,37 @@ def test_medium_confidence_conflict_regression_and_raw_leakage_never_auto_activa
             confidence=0.95,
             evidence_refs=[],
         )
+
+
+def test_production_default_policy_passes_safe_abstract_and_blocks_fact_claims(knowledge) -> None:
+    service, _, _ = knowledge
+    safe = service.ingest_candidate(
+        candidate_payload(add_evidence(service), kind="safe_structure"), actor="employee", trace_id="safe"
+    )
+    risky = service.ingest_candidate(
+        candidate_payload([], kind="risky", abstract="Always claim genuine silk material and guaranteed shipping."),
+        actor="employee", trace_id="risky",
+    )
+    assert safe.status is KnowledgeStatus.ACTIVE
+    assert risky.status is KnowledgeStatus.PROPOSED
+    with pytest.raises(KnowledgeConflictError, match="policy"):
+        service.approve_candidate(risky.id, actor="owner")
+
+
+def test_policy_validator_failure_is_fail_closed(knowledge) -> None:
+    service, _, _ = knowledge
+
+    class BrokenPolicy:
+        def validate(self, kind: str, abstract: str):
+            raise RuntimeError("validator unavailable")
+
+    service.policy_validator = BrokenPolicy()
+    candidate = service.ingest_candidate(
+        candidate_payload(add_evidence(service), kind="closed"), actor="employee", trace_id="closed"
+    )
+    assert candidate.status is KnowledgeStatus.PROPOSED
+    with pytest.raises(KnowledgeConflictError, match="policy_unavailable"):
+        service.approve_candidate(candidate.id, actor="owner")
 
 
 def test_manual_approve_reject_idempotence_and_concurrent_approval(knowledge) -> None:
@@ -192,8 +261,7 @@ def test_manual_approve_reject_idempotence_and_concurrent_approval(knowledge) ->
 
 def test_manual_approve_still_enforces_hard_rules_regression_and_no_leakage(knowledge) -> None:
     service, _, _ = knowledge
-    service.hard_rule_kinds.add("protected")
-    conflict = service.ingest_candidate(candidate_payload([], confidence=0.4, kind="protected"), actor="employee", trace_id="c")
+    conflict = service.ingest_candidate(candidate_payload([], confidence=0.4, kind="protected", abstract="Always claim certified genuine silk material."), actor="employee", trace_id="c")
     with pytest.raises(KnowledgeConflictError):
         service.approve_candidate(conflict.id, actor="owner")
 
@@ -276,6 +344,22 @@ def test_detached_export_matches_task5_contract_and_tamper_changes_file_hash(kno
     assert hashlib.sha256(trust.path.read_bytes()).hexdigest() != before
 
 
+def test_detached_evidence_guard_export_contains_only_id_and_raw_digest_records(knowledge, tmp_path: Path) -> None:
+    service, _, _ = knowledge
+    evidence = add_evidence(service, 2)
+    trust = service.export_evidence_guard(tmp_path / "guard.json")
+    envelope = json.loads(trust.path.read_text(encoding="utf-8"))
+    payload = {key: envelope[key] for key in ("schema_version", "export_id", "issuer", "threshold", "records")}
+    assert envelope["issuer"] == "local-evidence-guard-v1"
+    assert envelope["export_id"].startswith("eg-")
+    assert envelope["threshold"] == service.originality.threshold
+    assert envelope["content_sha256"] == hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    assert set(envelope["records"][0]) == {"id", "text", "content_sha256"}
+    assert {record["id"] for record in envelope["records"]} == {item.public_id for item in evidence}
+    assert trust.file_sha256 == hashlib.sha256(trust.path.read_bytes()).hexdigest()
+    assert stat.S_IMODE(trust.path.stat().st_mode) & stat.S_IWRITE == 0
+
+
 class EnvelopeHermes(HermesAdapter):
     def check_available(self) -> None:
         return None
@@ -330,12 +414,28 @@ def test_knowledge_api_is_safe_paginated_and_uses_precise_status_codes(knowledge
         assert client.post("/api/knowledge/patterns/999/rollback").status_code == 404
 
 
+def test_evidence_api_requires_server_capability_and_never_returns_raw(tmp_path: Path) -> None:
+    from app.api.knowledge import require_evidence_capability
+    app = create_app(
+        settings=Settings(data_dir=tmp_path / "data", database_url=f"sqlite:///{tmp_path / 'api.db'}"),
+        employee=EnvelopeHermes(),
+    )
+    payload = evidence_payload(1).model_dump(mode="json")
+    with TestClient(app) as client:
+        assert client.post("/api/knowledge/evidence", json=payload).status_code == 403
+        app.dependency_overrides[require_evidence_capability] = lambda: None
+        response = client.post("/api/knowledge/evidence", json=payload)
+        assert response.status_code == 200
+        assert set(response.json()) == {"id", "source_timestamp"}
+        assert "etsy.com" not in json.dumps(response.json())
+
+
 def test_v5_migration_is_idempotent_and_enforces_raw_sql_constraints(tmp_path: Path) -> None:
     engine = create_engine_for_url(f"sqlite:///{tmp_path / 'migration.db'}")
     init_db(engine)
     init_db(engine)
     with engine.begin() as connection:
-        assert connection.execute(text("SELECT version FROM schema_migrations ORDER BY version")).scalars().all() == [1, 2, 3, 4, 5]
+        assert connection.execute(text("SELECT version FROM schema_migrations ORDER BY version")).scalars().all() == [1, 2, 3, 4, 5, 6]
         with pytest.raises(IntegrityError):
             connection.execute(text("INSERT INTO competitor_evidence (public_id, canonical_url, source_key, title, snapshot, tags, source_timestamp, content_hash, created_at) VALUES ('bad','http://evil.test','x','t','s','[]',CURRENT_TIMESTAMP,'bad',CURRENT_TIMESTAMP)"))
         with pytest.raises(IntegrityError):

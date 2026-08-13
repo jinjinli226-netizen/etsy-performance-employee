@@ -176,6 +176,7 @@ class CompetitorEvidence(Base):
         CheckConstraint("public_id GLOB 'ev-[0-9a-f][0-9a-f]*' AND length(public_id)=35", name="ck_evidence_public_id"),
         CheckConstraint("canonical_url LIKE 'https://www.etsy.com/listing/%'", name="ck_evidence_url"),
         CheckConstraint("length(content_hash)=64 AND content_hash NOT GLOB '*[^0-9a-f]*'", name="ck_evidence_hash"),
+        CheckConstraint("length(snapshot_hash)=64 AND snapshot_hash NOT GLOB '*[^0-9a-f]*'", name="ck_evidence_snapshot_hash"),
     )
 
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -187,6 +188,7 @@ class CompetitorEvidence(Base):
     tags: Mapped[list[str]] = mapped_column(JSON, nullable=False)
     source_timestamp: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
     content_hash: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    snapshot_hash: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now, nullable=False)
 
 

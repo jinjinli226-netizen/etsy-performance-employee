@@ -388,6 +388,75 @@ def _task7_controlled_learning(connection: Connection) -> None:
         connection.execute(text(statement))
 
 
+def _task7_trust_hardening(connection: Connection) -> None:
+    evidence_columns = _columns(connection, "competitor_evidence")
+    if "snapshot_hash" not in evidence_columns:
+        connection.execute(text("ALTER TABLE competitor_evidence ADD COLUMN snapshot_hash VARCHAR(64)"))
+    rows = connection.execute(
+        text("SELECT id, title, snapshot, tags, snapshot_hash FROM competitor_evidence ORDER BY id")
+    ).mappings()
+    import hashlib
+    import unicodedata
+
+    for row in rows:
+        digest = row["snapshot_hash"]
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            def normalized(value: object) -> object:
+                if isinstance(value, str):
+                    return " ".join(unicodedata.normalize("NFKC", value).casefold().split())
+                if isinstance(value, list):
+                    return [normalized(item) for item in value]
+                return value
+            tags = json.loads(row["tags"]) if isinstance(row["tags"], str) else row["tags"]
+            payload = {"title": normalized(row["title"]), "snapshot": normalized(row["snapshot"]), "tags": normalized(tags)}
+            encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            digest = hashlib.sha256(encoded).hexdigest()
+            connection.execute(
+                text("UPDATE competitor_evidence SET snapshot_hash=:digest WHERE id=:id"),
+                {"digest": digest, "id": row["id"]},
+            )
+    connection.execute(text("CREATE INDEX IF NOT EXISTS ix_competitor_evidence_snapshot_hash ON competitor_evidence(snapshot_hash)"))
+    condition = "NEW.snapshot_hash IS NULL OR length(NEW.snapshot_hash)!=64 OR NEW.snapshot_hash GLOB '*[^0-9a-f]*'"
+    for operation in ("INSERT", "UPDATE"):
+        name = f"trg_competitor_evidence_v6_{operation.casefold()}"
+        connection.execute(text(f"DROP TRIGGER IF EXISTS {name}"))
+        connection.execute(text(
+            f"CREATE TRIGGER {name} BEFORE {operation} ON competitor_evidence WHEN {condition} "
+            "BEGIN SELECT RAISE(ABORT, 'evidence snapshot hash violation'); END"
+        ))
+    for table in ("knowledge_candidates", "knowledge_patterns", "rule_versions"):
+        condition = "NEW.status NOT IN ('proposed','testing','active','rejected','rolled_back')"
+        for operation in ("INSERT", "UPDATE"):
+            name = f"trg_{table}_v6_status_{operation.casefold()}"
+            connection.execute(text(f"DROP TRIGGER IF EXISTS {name}"))
+            connection.execute(text(
+                f"CREATE TRIGGER {name} BEFORE {operation} ON {table} WHEN {condition} "
+                "BEGIN SELECT RAISE(ABORT, 'controlled learning status violation'); END"
+            ))
+    connection.execute(text("DROP TRIGGER IF EXISTS trg_patterns_v6_active_lineage_insert"))
+    connection.execute(text("DROP TRIGGER IF EXISTS trg_patterns_v6_active_lineage_update"))
+    for operation in ("INSERT", "UPDATE"):
+        name = f"trg_patterns_v6_active_lineage_{operation.casefold()}"
+        connection.execute(text(
+            f"CREATE TRIGGER {name} BEFORE {operation} ON knowledge_patterns "
+            "WHEN NEW.status='active' AND NEW.source_candidate_id IS NULL "
+            "BEGIN SELECT RAISE(ABORT, 'active pattern lineage violation'); END"
+        ))
+    connection.execute(text("DROP TRIGGER IF EXISTS trg_rule_versions_v6_active_lineage_insert"))
+    connection.execute(text(
+        "CREATE TRIGGER trg_rule_versions_v6_active_lineage_insert BEFORE INSERT ON rule_versions "
+        "WHEN NEW.status='active' AND (NEW.knowledge_candidate_id IS NULL OR NOT EXISTS "
+        "(SELECT 1 FROM knowledge_patterns WHERE id=NEW.pattern_id AND status='active' "
+        "AND source_candidate_id=NEW.knowledge_candidate_id)) "
+        "BEGIN SELECT RAISE(ABORT, 'active rule lineage violation'); END"
+    ))
+    # Legacy patterns were quarantined in v5; their legacy rule rows cannot remain active.
+    connection.execute(text(
+        "UPDATE rule_versions SET status='rolled_back' WHERE status='active' AND pattern_id IN "
+        "(SELECT id FROM knowledge_patterns WHERE status!='active')"
+    ))
+
+
 MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (1, _task4_chat_columns),
     (2, _task6_excel_job_columns),
@@ -395,6 +464,7 @@ MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     # Refresh the v3 contract for databases that applied it before canonical UUID checks.
     (4, _task6_legacy_policy_and_constraints),
     (5, _task7_controlled_learning),
+    (6, _task7_trust_hardening),
 )
 
 

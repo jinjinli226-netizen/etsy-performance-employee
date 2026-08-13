@@ -33,6 +33,7 @@ from app.excel_jobs.storage import (
     validate_artifact,
 )
 from app.knowledge.service import KnowledgeService
+from app.knowledge.service import KnowledgeValidationError
 
 
 TERMINAL = {JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED}
@@ -242,6 +243,11 @@ class ExcelJobService:
                 if self.knowledge_service is not None
                 else ensure_empty_knowledge_export(self.settings.data_dir)
             )
+            guard_trust = (
+                self.knowledge_service.export_evidence_guard(operation / "evidence-guard.json")
+                if self.knowledge_service is not None
+                else ensure_empty_knowledge_export(self.settings.data_dir)
+            )
             request = RunnerRequest(
                 public_id=public_id,
                 source_path=source,
@@ -251,6 +257,10 @@ class ExcelJobService:
                 knowledge_export_id=trust.export_id,
                 knowledge_payload_sha256=trust.payload_sha256,
                 knowledge_file_sha256=trust.file_sha256,
+                guard_path=guard_trust.path,
+                guard_export_id=guard_trust.export_id,
+                guard_payload_sha256=guard_trust.payload_sha256,
+                guard_file_sha256=guard_trust.file_sha256,
             )
 
             async def emit(event: dict) -> None:
@@ -268,6 +278,8 @@ class ExcelJobService:
             )
             if result.output_sha256 != digest:
                 raise StorageError("invalid_artifact", "The artifact digest did not match the worker report.")
+            if self.knowledge_service is not None:
+                await asyncio.to_thread(self.knowledge_service.validate_generated_workbook, result.output_path)
             published = await asyncio.to_thread(
                 publish_artifact,
                 result.output_path,
@@ -305,6 +317,8 @@ class ExcelJobService:
         except StorageError as exc:
             code = exc.code if _SAFE_CODE.fullmatch(exc.code) else "invalid_artifact"
             self._fail(public_id, code, _safe_storage_message(code))
+        except KnowledgeValidationError:
+            self._fail(public_id, "originality_failed", "The generated workbook was too similar to protected evidence.")
         except Exception:
             try:
                 source_changed = (

@@ -84,7 +84,7 @@ def list_messages(conversation_id: int, request: Request):
 async def send_message(conversation_id: int, payload: ChatSendRequest, request: Request):
     try:
         operation_id = await service(request).start_send(
-            conversation_id, payload.content, payload.attachment_ids
+            conversation_id, payload.content, payload.attachment_ids, learning_mode=payload.learning_mode
         )
     except ConversationNotFoundError as exc:
         raise HTTPException(status_code=404, detail="Conversation not found") from exc

@@ -347,6 +347,44 @@ def test_real_runner_command_invokes_only_employee_entry_and_trusted_arguments(t
     assert "--expected-knowledge-file-sha256" in command
 
 
+def test_backend_rejects_worker_artifact_that_copies_guarded_competitor_text(tmp_path) -> None:
+    raw = "Velvet Vampire Cape for Women Dramatic Gothic Halloween Costume"
+
+    class CopiedRunner(FakeExcelRunner):
+        async def run(self, request, emit):
+            self.calls.append(request)
+            output = request.operation_dir / "generated.xlsx"
+            shutil.copyfile(request.source_path, output)
+            workbook = load_workbook(output)
+            sheet = workbook.active
+            for cells in sheet.iter_rows(min_row=1, max_row=20):
+                headers = {str(cell.value).strip(): cell.column for cell in cells if cell.value}
+                if {"head titles", "SPECIFICATION", "Instructions for buyers"} <= set(headers):
+                    header_row = cells[0].row
+                    break
+            sheet.cell(header_row + 2, headers["head titles"], raw)
+            sheet.cell(header_row + 2, headers["SPECIFICATION"], raw)
+            sheet.cell(header_row + 2, headers["Instructions for buyers"], raw)
+            workbook.save(output)
+            return WorkerResult(output, sha256(output))
+
+    settings = Settings(data_dir=tmp_path / "data", database_url=f"sqlite:///{tmp_path / 'api.db'}")
+    with TestClient(create_app(settings=settings, excel_runner=CopiedRunner())) as client:
+        from app.knowledge.schemas import EvidenceInput
+        from datetime import UTC, datetime
+        client.app.state.knowledge_service.ingest_evidence(EvidenceInput(
+            url="https://www.etsy.com/listing/123/sample", title=raw,
+            snapshot="Protected public competitor snapshot.", tags=[],
+            source_timestamp=datetime(2026, 8, 10, tzinfo=UTC),
+        ))
+        job = upload(client).json()
+        terminal = wait_terminal(client, job["id"])
+        assert terminal["status"] == "failed"
+        assert terminal["error"]["code"] == "originality_failed"
+        assert raw not in json.dumps(terminal)
+        assert client.get(f"/api/excel-jobs/{job['id']}/download").status_code == 409
+
+
 def test_artifact_contract_rejects_duplicate_fixed_header(tmp_path) -> None:
     runner = FakeExcelRunner()
 

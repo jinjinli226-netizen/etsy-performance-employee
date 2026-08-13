@@ -38,8 +38,10 @@ KNOWLEDGE_SCHEMA_VERSION = 1
 KNOWLEDGE_ISSUER = "local-knowledge-pipeline-v1"
 _RULE_FIELDS = {"rule_version", "title_min_words", "title_max_words", "tag_count", "tag_max_chars"}
 _KNOWLEDGE_ROOT_FIELDS = {"schema_version", "export_id", "issuer", "records", "content_sha256"}
+_GUARD_ROOT_FIELDS = {"schema_version", "export_id", "issuer", "threshold", "records", "content_sha256"}
 _KNOWLEDGE_ITEM_FIELDS = {"id", "status", "approved", "abstract", "content_sha256"}
 _EXPORT_ID = re.compile(r"^kx-[0-9a-f]{32}$")
+_GUARD_EXPORT_ID = re.compile(r"^eg-[0-9a-f]{32}$")
 _RECORD_ID = re.compile(r"^rec-[0-9a-f]{16,64}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _DANGEROUS_KNOWLEDGE = re.compile(
@@ -354,6 +356,70 @@ def _safe_knowledge(
     return safe_entries
 
 
+def _safe_guard(
+    path: str | Path | None, *, expected_export_id: str | None,
+    expected_payload_sha256: str | None, expected_file_sha256: str | None,
+) -> list[tuple[str, str]]:
+    if path is None:
+        if any(value is not None for value in (expected_export_id, expected_payload_sha256, expected_file_sha256)):
+            raise TaskError("invalid_guard", "Detached guard trust values require an evidence guard file.")
+        return [], 0.72
+    if not (
+        isinstance(expected_export_id, str) and _GUARD_EXPORT_ID.fullmatch(expected_export_id)
+        and isinstance(expected_payload_sha256, str) and _SHA256.fullmatch(expected_payload_sha256)
+        and isinstance(expected_file_sha256, str) and _SHA256.fullmatch(expected_file_sha256)
+    ):
+        raise TaskError("invalid_guard", "An evidence guard requires detached trusted identity and digests.")
+    guard_path = Path(path)
+    try:
+        if guard_path.stat().st_size > MAX_KNOWLEDGE_BYTES or _file_sha256(guard_path) != expected_file_sha256:
+            raise TaskError("invalid_guard", "The evidence guard file failed detached trust validation.")
+        value = json.loads(guard_path.read_text(encoding="utf-8"))
+    except TaskError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise TaskError("invalid_guard", "The evidence guard JSON could not be parsed.") from exc
+    if not isinstance(value, dict) or set(value) != _GUARD_ROOT_FIELDS:
+        raise TaskError("invalid_guard", "The evidence guard envelope is invalid.")
+    if value.get("schema_version") != 1 or value.get("issuer") != "local-evidence-guard-v1" or value.get("export_id") != expected_export_id or value.get("content_sha256") != expected_payload_sha256:
+        raise TaskError("invalid_guard", "The evidence guard identity is invalid.")
+    threshold = value.get("threshold")
+    if isinstance(threshold, bool) or not isinstance(threshold, (int, float)) or not 0.1 <= float(threshold) <= 1:
+        raise TaskError("invalid_guard", "The evidence guard threshold is invalid.")
+    payload = {key: value[key] for key in ("schema_version", "export_id", "issuer", "threshold", "records")}
+    if _canonical_sha256(payload) != expected_payload_sha256:
+        raise TaskError("invalid_guard", "The evidence guard payload digest is invalid.")
+    records = value.get("records")
+    if not isinstance(records, list) or len(records) > 1000:
+        raise TaskError("invalid_guard", "The evidence guard record count is invalid.")
+    safe = []
+    for record in records:
+        if not isinstance(record, dict) or set(record) != {"id", "text", "content_sha256"}:
+            raise TaskError("invalid_guard", "An evidence guard record is invalid.")
+        identifier, raw = record.get("id"), record.get("text")
+        if not isinstance(identifier, str) or not re.fullmatch(r"ev-[0-9a-f]{32}", identifier) or not isinstance(raw, str) or len(raw) > 100_000:
+            raise TaskError("invalid_guard", "An evidence guard record is invalid.")
+        record_payload = {"id": identifier, "text": raw}
+        if not isinstance(record.get("content_sha256"), str) or _canonical_sha256(record_payload) != record["content_sha256"]:
+            raise TaskError("invalid_guard", "An evidence guard record digest is invalid.")
+        safe.append((identifier, raw))
+    return safe, float(threshold)
+
+
+def _originality_result(generated: dict[str, Any], evidence: list[tuple[str, str]], threshold: float = 0.72) -> dict[str, Any]:
+    def shingles(value: str) -> set[str]:
+        words = re.findall(r"[\w]+", value.casefold(), re.UNICODE)
+        return {" ".join(words[index:index + 3]) for index in range(max(0, len(words) - 2))}
+    generated_shingles = set().union(*(shingles(str(generated.get(field, ""))) for field in ("head_titles", "specification", "instructions_for_buyers")))
+    maximum, evidence_id = 0.0, None
+    for identifier, raw in evidence:
+        raw_shingles = shingles(raw)
+        score = len(generated_shingles & raw_shingles) / max(1, min(len(generated_shingles), len(raw_shingles))) if raw_shingles else 0
+        if score > maximum:
+            maximum, evidence_id = score, identifier
+    return {"passed": maximum < threshold, "score": round(maximum, 6), "evidence_id": evidence_id}
+
+
 def _prompt(row: dict[str, Any], knowledge: Any, rules: dict[str, Any], repair_error: dict[str, Any] | None) -> str:
     safe_row = _safe_row_for_prompt(row)
     schema = json.loads(json.dumps(OUTPUT_SCHEMA))
@@ -412,6 +478,8 @@ def _invoke_row(
     runner: Callable[[list[str], str], subprocess.CompletedProcess[str]],
     *,
     max_response_bytes: int,
+    guard: list[tuple[str, str]] | None = None,
+    guard_threshold: float = 0.72,
 ) -> dict[str, Any]:
     command = ["hermes", "-p", PROFILE, "chat", "-Q", "--source", "tool", "--max-turns", str(MAX_TURNS)]
     images = row.get("image_paths") or []
@@ -436,7 +504,13 @@ def _invoke_row(
         if process.returncode != 0:
             raise TaskError("employee_process_failed", "The employee process failed.")
         try:
-            return _parse_and_validate(process.stdout.strip(), rules)
+            generated = _parse_and_validate(process.stdout.strip(), rules)
+            originality = _originality_result(generated, guard or [], threshold=guard_threshold)
+            if not originality["passed"]:
+                error = TaskError("originality_failed", "Generated listing was too similar to protected evidence.")
+                error.repair_details = {"code": "originality_failed", "score": originality["score"], "evidence_id": originality["evidence_id"]}
+                raise error
+            return generated
         except TaskError as exc:
             last_error = exc
             repair_error = getattr(exc, "repair_details", {"code": exc.code})
@@ -457,6 +531,10 @@ def run_task(
     expected_knowledge_export_id: str | None = None,
     expected_knowledge_payload_sha256: str | None = None,
     expected_knowledge_file_sha256: str | None = None,
+    guard_path: str | Path | None = None,
+    expected_guard_export_id: str | None = None,
+    expected_guard_payload_sha256: str | None = None,
+    expected_guard_file_sha256: str | None = None,
 ) -> dict[str, Any]:
     operation = Path(operation_dir).resolve()
     operation.mkdir(parents=True, exist_ok=True)
@@ -470,6 +548,11 @@ def run_task(
             expected_export_id=expected_knowledge_export_id,
             expected_payload_sha256=expected_knowledge_payload_sha256,
             expected_file_sha256=expected_knowledge_file_sha256,
+        )
+        guard, guard_threshold = _safe_guard(
+            guard_path, expected_export_id=expected_guard_export_id,
+            expected_payload_sha256=expected_guard_payload_sha256,
+            expected_file_sha256=expected_guard_file_sha256,
         )
         if command_runner is _default_runner:
             def active_runner(command: list[str], prompt: str) -> subprocess.CompletedProcess[str]:
@@ -486,7 +569,7 @@ def run_task(
             row_id = row["row_id"]
             emit({"event": "row_started", "row_id": row_id, "row_number": row["row_number"]})
             try:
-                results[row_id] = _invoke_row(row, knowledge, rules, active_runner, max_response_bytes=max_response_bytes)
+                results[row_id] = _invoke_row(row, knowledge, rules, active_runner, max_response_bytes=max_response_bytes, guard=guard, guard_threshold=guard_threshold)
             except TaskError as exc:
                 emit({"event": "row_failed", "row_id": row_id, "error": {"code": exc.code, "message": str(exc)}})
                 raise
@@ -512,6 +595,10 @@ def main() -> int:
     parser.add_argument("--expected-knowledge-export-id")
     parser.add_argument("--expected-knowledge-payload-sha256")
     parser.add_argument("--expected-knowledge-file-sha256")
+    parser.add_argument("--guard")
+    parser.add_argument("--expected-guard-export-id")
+    parser.add_argument("--expected-guard-payload-sha256")
+    parser.add_argument("--expected-guard-file-sha256")
     parser.add_argument("--rules", required=True)
     parser.add_argument("--timeout-seconds", type=float, default=DEFAULT_TIMEOUT_SECONDS)
     parser.add_argument("--max-response-bytes", type=int, default=DEFAULT_MAX_RESPONSE_BYTES)
@@ -528,6 +615,10 @@ def main() -> int:
             expected_knowledge_export_id=args.expected_knowledge_export_id,
             expected_knowledge_payload_sha256=args.expected_knowledge_payload_sha256,
             expected_knowledge_file_sha256=args.expected_knowledge_file_sha256,
+            guard_path=args.guard,
+            expected_guard_export_id=args.expected_guard_export_id,
+            expected_guard_payload_sha256=args.expected_guard_payload_sha256,
+            expected_guard_file_sha256=args.expected_guard_file_sha256,
         )
         return 0
     except (TaskError, OSError, UnicodeError, json.JSONDecodeError) as exc:
