@@ -70,8 +70,8 @@ def test_production_start_script_parses_and_uses_bounded_owned_processes() -> No
     assert "-Process $startedFrontend -ExpectedExecutable $NodePath -CommandMarker $VitePath" in script
     assert "taskkill" not in script.casefold()
     assert "Stop-Process -Name" not in script
-    assert '"--port", "8765"' in script
-    assert "5173" in script and "--strictPort" in script
+    assert '"--port", ([string]$BackendPort)' in script
+    assert '([string]$FrontendPort), "--strictPort"' in script
     assert "if ((Test-PortInUse -Port $BackendPort) -or (Test-PortInUse -Port $FrontendPort))" in script
 
 
@@ -166,12 +166,17 @@ def test_startup_builds_and_serves_the_production_frontend_with_local_api_proxy(
     assert "run build" in script and "pnpm" in script.casefold()
     assert '"preview"' in script and "vite.js" in script
     assert '"app.main:app"' in script and '"uvicorn"' in script
-    assert "http://127.0.0.1:5173" in script
+    assert "http://127.0.0.1:$FrontendPort" in script
     assert "preview:" in vite and "server:" in vite
     assert '"/api"' in vite
     assert '"http://127.0.0.1:8765"' in vite
     assert 'process.env.ETSY_E2E_TEST_MODE === "1"' in vite
     assert "ETSY_E2E_BACKEND" in vite
+    assert "[ValidateRange(1024, 65535)][int]$BackendPort" in script
+    assert "[ValidateRange(1024, 65535)][int]$FrontendPort" in script
+    assert "$env:ETSY_EMPLOYEE_BACKEND_PORT = [string]$BackendPort" in script
+    assert "ETSY_EMPLOYEE_BACKEND_PORT" in vite
+    assert "127.0.0.1" in vite
 
 
 def test_chinese_readme_documents_truthful_setup_start_stop_and_storage() -> None:

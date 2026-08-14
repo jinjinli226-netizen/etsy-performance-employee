@@ -3,6 +3,8 @@ param(
     [string]$DataDirectory,
     [string]$HermesExecutable = "hermes",
     [string]$HermesHome,
+    [ValidateRange(1024, 65535)][int]$BackendPort = 8765,
+    [ValidateRange(1024, 65535)][int]$FrontendPort = 5173,
     [switch]$Stop
 )
 
@@ -14,10 +16,12 @@ $BackendPath = Join-Path $ProjectRoot "backend"
 $FrontendPath = Join-Path $ProjectRoot "frontend"
 $VitePath = Join-Path $FrontendPath "node_modules\vite\bin\vite.js"
 $ProfileId = "etsy-performance-us"
-$BackendPort = 8765
-$FrontendPort = 5173
 $StartEnvironmentScript = Join-Path $PSScriptRoot "start-environment.ps1"
 . $StartEnvironmentScript
+
+if ($BackendPort -eq $FrontendPort) {
+    throw "BackendPort and FrontendPort must be different."
+}
 
 if ([string]::IsNullOrWhiteSpace($DataDirectory)) {
     $DataDirectory = Join-Path $env:LOCALAPPDATA "etsy-performance-employee\data"
@@ -303,7 +307,7 @@ if ($null -ne $previousMetadata) {
     Remove-Item -LiteralPath $PidFile -Force
 }
 if ((Test-PortInUse -Port $BackendPort) -or (Test-PortInUse -Port $FrontendPort)) {
-    throw "Port 8765 or 5173 is already in use; no process was stopped."
+    throw "A requested backend or frontend port is already in use; no process was stopped."
 }
 
 $HermesCommand = Get-Command $HermesExecutable -CommandType Application -ErrorAction Stop
@@ -317,6 +321,7 @@ if ([string]::IsNullOrWhiteSpace($HermesHome)) {
 $HermesHome = [IO.Path]::GetFullPath($HermesHome)
 Assert-SafeDataDirectory -Path $HermesHome
 Set-EmployeeRuntimeEnvironment -DataDirectory $DataDirectory -HermesExecutable $HermesPath -HermesHome $HermesHome
+$env:ETSY_EMPLOYEE_BACKEND_PORT = [string]$BackendPort
 $NodePath = (Get-Command node -ErrorAction Stop).Source
 $PnpmPath = (Get-Command pnpm -ErrorAction Stop).Source
 $PowerShellPath = (Get-Command powershell -ErrorAction Stop).Source
@@ -362,10 +367,10 @@ $metadata = [pscustomobject]@{
 $startedBackend = $null
 $startedFrontend = $null
 try {
-    $startedBackend = Start-Process -FilePath $PythonPath -ArgumentList "-m", "uvicorn", "app.main:app", "--app-dir", $BackendPath, "--host", "127.0.0.1", "--port", "8765" -WorkingDirectory $BackendPath -WindowStyle Hidden -PassThru
+    $startedBackend = Start-Process -FilePath $PythonPath -ArgumentList "-m", "uvicorn", "app.main:app", "--app-dir", $BackendPath, "--host", "127.0.0.1", "--port", ([string]$BackendPort) -WorkingDirectory $BackendPath -WindowStyle Hidden -PassThru
     $metadata.services | Add-Member -NotePropertyName backend -NotePropertyValue (New-ProcessRecord -Process $startedBackend -Port $BackendPort -CommandMarker $BackendPath -Role "backend")
 
-    $startedFrontend = Start-Process -FilePath $NodePath -ArgumentList $VitePath, "preview", "--host", "127.0.0.1", "--port", "5173", "--strictPort" -WorkingDirectory $FrontendPath -WindowStyle Hidden -PassThru
+    $startedFrontend = Start-Process -FilePath $NodePath -ArgumentList $VitePath, "preview", "--host", "127.0.0.1", "--port", ([string]$FrontendPort), "--strictPort" -WorkingDirectory $FrontendPath -WindowStyle Hidden -PassThru
     $metadata.services | Add-Member -NotePropertyName frontend -NotePropertyValue (New-ProcessRecord -Process $startedFrontend -Port $FrontendPort -CommandMarker $VitePath -Role "frontend")
 
     $temporaryPidFile = Join-Path $RuntimePath (".start-pids-" + [Guid]::NewGuid().ToString("N") + ".tmp")
@@ -374,7 +379,7 @@ try {
 
     Wait-ForServicePort -Port $BackendPort -Record $metadata.services.backend
     Wait-ForServicePort -Port $FrontendPort -Record $metadata.services.frontend
-    Write-Host "Etsy Performance Employee is running at http://127.0.0.1:5173"
+    Write-Host "Etsy Performance Employee is running at http://127.0.0.1:$FrontendPort"
     Write-Host "Press Ctrl+C to stop only these verified service processes."
 
     while ($true) {
