@@ -99,6 +99,48 @@ function Test-ConfigUnset {
     }
 }
 
+function Invoke-HermesModelCheck {
+    param([Parameter(Mandatory = $true)][string]$Prompt)
+
+    if ($Prompt.Contains('"')) {
+        throw "The model-check prompt contains unsupported quoting."
+    }
+    $Arguments = @(
+        "-p", $ProfileId, "chat", "-Q", "--source", "tool", "--max-turns", "1",
+        "-q", $Prompt
+    )
+    $QuotedArguments = $Arguments | ForEach-Object {
+        '"' + ([string]$_).Replace('\', '\').Replace('"', '\"') + '"'
+    }
+    $StartInfo = [Diagnostics.ProcessStartInfo]::new()
+    $StartInfo.FileName = $HermesCommand
+    $StartInfo.Arguments = $QuotedArguments -join " "
+    $StartInfo.UseShellExecute = $false
+    $StartInfo.CreateNoWindow = $true
+    $StartInfo.RedirectStandardOutput = $true
+    $StartInfo.RedirectStandardError = $true
+    $StartInfo.StandardOutputEncoding = [Text.Encoding]::UTF8
+    $StartInfo.StandardErrorEncoding = [Text.Encoding]::UTF8
+    $Process = [Diagnostics.Process]::new()
+    $Process.StartInfo = $StartInfo
+    if (-not $Process.Start()) {
+        throw "The Hermes model check could not start."
+    }
+    $StdoutTask = $Process.StandardOutput.ReadToEndAsync()
+    $StderrTask = $Process.StandardError.ReadToEndAsync()
+    if (-not $Process.WaitForExit(120000)) {
+        $Process.Kill()
+        $Process.WaitForExit()
+        return [pscustomobject]@{ ExitCode = 124; Output = "" }
+    }
+    $StdoutTask.Wait()
+    $StderrTask.Wait()
+    return [pscustomobject]@{
+        ExitCode = $Process.ExitCode
+        Output = $StdoutTask.Result
+    }
+}
+
 function Get-FileHashOrMissing {
     param([Parameter(Mandatory = $true)][string]$Path)
 
@@ -424,9 +466,8 @@ if (-not [string]::IsNullOrWhiteSpace($BaselinePath)) {
 }
 
 if ($RunModelCheck -and $Failures.Count -eq 0) {
-    $Prompt = "系统集成测试：不要调用工具，不要修改记忆，只回复 PROFILE_READY"
-    $ChatArguments = @("-p", $ProfileId, "chat", "-Q", "--source", "tool", "--max-turns", "1", "-q", $Prompt)
-    $ChatResult = Invoke-HermesCapture -Arguments $ChatArguments
+    $Prompt = "Integration probe. Do not call tools or write memory. Reply with exactly PROFILE_READY."
+    $ChatResult = Invoke-HermesModelCheck -Prompt $Prompt
     if ($ChatResult.ExitCode -ne 0 -or $ChatResult.Output.Trim() -cne "PROFILE_READY") {
         Add-Failure "The optional model check did not return the exact usable marker PROFILE_READY."
     }

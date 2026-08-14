@@ -204,6 +204,7 @@ def run_verifier(
     *,
     initial_provision: bool = False,
     run_doctor: bool = False,
+    run_model_check: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     arguments = [
         powershell_executable(),
@@ -220,12 +221,54 @@ def run_verifier(
         arguments.append("-InitialProvision")
     if run_doctor:
         arguments.append("-RunDoctor")
+    if run_model_check:
+        arguments.append("-RunModelCheck")
     return subprocess.run(
         arguments,
         capture_output=True,
         text=True,
         check=False,
     )
+
+
+def test_model_check_uses_stdout_only_when_native_stderr_contains_session_metadata(
+    tmp_path: Path,
+) -> None:
+    hermes_home, _, delegate, values = create_verifier_fixture(tmp_path)
+    escaped_values = "\n".join(
+        f"    '{key}' = '{value.replace(chr(39), chr(39) * 2)}'"
+        for key, value in values.items()
+    )
+    delegate.write_text(
+        "$Values = @{\n"
+        f"{escaped_values}\n"
+        "}\n"
+        "if ($args -contains 'chat') { "
+        "[Console]::Error.WriteLine('session_id: fixture-session'); "
+        "[Console]::Out.WriteLine('PROFILE_READY'); exit 0 }\n"
+        "$Key = $args[$args.Count - 1]\n"
+        "if ($Values.ContainsKey($Key)) { Write-Output $Values[$Key]; exit 0 }\n"
+        "[Console]::Error.WriteLine('Config key not set: model.base_url')\n"
+        "exit 1\n",
+        encoding="utf-8-sig",
+    )
+    native_wrapper = tmp_path / "fake-hermes.cmd"
+    native_wrapper.write_text(
+        "@echo off\n"
+        f'powershell.exe -NoProfile -NonInteractive -File "{delegate}" %*\n'
+        "exit /b %ERRORLEVEL%\n",
+        encoding="utf-8",
+    )
+
+    result = run_verifier(
+        hermes_home,
+        native_wrapper,
+        run_model_check=True,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Employee Profile verification passed." in result.stdout
+    assert "NativeCommandError" not in result.stdout + result.stderr
 
 
 def test_soul_defines_only_the_etsy_performance_costume_role() -> None:

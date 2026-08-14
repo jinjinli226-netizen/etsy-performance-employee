@@ -14,7 +14,6 @@ $BackendPath = Join-Path $ProjectRoot "backend"
 $FrontendPath = Join-Path $ProjectRoot "frontend"
 $VitePath = Join-Path $FrontendPath "node_modules\vite\bin\vite.js"
 $ProfileId = "etsy-performance-us"
-$ProviderId = "openai-codex"
 $BackendPort = 8765
 $FrontendPort = 5173
 $StartEnvironmentScript = Join-Path $PSScriptRoot "start-environment.ps1"
@@ -222,10 +221,32 @@ function Wait-ForServicePort {
     throw "Service process for port $Port did not bind before the deadline."
 }
 
-function Invoke-HermesCredentialStatus {
-    param([Parameter(Mandatory = $true)][string]$HermesCommand)
+function Get-EmployeeProfileManifest {
+    param([Parameter(Mandatory = $true)][string]$HermesRoot)
 
-    $arguments = @("-p", $ProfileId, "auth", "status", $ProviderId)
+    $manifestPath = Join-Path $HermesRoot "profiles\$ProfileId\provisioning-manifest.json"
+    if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+        throw "The Hermes employee provisioning manifest is missing."
+    }
+    $item = Get-Item -LiteralPath $manifestPath -Force
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $item.Length -gt 65536) {
+        throw "The Hermes employee provisioning manifest is unsafe."
+    }
+    try {
+        return Get-Content -LiteralPath $manifestPath -Raw -Encoding utf8 | ConvertFrom-Json
+    }
+    catch {
+        throw "The Hermes employee provisioning manifest is invalid."
+    }
+}
+
+function Invoke-HermesCredentialStatus {
+    param(
+        [Parameter(Mandatory = $true)][string]$HermesCommand,
+        [Parameter(Mandatory = $true)][string]$Provider
+    )
+
+    $arguments = @("-p", $ProfileId, "auth", "status", $Provider)
     $previousErrorActionPreference = $ErrorActionPreference
     $hadNativePreference = Test-Path Variable:PSNativeCommandUseErrorActionPreference
     if ($hadNativePreference) { $previousNativePreference = $PSNativeCommandUseErrorActionPreference }
@@ -234,7 +255,7 @@ function Invoke-HermesCredentialStatus {
         if ($hadNativePreference) { $PSNativeCommandUseErrorActionPreference = $false }
         $lines = @(& $HermesCommand @arguments 2>&1 | ForEach-Object { [string]$_ })
         $exitCode = $LASTEXITCODE
-        return $exitCode -eq 0 -and $lines.Count -ge 1 -and $lines[0].Trim() -ceq "${ProviderId}: logged in"
+        return $exitCode -eq 0 -and $lines.Count -ge 1 -and $lines[0].Trim() -ceq "${Provider}: logged in"
     }
     finally {
         $ErrorActionPreference = $previousErrorActionPreference
@@ -316,8 +337,15 @@ if ($verifyResult.ExitCode -ne 0) {
     throw "The Hermes employee Profile verification failed. No service was started."
 }
 if (-not [string]::IsNullOrWhiteSpace($verifyResult.Stdout)) { Write-Host $verifyResult.Stdout.Trim() }
-if (-not (Invoke-HermesCredentialStatus -HermesCommand $HermesPath)) {
-    throw "Hermes credential is not ready. Run: hermes -p etsy-performance-us auth add openai-codex --type oauth"
+$profileManifest = Get-EmployeeProfileManifest -HermesRoot $HermesHome
+if (-not [bool]$profileManifest.keyConfigured) {
+    $profileProvider = [string]$profileManifest.provider
+    if ($profileProvider -cne "openai-codex") {
+        throw "Hermes API-key credential is not configured for the employee Profile."
+    }
+    if (-not (Invoke-HermesCredentialStatus -HermesCommand $HermesPath -Provider $profileProvider)) {
+        throw "Hermes OAuth credential is not ready for the employee Profile."
+    }
 }
 
 & $PythonPath -c "import fastapi, openpyxl, sqlalchemy, uvicorn"

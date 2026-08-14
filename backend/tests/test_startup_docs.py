@@ -80,8 +80,12 @@ def test_startup_preflight_is_read_only_and_never_handles_credentials() -> None:
     lowered = script.casefold()
 
     assert "verify-employee.ps1" in script
-    assert '@("-p", $ProfileId, "auth", "status", $ProviderId)' in script
-    assert "hermes -p etsy-performance-us auth add openai-codex --type oauth" in script
+    assert '@("-p", $ProfileId, "auth", "status", $Provider)' in script
+    assert "Get-EmployeeProfileManifest" in script
+    assert "keyConfigured" in script
+    assert "if (-not [bool]$profileManifest.keyConfigured" in script
+    assert "Hermes API-key credential is not configured" in script
+    assert "Hermes OAuth credential is not ready" in script
     assert "RunModelCheck" not in script and "RunDoctor" not in script
     assert "--api-key" not in lowered
     assert "read-host" not in lowered
