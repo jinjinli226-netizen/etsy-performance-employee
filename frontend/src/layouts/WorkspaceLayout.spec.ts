@@ -1,4 +1,4 @@
-import { enableAutoUnmount, mount } from "@vue/test-utils";
+import { enableAutoUnmount, mount, type VueWrapper } from "@vue/test-utils";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { nextTick } from "vue";
 import { createMemoryHistory, createRouter } from "vue-router";
@@ -7,6 +7,9 @@ import App from "../App.vue";
 import ChatView from "../views/ChatView.vue";
 import ExcelView from "../views/ExcelView.vue";
 import EmployeeStatus from "../components/EmployeeStatus.vue";
+
+const { fetchEmployeeStatusMock } = vi.hoisted(() => ({ fetchEmployeeStatusMock: vi.fn() }));
+vi.mock("../api/employee", () => ({ fetchEmployeeStatus: fetchEmployeeStatusMock }));
 
 enableAutoUnmount(afterEach);
 
@@ -32,6 +35,8 @@ describe("WorkspaceLayout", () => {
   beforeEach(() => {
     localStorage.clear();
     setViewport(1440);
+    fetchEmployeeStatusMock.mockReset();
+    fetchEmployeeStatusMock.mockResolvedValue({ status: "online" });
   });
 
   afterEach(() => {
@@ -241,6 +246,92 @@ describe("WorkspaceLayout", () => {
 
     expect(wrapper.findAll('[role="status"][aria-live="polite"]')).toHaveLength(1);
     expect(wrapper.findAll('[aria-label^="数字员工状态"]')).toHaveLength(2);
+  });
+});
+
+describe("WorkspaceLayout employee status polling", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    localStorage.clear();
+    setViewport(1440);
+    fetchEmployeeStatusMock.mockReset();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    document.body.style.overflow = "";
+    fetchEmployeeStatusMock.mockReset();
+  });
+
+  const flush = async () => {
+    for (let i = 0; i < 5; i += 1) await Promise.resolve();
+    await nextTick();
+  };
+
+  const mountApp = async () => {
+    const router = createTestRouter("/chat");
+    await router.isReady();
+    const wrapper = mount(App, { global: { plugins: [router] } });
+    await flush();
+    return wrapper;
+  };
+
+  it("shows 在线 after the initial request reports online", async () => {
+    fetchEmployeeStatusMock.mockResolvedValue({ status: "online" });
+
+    const wrapper = await mountApp();
+
+    expect(fetchEmployeeStatusMock).toHaveBeenCalledTimes(1);
+    expect(wrapper.text()).toContain("在线");
+  });
+
+  it("shows 工作中 when the status reports busy", async () => {
+    fetchEmployeeStatusMock.mockResolvedValue({ status: "busy" });
+
+    const wrapper = await mountApp();
+
+    expect(wrapper.text()).toContain("工作中");
+  });
+
+  it("shows 异常 when the status request fails", async () => {
+    fetchEmployeeStatusMock.mockRejectedValue(new Error("network down"));
+
+    const wrapper = await mountApp();
+
+    expect(wrapper.text()).toContain("异常");
+  });
+
+  it("refreshes the displayed status on the polling timer", async () => {
+    fetchEmployeeStatusMock.mockResolvedValue({ status: "online" });
+    const wrapper = await mountApp();
+    expect(wrapper.text()).toContain("在线");
+
+    fetchEmployeeStatusMock.mockResolvedValue({ status: "busy" });
+    await vi.advanceTimersByTimeAsync(2500);
+    await flush();
+
+    expect(fetchEmployeeStatusMock).toHaveBeenCalledTimes(2);
+    expect(wrapper.text()).toContain("工作中");
+  });
+
+  it("aborts in-flight requests and clears the timer on unmount", async () => {
+    let resolveStatus: ((value: { status: "online" }) => void) | undefined;
+    fetchEmployeeStatusMock.mockReturnValue(
+      new Promise<{ status: "online" }>((resolve) => {
+        resolveStatus = resolve;
+      }),
+    );
+    const wrapper = await mountApp();
+    expect(fetchEmployeeStatusMock).toHaveBeenCalledTimes(1);
+    const signal = fetchEmployeeStatusMock.mock.calls[0][0] as AbortSignal;
+
+    wrapper.unmount();
+
+    expect(signal.aborted).toBe(true);
+    resolveStatus?.({ status: "online" });
+    await flush();
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(fetchEmployeeStatusMock).toHaveBeenCalledTimes(1);
   });
 });
 

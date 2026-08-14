@@ -6,6 +6,7 @@ from pathlib import Path
 from fastapi import FastAPI
 
 from app.api.chat import router as chat_router
+from app.api.employee import router as employee_router
 from app.api.excel_jobs import router as excel_jobs_router
 from app.api.knowledge import router as knowledge_router
 from app.api.migration import router as migration_router
@@ -46,6 +47,7 @@ def create_app(
         app.state.settings = runtime_settings
         app.state.engine = engine
         app.state.session_factory = factory
+        app.state.employee = runtime_employee
         app.state.knowledge_service = KnowledgeService(
             factory,
             export_dir=runtime_settings.data_dir / "trust",
@@ -101,6 +103,7 @@ def create_app(
         return {"status": "ok"}
 
     application.include_router(chat_router)
+    application.include_router(employee_router)
     application.include_router(excel_jobs_router)
     application.include_router(knowledge_router)
     application.include_router(migration_router)

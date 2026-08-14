@@ -3,14 +3,32 @@ import { Menu } from "lucide-vue-next";
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useRoute } from "vue-router";
 
+import { fetchEmployeeStatus } from "../api/employee";
 import AppSidebar from "../components/AppSidebar.vue";
 import EmployeeStatus, { type EmployeeState } from "../components/EmployeeStatus.vue";
 
 const SIDEBAR_KEY = "etsy-workspace-sidebar-collapsed";
 const MOBILE_BREAKPOINT = 640;
+const EMPLOYEE_STATUS_POLL_MS = 2500;
 
 const route = useRoute();
-const employeeStatus: EmployeeState = "offline";
+const employeeStatus = ref<EmployeeState>("offline");
+let employeeStatusTimer: number | undefined;
+let employeeStatusController: AbortController | undefined;
+
+const refreshEmployeeStatus = async () => {
+  employeeStatusController?.abort();
+  const controller = new AbortController();
+  employeeStatusController = controller;
+  try {
+    const { status } = await fetchEmployeeStatus(controller.signal);
+    if (controller.signal.aborted) return;
+    employeeStatus.value = status;
+  } catch {
+    if (controller.signal.aborted) return;
+    employeeStatus.value = "error";
+  }
+};
 const mobile = ref(false);
 const mobileOpen = ref(false);
 const menuButton = ref<HTMLButtonElement | null>(null);
@@ -128,12 +146,23 @@ onMounted(() => {
   updateViewport();
   window.addEventListener("resize", updateViewport);
   window.addEventListener("keydown", handleKeydown);
+  void refreshEmployeeStatus();
+  employeeStatusTimer = window.setInterval(
+    () => void refreshEmployeeStatus(),
+    EMPLOYEE_STATUS_POLL_MS,
+  );
 });
 
 onBeforeUnmount(() => {
   unlockBodyScroll();
   window.removeEventListener("resize", updateViewport);
   window.removeEventListener("keydown", handleKeydown);
+  if (employeeStatusTimer !== undefined) {
+    window.clearInterval(employeeStatusTimer);
+    employeeStatusTimer = undefined;
+  }
+  employeeStatusController?.abort();
+  employeeStatusController = undefined;
 });
 </script>
 
