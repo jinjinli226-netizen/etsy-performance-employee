@@ -2,6 +2,12 @@ from __future__ import annotations
 
 import sys
 sys.dont_write_bytecode = True
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+del _stream
 
 import argparse
 import hashlib
@@ -17,8 +23,8 @@ from typing import Any, Callable
 
 
 PROFILE = "etsy-performance-us"
-MAX_TURNS = 6
-DEFAULT_TIMEOUT_SECONDS = 120.0
+MAX_TURNS = 30
+DEFAULT_TIMEOUT_SECONDS = 300.0
 MAX_TIMEOUT_SECONDS = 600.0
 DEFAULT_MAX_RESPONSE_BYTES = 256 * 1024
 MAX_RESPONSE_BYTES = 1024 * 1024
@@ -449,14 +455,32 @@ def _prompt(row: dict[str, Any], knowledge: Any, rules: dict[str, Any], repair_e
     return prompt
 
 
+def _extract_json_object(text: str):
+    """Parse the employee reply, tolerating a CLI reasoning panel before the JSON."""
+    stripped = text.strip()
+    try:
+        return json.loads(stripped)
+    except (json.JSONDecodeError, UnicodeError, RecursionError):
+        pass
+    # The Hermes CLI may prefix the answer with a reasoning panel; try each
+    # object start from the end and keep the first valid JSON object.
+    for start in range(len(stripped) - 1, -1, -1):
+        if stripped[start] != "{":
+            continue
+        try:
+            return json.loads(stripped[start:])
+        except (json.JSONDecodeError, UnicodeError, RecursionError):
+            continue
+    return None
+
+
 def _parse_and_validate(text: str, rules: dict[str, Any]) -> dict[str, Any]:
     validator = _load_sibling("validate_output")
-    try:
-        payload = json.loads(text)
-    except json.JSONDecodeError as exc:
+    payload = _extract_json_object(text)
+    if payload is None:
         error = TaskError("malformed_model_json", "The employee returned malformed JSON.")
         error.repair_details = {"code": error.code, "message": "Response is not valid JSON."}
-        raise error from exc
+        raise error
     try:
         return validator.validate_generated(payload, rules)
     except validator.OutputValidationError as exc:
