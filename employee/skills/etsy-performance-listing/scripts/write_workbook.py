@@ -15,6 +15,12 @@ from typing import Any
 
 from openpyxl import load_workbook
 from openpyxl.utils import column_index_from_string, get_column_letter
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+del _stream
 
 
 HEADER_TO_KEY = {

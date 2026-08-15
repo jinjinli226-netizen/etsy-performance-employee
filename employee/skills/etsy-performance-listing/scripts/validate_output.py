@@ -10,6 +10,12 @@ import re
 import unicodedata
 from pathlib import Path
 from typing import Any
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+del _stream
 
 
 FIELDS = {

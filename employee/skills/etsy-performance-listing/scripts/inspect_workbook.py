@@ -18,6 +18,12 @@ from xml.etree import ElementTree
 from openpyxl import load_workbook
 from openpyxl.cell.cell import MergedCell
 from openpyxl.utils import get_column_letter
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+del _stream
 
 
 OUTPUT_HEADERS = (
