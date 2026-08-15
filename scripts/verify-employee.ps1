@@ -209,6 +209,8 @@ function Test-AssetIsolation {
     $SkillsRoot = Join-Path $ProfileHome "skills"
     if (Test-Path -LiteralPath $SkillsRoot -PathType Container) {
         $AllowedEntries = @(
+            ".usage.json",
+            ".usage.json.lock",
             "etsy-performance-listing",
             "etsy-performance-listing/SKILL.md",
             "etsy-performance-listing/references",

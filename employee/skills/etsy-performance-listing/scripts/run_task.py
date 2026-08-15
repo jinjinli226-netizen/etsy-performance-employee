@@ -24,7 +24,7 @@ from typing import Any, Callable
 
 PROFILE = "etsy-performance-us"
 MAX_TURNS = 30
-DEFAULT_TIMEOUT_SECONDS = 300.0
+DEFAULT_TIMEOUT_SECONDS = 480.0
 MAX_TIMEOUT_SECONDS = 600.0
 DEFAULT_MAX_RESPONSE_BYTES = 256 * 1024
 MAX_RESPONSE_BYTES = 1024 * 1024
@@ -583,6 +583,7 @@ def run_task(
         manifest_path = operation / "manifest.json"
         manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
         results: dict[str, dict[str, Any]] = {}
+        failed_rows: list[dict[str, Any]] = []
         for row in manifest["rows"]:
             row_id = row["row_id"]
             emit({"event": "row_started", "row_id": row_id, "row_number": row["row_number"]})
@@ -590,7 +591,8 @@ def run_task(
                 results[row_id] = _invoke_row(row, knowledge, rules, active_runner, max_response_bytes=max_response_bytes, guard=guard, guard_threshold=guard_threshold)
             except TaskError as exc:
                 emit({"event": "row_failed", "row_id": row_id, "error": {"code": exc.code, "message": str(exc)}})
-                raise
+                failed_rows.append({"row_id": row_id, "row_number": row["row_number"], "code": exc.code})
+                continue
             listing_warnings = [
                 *results[row_id]["fact_warnings"],
                 *results[row_id]["quality_warnings"],
@@ -601,6 +603,8 @@ def run_task(
                 "row_number": row["row_number"],
                 "warnings": listing_warnings,
             })
+        if not results:
+            raise TaskError("all_rows_failed", "No product rows could be generated.")
         expected_rule_version = rules["rule_version"]
         report = writer.write_workbook(source_path, operation, manifest, results, rules=rules, expected_rule_version=expected_rule_version)
         emit({"event": "completed", "output_path": report["output_path"], "output_sha256": report["output_sha256"]})

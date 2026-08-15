@@ -230,14 +230,14 @@ def remove_operation_dir(operation: Path, workspace: Path) -> None:
         os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
         function(path)
 
-    for attempt in range(3):
+    for attempt in range(8):
         try:
             shutil.rmtree(verified, onerror=make_writable_and_retry)
             return
         except (OSError, PermissionError) as exc:
-            if attempt == 2:
+            if attempt == 7:
                 raise StorageError("cleanup_failed", "Temporary operation cleanup failed.") from exc
-            time.sleep(0.02 * (attempt + 1))
+            time.sleep(0.3 * (attempt + 1))
 
 
 def ensure_empty_knowledge_export(data_dir: Path) -> KnowledgeTrust:
