@@ -1,7 +1,7 @@
 # Etsy 图片 + Listing 联合训练与 Excel 视觉生成设计规格
 
-日期：2026-08-17  
-状态：方案已口头确认，等待书面规格复核  
+日期：2026-08-17
+状态：方案已口头确认，等待书面规格复核
 目标运行环境：Windows、本机 FastAPI 服务、`etsy-performance-us` Hermes Profile
 
 ## 1. 背景
