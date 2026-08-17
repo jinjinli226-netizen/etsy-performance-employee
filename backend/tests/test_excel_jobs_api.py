@@ -8,6 +8,7 @@ import shutil
 import stat
 import sys
 import time
+import zipfile
 from pathlib import Path
 from uuid import NAMESPACE_URL, uuid5
 
@@ -207,6 +208,20 @@ def test_upload_rejects_unsupported_or_disguised_files(api, filename, content, e
     response = client.post("/api/excel-jobs", files={"file": (filename, content)})
     assert response.status_code == expected
     assert client.get("/api/excel-jobs").json()["total"] == 0
+
+
+def test_xlsx_validator_accepts_a_valid_sheet_without_cached_dimensions(tmp_path: Path) -> None:
+    workbook = tmp_path / "dimensionless.xlsx"
+    with zipfile.ZipFile(FIXTURE) as source, zipfile.ZipFile(workbook, "w", zipfile.ZIP_DEFLATED) as target:
+        for info in source.infolist():
+            body = source.read(info.filename)
+            if info.filename == "xl/worksheets/sheet1.xml":
+                start = body.index(b"<dimension ")
+                end = body.index(b"/>", start) + 2
+                body = body[:start] + body[end:]
+            target.writestr(info, body)
+
+    excel_storage._validate_xlsx_package(workbook)
 
 
 def test_upload_returns_507_before_queue_or_worker_when_knowledge_capacity_exceeded(api, monkeypatch) -> None:

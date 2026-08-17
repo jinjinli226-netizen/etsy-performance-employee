@@ -132,7 +132,11 @@ def _validate_xlsx_package(path: Path | BinaryIO) -> None:
         workbook = load_workbook(path, read_only=True, data_only=False, keep_links=False)
         try:
             for worksheet in workbook.worksheets:
-                if worksheet.max_row > MAX_ROWS or worksheet.max_column > MAX_COLUMNS:
+                if worksheet.max_row is None or worksheet.max_column is None:
+                    worksheet.calculate_dimension(force=True)
+                row_count = worksheet.max_row or 0
+                column_count = worksheet.max_column or 0
+                if row_count > MAX_ROWS or column_count > MAX_COLUMNS:
                     raise StorageError("unsafe_workbook", "A worksheet exceeds safe dimension limits.")
         finally:
             workbook.close()
