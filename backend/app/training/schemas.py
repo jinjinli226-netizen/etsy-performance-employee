@@ -6,6 +6,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from app.knowledge.schemas import KnowledgeStatus
+
 
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 KnowledgeKind = Literal[
@@ -160,3 +162,18 @@ class ReviewSet(StrictModel):
         if len(kinds) != len(set(kinds)):
             raise ValueError("review kinds must be distinct")
         return self
+
+
+class ActiveToken(StrictModel):
+    active_rule_public_id: str | None = Field(default=None, max_length=36)
+    pattern_revision: int | None = Field(default=None, ge=0)
+
+
+class TrainingActivationResult(StrictModel):
+    candidate_id: int
+    candidate_public_id: str
+    kind: KnowledgeKind
+    status: KnowledgeStatus
+    review_public_id: str
+    activated_rule_version: str | None = None
+    not_activated_reason: str | None = None

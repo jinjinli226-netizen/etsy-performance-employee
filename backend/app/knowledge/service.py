@@ -16,7 +16,7 @@ from uuid import uuid4
 from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.db.models import AuditEvent, CompetitorEvidence, FeedbackEvent, ImportedEvidenceFingerprint, KnowledgeCandidate, KnowledgePattern, RuleVersion
+from app.db.models import AuditEvent, CompetitorEvidence, FeedbackEvent, ImportedEvidenceFingerprint, KnowledgeCandidate, KnowledgePattern, RuleVersion, TrainingReview, TrainingSample
 from app.knowledge.originality import OriginalityGuard
 from app.knowledge.promotion import PolicyValidationError, PolicyValidator, PolicyValidatorProtocol, decide_promotion
 from app.knowledge.schemas import (
@@ -33,6 +33,7 @@ from app.knowledge.schemas import (
     PatternTransitionRead,
 )
 from app.migration.guard import GuardValidationError, PortableGuard, merge_guards
+from app.training.schemas import ActiveToken, CandidateSet, ReviewSet, TrainingActivationResult
 
 
 class KnowledgeNotFoundError(LookupError):
@@ -76,12 +77,14 @@ def _snapshot_hash(title: str, snapshot: str, tags: list[str]) -> str:
     return _canonical_hash({"title": clean(title), "snapshot": clean(snapshot), "tags": [clean(tag) for tag in tags]})
 
 
-def _audit(session: Session, *, actor: str, action: str, entity_type: str, entity_id: str, previous: str | None, new: str | None, trace_id: str | None = None, score: float | None = None) -> None:
+def _audit(session: Session, *, actor: str, action: str, entity_type: str, entity_id: str, previous: str | None, new: str | None, trace_id: str | None = None, score: float | None = None, review_id: str | None = None) -> None:
     details: dict[str, object] = {"previous": previous, "new": new}
     if trace_id:
         details["trace_id"] = trace_id[:127]
     if score is not None:
         details["max_score"] = round(score, 6)
+    if review_id is not None:
+        details["review_id"] = review_id
     session.add(AuditEvent(actor=actor[:127], action=action, entity_type=entity_type, entity_id=entity_id, details=details))
 
 
@@ -393,7 +396,7 @@ class KnowledgeService:
         if constraints and decision.eligible:
             self._activate(session, candidate, actor="system:auto")
 
-    def _activate(self, session: Session, candidate: KnowledgeCandidate, *, actor: str) -> KnowledgePattern:
+    def _activate(self, session: Session, candidate: KnowledgeCandidate, *, actor: str, review_id: str | None = None) -> KnowledgePattern:
         if candidate.status is KnowledgeStatus.REJECTED:
             raise KnowledgeConflictError("rejected candidates cannot be approved")
         existing = session.scalar(select(KnowledgePattern).where(KnowledgePattern.kind == candidate.kind))
@@ -458,8 +461,148 @@ class KnowledgeService:
         pattern.pattern = rules
         pattern.status = KnowledgeStatus.ACTIVE
         pattern.revision += 1
-        _audit(session, actor=actor, action="candidate_activated", entity_type="candidate", entity_id=candidate.public_id or str(candidate.id), previous=previous, new=KnowledgeStatus.ACTIVE.value, trace_id=candidate.trace_id)
+        _audit(session, actor=actor, action="candidate_activated", entity_type="candidate", entity_id=candidate.public_id or str(candidate.id), previous=previous, new=KnowledgeStatus.ACTIVE.value, trace_id=candidate.trace_id, review_id=review_id)
         return pattern
+
+    def apply_reviewed_training_batch(
+        self,
+        *,
+        sample_id: int,
+        evidence: EvidenceInput,
+        candidates: CandidateSet,
+        reviews: ReviewSet,
+        reviewed_active_tokens: dict[str, ActiveToken],
+        reviewer_version: str,
+        trace_id: str,
+    ) -> list[TrainingActivationResult]:
+        if not reviewer_version or len(reviewer_version) > 127:
+            raise KnowledgeValidationError("invalid reviewer version")
+        candidate_kinds = {candidate.kind for candidate in candidates.candidates}
+        review_by_kind = {review.kind: review for review in reviews.reviews}
+        if not candidate_kinds or set(review_by_kind) != candidate_kinds or set(reviewed_active_tokens) != candidate_kinds:
+            raise KnowledgeValidationError("review batch kinds do not match")
+        with self._lock, self._write_session() as session:
+            sample = session.get(TrainingSample, sample_id)
+            if sample is None:
+                raise KnowledgeNotFoundError
+            existing = list(session.scalars(
+                select(TrainingReview)
+                .where(TrainingReview.training_sample_id == sample_id)
+                .order_by(TrainingReview.id)
+            ))
+            if existing:
+                if {item.kind for item in existing} != candidate_kinds:
+                    raise KnowledgeConflictError("training sample review batch already exists")
+                return [self._training_result(item) for item in existing]
+
+            record = self._ingest_evidence_in_session(session, evidence)
+            created: list[TrainingReview] = []
+            for proposal in candidates.candidates:
+                candidate_payload = CandidateInput(
+                    kind=proposal.kind,
+                    abstract=proposal.abstract,
+                    confidence=proposal.confidence,
+                    evidence_refs=[
+                        EvidenceReference(
+                            evidence_id=record.public_id,
+                            source_timestamp=record.source_timestamp,
+                        )
+                    ],
+                )
+                candidate = self._ingest_candidate_in_session(
+                    session,
+                    candidate_payload,
+                    actor="system:vision-training",
+                    trace_id=trace_id,
+                    conversation_id=None,
+                    message_id=None,
+                )
+                review_payload = review_by_kind[proposal.kind]
+                reviewed_token = reviewed_active_tokens[proposal.kind]
+                review = TrainingReview(
+                    public_id=str(uuid4()),
+                    sample=sample,
+                    candidate=candidate,
+                    kind=proposal.kind,
+                    reviewer_version=reviewer_version,
+                    prompt_schema_version=1,
+                    decision=review_payload.decision,
+                    reason_code=review_payload.reason_code,
+                    reason=review_payload.reason,
+                    risk_flags=review_payload.risk_flags,
+                    confidence=review_payload.confidence,
+                    active_rule_public_id=reviewed_token.active_rule_public_id,
+                    active_pattern_revision=reviewed_token.pattern_revision,
+                )
+                session.add(review)
+                session.flush()
+
+                reason: str | None = None
+                if review_payload.decision != "approve":
+                    reason = "ai_rejected"
+                elif review_payload.confidence < 0.85:
+                    reason = "review_confidence"
+                elif review_payload.risk_flags:
+                    reason = "review_risk_flags"
+                else:
+                    current_rule, current_revision = self._active_token(session, proposal.kind)
+                    if (
+                        current_rule != reviewed_token.active_rule_public_id
+                        or current_revision != reviewed_token.pattern_revision
+                    ):
+                        reason = "stale_review"
+                    else:
+                        passed, constraint_reason = self._constraints_pass(candidate, [record])
+                        if not passed:
+                            reason = constraint_reason
+                            candidate.status = KnowledgeStatus.REJECTED
+                            candidate.revision += 1
+                            _audit(
+                                session,
+                                actor="system:ai-review",
+                                action="candidate_rejected_policy",
+                                entity_type="candidate",
+                                entity_id=candidate.public_id or str(candidate.id),
+                                previous=KnowledgeStatus.PROPOSED.value,
+                                new=KnowledgeStatus.REJECTED.value,
+                                trace_id=trace_id,
+                                review_id=review.public_id,
+                            )
+                        else:
+                            pattern = self._activate(
+                                session,
+                                candidate,
+                                actor="system:ai-review",
+                                review_id=review.public_id,
+                            )
+                            active = session.scalar(
+                                select(RuleVersion).where(
+                                    RuleVersion.pattern_id == pattern.id,
+                                    RuleVersion.status == KnowledgeStatus.ACTIVE,
+                                )
+                            )
+                            if active is None:
+                                raise KnowledgeConflictError("activated pattern has no active rule")
+                            review.activated_rule_version = active.version
+                review.not_activated_reason = reason
+                created.append(review)
+            session.flush()
+            return [self._training_result(item) for item in created]
+
+    @staticmethod
+    def _training_result(review: TrainingReview) -> TrainingActivationResult:
+        candidate = review.candidate
+        if candidate is None:
+            raise KnowledgeConflictError("training review candidate lineage is missing")
+        return TrainingActivationResult(
+            candidate_id=candidate.id,
+            candidate_public_id=candidate.public_id or str(candidate.id),
+            kind=review.kind,
+            status=candidate.status,
+            review_public_id=review.public_id,
+            activated_rule_version=review.activated_rule_version,
+            not_activated_reason=review.not_activated_reason,
+        )
 
     @staticmethod
     def _active_token(session: Session, kind: str) -> tuple[str | None, int | None]:
