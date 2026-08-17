@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.db.models import (
     Attachment, AuditEvent, CompetitorEvidence, Conversation, ExcelJob, FeedbackEvent,
     ImportedEvidenceFingerprint, KnowledgeCandidate, KnowledgePattern, Message,
-    MigrationExport, MigrationImport, RuleVersion,
+    MigrationExport, MigrationImport, RuleVersion, TrainingReview, TrainingRun, TrainingSample,
 )
 from app.migration.contracts import ManifestRecord, RECORD_MODELS
 from app.migration.exporter import APP_VERSION, ASSET_ALLOWLIST, PROFILE_ID, SCHEMA_VERSION, _scan, _sha
@@ -295,6 +295,19 @@ class MigrationImporter:
             if active_rules and active_rules[0].candidate_id != pattern.source_candidate_id:
                 raise ImportValidationError("active rule candidate lineage is invalid")
         rule_ids = {rule.id for rule in records["rule_versions"]}
+        training_runs = {item.id for item in records["training_runs"]}
+        training_samples = {item.id: item for item in records["training_samples"]}
+        if any(item.training_run_id not in training_runs for item in training_samples.values()):
+            raise ImportValidationError("training run relationship is invalid")
+        for review in records["training_reviews"]:
+            if review.training_sample_id not in training_samples or (review.candidate_id and review.candidate_id not in candidates):
+                raise ImportValidationError("training review relationship is invalid")
+            if review.candidate_id and candidates[review.candidate_id].kind != review.kind:
+                raise ImportValidationError("training review candidate kind is invalid")
+            if review.active_rule_public_id and review.active_rule_public_id not in rule_ids:
+                raise ImportValidationError("training review active rule is invalid")
+            if review.activated_rule_version and review.activated_rule_version not in versions:
+                raise ImportValidationError("training review activated version is invalid")
         for candidate in candidates.values():
             if candidate.base_active_rule_public_id and candidate.base_active_rule_public_id not in rule_ids:
                 raise ImportValidationError("candidate base rule token is invalid")
@@ -320,7 +333,7 @@ class MigrationImporter:
         return ValidatedGraph(manifest, records)
 
     def _conflicts(self, session: Session | None = None) -> list[str]:
-        models = (Conversation, Message, Attachment, ExcelJob, CompetitorEvidence, KnowledgeCandidate, KnowledgePattern, RuleVersion, FeedbackEvent, AuditEvent, ImportedEvidenceFingerprint, MigrationImport, MigrationExport)
+        models = (Conversation, Message, Attachment, ExcelJob, CompetitorEvidence, KnowledgeCandidate, KnowledgePattern, RuleVersion, FeedbackEvent, AuditEvent, ImportedEvidenceFingerprint, TrainingRun, TrainingSample, TrainingReview, MigrationImport, MigrationExport)
         owned = session is None
         session = session or self.session_factory()
         try: return [model.__tablename__ for model in models if session.scalar(select(func.count()).select_from(model))]
@@ -357,6 +370,14 @@ class MigrationImporter:
             for item in graph.records["feedback_events"]: session.add(FeedbackEvent(public_id=item.id, knowledge_candidate_id=candidate_map[item.candidate_id].id if item.candidate_id else None, conversation_id=conversation_map[item.conversation_id].id if item.conversation_id else None, excel_job_ref=item.excel_job_id, feedback_id=item.feedback_id, row_id=item.row_id, accepted=item.accepted, event_type=item.event_type, payload=item.payload, created_at=item.created_at))
             for item in graph.records["audit_events"]: session.add(AuditEvent(public_id=item.id, actor=item.actor, action=item.action, entity_type=item.entity_type, entity_id=item.entity_public_id or "unresolved", details={**item.details, **({"unresolved_reason": item.unresolved_reason} if item.unresolved_reason else {})}, created_at=item.created_at))
             for item in graph.records["evidence_guard"]: session.add(ImportedEvidenceFingerprint(public_id=item.id, shingles=item.shingles, source_timestamp=item.source_timestamp, threshold=item.threshold, content_hash=item.content_hash, snapshot_hash=item.snapshot_hash))
+            training_run_map: dict[str, TrainingRun] = {}
+            for item in graph.records["training_runs"]:
+                row = TrainingRun(public_id=item.id, source_workbook_hash=item.source_workbook_hash, source_workbook_name=item.source_workbook_name, requested_limit=item.requested_limit, status=item.status, counts=item.counts, started_at=item.started_at, completed_at=item.completed_at, created_at=item.created_at, updated_at=item.updated_at); session.add(row); session.flush(); training_run_map[item.id] = row
+            training_sample_map: dict[str, TrainingSample] = {}
+            for item in graph.records["training_samples"]:
+                row = TrainingSample(public_id=item.id, training_run_id=training_run_map[item.training_run_id].id, shop_url="https://www.etsy.com/shop/imported-training", listing_id=item.listing_id, canonical_url=f"https://www.etsy.com/listing/{item.listing_id}", source_timestamp=item.source_timestamp, listing_snapshot_hash=item.listing_snapshot_hash, main_image_hash=item.main_image_hash, main_image_path=None, visual_facts=item.visual_facts, merged_facts=item.merged_facts, conflicts=item.conflicts, schema_version=item.schema_version, status=item.status, error_code=item.error_code, created_at=item.created_at, updated_at=item.updated_at); session.add(row); session.flush(); training_sample_map[item.id] = row
+            for item in graph.records["training_reviews"]:
+                session.add(TrainingReview(public_id=item.id, training_sample_id=training_sample_map[item.training_sample_id].id, knowledge_candidate_id=candidate_map[item.candidate_id].id if item.candidate_id else None, kind=item.kind, reviewer_version=item.reviewer_version, prompt_schema_version=item.prompt_schema_version, decision=item.decision, reason_code=item.reason_code, reason=item.reason, risk_flags=item.risk_flags, confidence=item.confidence, active_rule_public_id=item.active_rule_public_id, active_pattern_revision=item.active_pattern_revision, activated_rule_version=item.activated_rule_version, not_activated_reason=item.not_activated_reason, reviewed_at=item.reviewed_at))
             session.add(MigrationImport(package_id=graph.manifest["package_id"], content_sha256=graph.manifest["content_sha256"], profile_id=PROFILE_ID, credential_status="pending", record_counts=graph.manifest["record_counts"]))
             session.flush()
             self._rebuild_fts(session)

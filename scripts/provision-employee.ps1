@@ -88,6 +88,7 @@ function Get-AssetHashes {
         "skills/etsy-performance-listing/scripts/originality_guard.py" = (Get-FileHash -LiteralPath (Join-Path $SourceSkill "scripts\originality_guard.py") -Algorithm SHA256).Hash
         "skills/etsy-performance-listing/scripts/run_task.py" = (Get-FileHash -LiteralPath (Join-Path $SourceSkill "scripts\run_task.py") -Algorithm SHA256).Hash
         "skills/etsy-performance-listing/scripts/validate_output.py" = (Get-FileHash -LiteralPath (Join-Path $SourceSkill "scripts\validate_output.py") -Algorithm SHA256).Hash
+        "skills/etsy-performance-listing/scripts/visual_context.py" = (Get-FileHash -LiteralPath (Join-Path $SourceSkill "scripts\visual_context.py") -Algorithm SHA256).Hash
         "skills/etsy-performance-listing/scripts/write_workbook.py" = (Get-FileHash -LiteralPath (Join-Path $SourceSkill "scripts\write_workbook.py") -Algorithm SHA256).Hash
     }
 }
@@ -192,7 +193,7 @@ try {
     [void](New-Item -ItemType Directory -Path $ScriptDestination -Force)
     Copy-Item -LiteralPath (Join-Path $SourceSkill "SKILL.md") -Destination (Join-Path $SkillDestination "SKILL.md") -Force
     Copy-Item -LiteralPath (Join-Path $SourceSkill "references\output-contract.md") -Destination (Join-Path $ReferenceDestination "output-contract.md") -Force
-    foreach ($ScriptName in @("inspect_workbook.py", "originality_guard.py", "run_task.py", "validate_output.py", "write_workbook.py")) {
+    foreach ($ScriptName in @("inspect_workbook.py", "originality_guard.py", "run_task.py", "validate_output.py", "visual_context.py", "write_workbook.py")) {
         Copy-Item -LiteralPath (Join-Path $SourceSkill "scripts\$ScriptName") -Destination (Join-Path $ScriptDestination $ScriptName) -Force
     }
 

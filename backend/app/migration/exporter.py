@@ -31,6 +31,9 @@ from app.db.models import (
     KnowledgePattern,
     Message,
     RuleVersion,
+    TrainingReview,
+    TrainingRun,
+    TrainingSample,
 )
 from app.knowledge.originality import OriginalityGuard
 from app.knowledge.schemas import KnowledgeStatus
@@ -48,6 +51,7 @@ ASSET_ALLOWLIST = (
     "skills/etsy-performance-listing/scripts/originality_guard.py",
     "skills/etsy-performance-listing/scripts/run_task.py",
     "skills/etsy-performance-listing/scripts/validate_output.py",
+    "skills/etsy-performance-listing/scripts/visual_context.py",
     "skills/etsy-performance-listing/scripts/write_workbook.py",
 )
 MAX_TEXT_FILE = 16 * 1024 * 1024
@@ -306,6 +310,11 @@ class MigrationExporter:
             audits = list(session.scalars(select(AuditEvent).order_by(AuditEvent.created_at, AuditEvent.id)))
             evidence = list(session.scalars(select(CompetitorEvidence).order_by(CompetitorEvidence.public_id)))
             imported_evidence = list(session.scalars(select(ImportedEvidenceFingerprint).order_by(ImportedEvidenceFingerprint.public_id)))
+            training_runs = list(session.scalars(select(TrainingRun).order_by(TrainingRun.public_id, TrainingRun.id)))
+            training_run_ids = {item.id: item.public_id for item in training_runs}
+            training_samples = list(session.scalars(select(TrainingSample).order_by(TrainingSample.public_id, TrainingSample.id)))
+            training_sample_ids = {item.id: item.public_id for item in training_samples}
+            training_reviews = list(session.scalars(select(TrainingReview).order_by(TrainingReview.public_id, TrainingReview.id)))
             evidence_by_url = {item.canonical_url: item.public_id for item in evidence}
             # Scan source values before redaction so credentials cannot be hidden by a later transform.
             try:
@@ -330,6 +339,9 @@ class MigrationExporter:
                 "feedback_events": [{"id": _public("feedback", x.public_id, str(x.id)), "candidate_id": candidate_ids.get(x.knowledge_candidate_id), "conversation_id": conversation_ids.get(x.conversation_id), "excel_job_id": x.excel_job_ref or job_ids.get(x.excel_job_id), "unresolved_relationships": (["excel_job_external_reference"] if (x.excel_job_ref or x.excel_job_id) else []), "feedback_id": x.feedback_id, "row_id": x.row_id, "accepted": x.accepted, "event_type": x.event_type, "payload": x.payload, "created_at": _timestamp(x.created_at)} for x in feedback],
                 "audit_events": [],
                 "evidence_guard": [],
+                "training_runs": [{"id": x.public_id, "source_workbook_hash": x.source_workbook_hash, "source_workbook_name": Path(x.source_workbook_name).name, "requested_limit": x.requested_limit, "status": x.status, "counts": x.counts, "started_at": _timestamp(x.started_at), "completed_at": _timestamp(x.completed_at) if x.completed_at else None, "created_at": _timestamp(x.created_at), "updated_at": _timestamp(x.updated_at)} for x in training_runs],
+                "training_samples": [{"id": x.public_id, "training_run_id": training_run_ids[x.training_run_id], "listing_id": x.listing_id, "source_timestamp": _timestamp(x.source_timestamp) if x.source_timestamp else None, "listing_snapshot_hash": x.listing_snapshot_hash, "main_image_hash": x.main_image_hash, "visual_facts": x.visual_facts, "merged_facts": x.merged_facts, "conflicts": x.conflicts, "schema_version": x.schema_version, "status": x.status, "error_code": x.error_code, "image_included": False, "image_path_included": False, "created_at": _timestamp(x.created_at), "updated_at": _timestamp(x.updated_at)} for x in training_samples],
+                "training_reviews": [{"id": x.public_id, "training_sample_id": training_sample_ids[x.training_sample_id], "candidate_id": candidate_ids.get(x.knowledge_candidate_id), "kind": x.kind, "reviewer_version": x.reviewer_version, "prompt_schema_version": x.prompt_schema_version, "decision": x.decision, "reason_code": x.reason_code, "reason": x.reason, "risk_flags": x.risk_flags, "confidence": x.confidence, "active_rule_public_id": x.active_rule_public_id, "active_pattern_revision": x.active_pattern_revision, "activated_rule_version": x.activated_rule_version, "not_activated_reason": x.not_activated_reason, "reviewed_at": _timestamp(x.reviewed_at)} for x in training_reviews],
             }
             for item in messages:
                 bound_ids = set(item.evidence_ids or [])

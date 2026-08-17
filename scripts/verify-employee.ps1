@@ -187,6 +187,7 @@ function Test-AssetIsolation {
         "skills/etsy-performance-listing/scripts/originality_guard.py" = "employee\skills\etsy-performance-listing\scripts\originality_guard.py"
         "skills/etsy-performance-listing/scripts/run_task.py" = "employee\skills\etsy-performance-listing\scripts\run_task.py"
         "skills/etsy-performance-listing/scripts/validate_output.py" = "employee\skills\etsy-performance-listing\scripts\validate_output.py"
+        "skills/etsy-performance-listing/scripts/visual_context.py" = "employee\skills\etsy-performance-listing\scripts\visual_context.py"
         "skills/etsy-performance-listing/scripts/write_workbook.py" = "employee\skills\etsy-performance-listing\scripts\write_workbook.py"
     }
     foreach ($RelativePath in $AssetPaths.Keys) {
@@ -220,6 +221,7 @@ function Test-AssetIsolation {
             "etsy-performance-listing/scripts/originality_guard.py",
             "etsy-performance-listing/scripts/run_task.py",
             "etsy-performance-listing/scripts/validate_output.py",
+            "etsy-performance-listing/scripts/visual_context.py",
             "etsy-performance-listing/scripts/write_workbook.py"
         )
         $SkillEntries = @(Get-ChildItem -LiteralPath $SkillsRoot -Recurse -Force |

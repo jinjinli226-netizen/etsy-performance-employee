@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import re
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -13,16 +14,35 @@ from app.migration.guard import GuardValidationError, validate_shingles
 class StrictRecord(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, allow_inf_nan=False)
 
-    @field_validator("created_at", "updated_at", check_fields=False, mode="before")
+    @field_validator(
+        "created_at",
+        "updated_at",
+        "started_at",
+        "completed_at",
+        "reviewed_at",
+        check_fields=False,
+        mode="before",
+    )
     @classmethod
     def canonical_zulu(cls, value: Any) -> Any:
+        if value is None:
+            return None
         if not isinstance(value, str) or not value.endswith("Z"):
             raise ValueError("canonical Zulu timestamp required")
         return datetime.fromisoformat(value[:-1] + "+00:00")
 
-    @field_validator("created_at", "updated_at", check_fields=False)
+    @field_validator(
+        "created_at",
+        "updated_at",
+        "started_at",
+        "completed_at",
+        "reviewed_at",
+        check_fields=False,
+    )
     @classmethod
-    def utc_only(cls, value: datetime) -> datetime:
+    def utc_only(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
         if value.tzinfo is None or value.utcoffset() is None or value.utcoffset().total_seconds() != 0:
             raise ValueError("Zulu UTC timestamp required")
         return value
@@ -60,6 +80,47 @@ def _canonical_source_timestamps(values: dict[str, str]) -> dict[str, str]:
             raise ValueError("canonical evidence timestamp required")
         checked[key] = value
     return checked
+
+
+_LOCAL_PATH_OR_URL = re.compile(
+    r"(?:file://|data:image/|https?://(?:www\.)?etsy\.com/listing/|(?<![A-Za-z0-9_])[A-Za-z]:[\\/]|(?:^|[\s\"'])/(?:home|Users|var|tmp)/)",
+    re.IGNORECASE,
+)
+_NON_PORTABLE_KEY = re.compile(r"(?:^|_)(?:path|url|uri|raw_image|image_data|image_bytes|image_base64)$", re.IGNORECASE)
+_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_BASE64_BLOB = re.compile(r"^[A-Za-z0-9+/]{1024,}={0,2}$")
+
+
+def _portable_json(value: Any) -> Any:
+    nodes = 0
+    characters = 0
+
+    def visit(item: Any, depth: int) -> None:
+        nonlocal nodes, characters
+        nodes += 1
+        if depth > 20 or nodes > 10_000:
+            raise ValueError("portable fact payload exceeds structure limits")
+        if isinstance(item, dict):
+            for key, child in item.items():
+                if not isinstance(key, str) or _NON_PORTABLE_KEY.search(key):
+                    raise ValueError("portable fact payload contains a non-portable field")
+                visit(child, depth + 1)
+        elif isinstance(item, list):
+            for child in item:
+                visit(child, depth + 1)
+        elif isinstance(item, str):
+            characters += len(item)
+            if characters > 1_000_000 or _LOCAL_PATH_OR_URL.search(item) or _BASE64_BLOB.fullmatch(item):
+                raise ValueError("portable fact payload contains local or raw image data")
+
+    visit(value, 0)
+    return value
+
+
+def _portable_text(value: str | None) -> str | None:
+    if value is not None and (_LOCAL_PATH_OR_URL.search(value) or _CONTROL.search(value)):
+        raise ValueError("portable text contains local or unsafe data")
+    return value
 
 
 class ConversationRecord(StrictRecord):
@@ -216,6 +277,102 @@ class GuardRecord(StrictRecord):
             raise ValueError(str(error)) from error
 
 
+class TrainingRunRecord(StrictRecord):
+    id: str = Field(min_length=36, max_length=36)
+    source_workbook_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_workbook_name: str = Field(min_length=1, max_length=255)
+    requested_limit: int | None = Field(default=None, ge=1)
+    status: Literal["running", "completed", "failed"]
+    counts: dict[str, int]
+    started_at: datetime
+    completed_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+    _canonical_id = field_validator("id")(_portable_id)
+
+    @field_validator("source_workbook_name")
+    @classmethod
+    def portable_filename(cls, value: str) -> str:
+        if value.strip() != value or "/" in value or "\\" in value or any(ord(char) < 32 for char in value) or _portable_text(value) != value:
+            raise ValueError("portable workbook filename required")
+        return value
+
+    @field_validator("counts")
+    @classmethod
+    def safe_counts(cls, value: dict[str, int]) -> dict[str, int]:
+        if len(value) > 16 or any(not re.fullmatch(r"[a-z_]{1,31}", key) or count < 0 for key, count in value.items()):
+            raise ValueError("invalid training counts")
+        return value
+
+
+class TrainingSampleRecord(StrictRecord):
+    id: str = Field(min_length=36, max_length=36)
+    training_run_id: str = Field(min_length=36, max_length=36)
+    listing_id: str = Field(pattern=r"^[0-9]{1,32}$")
+    source_timestamp: datetime | None
+    listing_snapshot_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    main_image_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    visual_facts: dict[str, Any] | None
+    merged_facts: dict[str, Any] | None
+    conflicts: list[dict[str, Any]] | None = Field(default=None, max_length=50)
+    schema_version: Literal[1]
+    status: Literal["claimed", "fetching", "image_ready", "facts_ready", "candidates_ready", "reviewing", "activating", "completed", "skipped", "failed"]
+    error_code: str | None = Field(default=None, pattern=r"^[a-z][a-z0-9_]{0,62}$")
+    image_included: Literal[False]
+    image_path_included: Literal[False]
+    created_at: datetime
+    updated_at: datetime
+    _canonical_ids = field_validator("id", "training_run_id")(_portable_id)
+    _portable_facts = field_validator("visual_facts", "merged_facts", "conflicts")(_portable_json)
+
+    @field_validator("source_timestamp", mode="before")
+    @classmethod
+    def canonical_source_timestamp(cls, value: Any) -> Any:
+        if value is None:
+            return None
+        if not isinstance(value, str) or not value.endswith("Z"):
+            raise ValueError("canonical Zulu timestamp required")
+        return datetime.fromisoformat(value[:-1] + "+00:00")
+
+    @field_validator("source_timestamp")
+    @classmethod
+    def utc_source_timestamp(cls, value: datetime | None) -> datetime | None:
+        if value is not None and (value.tzinfo is None or value.utcoffset() is None or value.utcoffset().total_seconds() != 0):
+            raise ValueError("Zulu UTC timestamp required")
+        return value
+
+
+class TrainingReviewRecord(StrictRecord):
+    id: str = Field(min_length=36, max_length=36)
+    training_sample_id: str = Field(min_length=36, max_length=36)
+    candidate_id: str | None = Field(default=None, min_length=8, max_length=64)
+    kind: str = Field(min_length=1, max_length=127, pattern=r"^[a-z][a-z0-9_]{0,126}$")
+    reviewer_version: str = Field(min_length=1, max_length=127)
+    prompt_schema_version: Literal[1]
+    decision: Literal["approve", "reject"]
+    reason_code: str = Field(min_length=1, max_length=63, pattern=r"^[a-z][a-z0-9_]{0,62}$")
+    reason: str = Field(min_length=1, max_length=500)
+    risk_flags: list[str] = Field(max_length=32)
+    confidence: float = Field(ge=0, le=1)
+    active_rule_public_id: str | None = Field(default=None, min_length=8, max_length=64)
+    active_pattern_revision: int | None = Field(default=None, ge=0)
+    activated_rule_version: str | None = Field(default=None, max_length=127)
+    not_activated_reason: str | None = Field(default=None, max_length=63, pattern=r"^[a-z][a-z0-9_]{0,62}$")
+    reviewed_at: datetime
+    _canonical_ids = field_validator("id", "training_sample_id")(_portable_id)
+    _canonical_refs = field_validator("candidate_id", "active_rule_public_id")(
+        lambda value: _portable_id(value) if value is not None else value
+    )
+    _portable_text_fields = field_validator("reviewer_version", "reason", "activated_rule_version")(_portable_text)
+
+    @field_validator("risk_flags")
+    @classmethod
+    def portable_risk_flags(cls, value: list[str]) -> list[str]:
+        if any(not flag or len(flag) > 127 or _portable_text(flag) != flag for flag in value):
+            raise ValueError("invalid risk flag")
+        return value
+
+
 class ManifestFileRecord(StrictRecord):
     path: str = Field(min_length=1, max_length=512)
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -249,4 +406,7 @@ RECORD_MODELS = {
     "feedback_events": FeedbackRecord,
     "audit_events": AuditRecord,
     "evidence_guard": GuardRecord,
+    "training_runs": TrainingRunRecord,
+    "training_samples": TrainingSampleRecord,
+    "training_reviews": TrainingReviewRecord,
 }

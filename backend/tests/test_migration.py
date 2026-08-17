@@ -23,6 +23,9 @@ from app.db.models import (
     KnowledgePattern,
     Message,
     RuleVersion,
+    TrainingReview,
+    TrainingRun,
+    TrainingSample,
     ImportedEvidenceFingerprint,
     MigrationImport,
     CompetitorEvidence,
@@ -51,6 +54,7 @@ def _assets(root: Path) -> Path:
         "skills/etsy-performance-listing/scripts/originality_guard.py": "print('guard')\n",
         "skills/etsy-performance-listing/scripts/run_task.py": "print('run')\n",
         "skills/etsy-performance-listing/scripts/validate_output.py": "print('validate')\n",
+        "skills/etsy-performance-listing/scripts/visual_context.py": "print('visual')\n",
         "skills/etsy-performance-listing/scripts/write_workbook.py": "print('write')\n",
     }
     employee = root / "employee"
@@ -105,6 +109,54 @@ def _seed(factory) -> None:
         )
         session.add_all([candidate, pattern, version])
         session.flush()
+        run = TrainingRun(
+            public_id=str(uuid4()),
+            source_workbook_hash="a" * 64,
+            source_workbook_name="shop-training.xlsx",
+            requested_limit=1,
+            status="completed",
+            counts={"completed": 1},
+            started_at=now,
+            completed_at=now,
+            created_at=now,
+            updated_at=now,
+        )
+        sample = TrainingSample(
+            public_id=str(uuid4()),
+            run=run,
+            shop_url="https://www.etsy.com/shop/private-shop",
+            listing_id="123",
+            canonical_url="https://www.etsy.com/listing/123/private-title",
+            source_timestamp=now,
+            listing_snapshot_hash="e" * 64,
+            main_image_hash="f" * 64,
+            main_image_path="C:/Users/owner/private/training/123.jpg",
+            visual_facts={"visible_facts": {"colors": ["blue"]}, "image_usable": True},
+            merged_facts={"listing_id": "123", "title": "Blue stage costume"},
+            conflicts=[{"field": "color", "text_value": "navy", "visual_value": "blue"}],
+            schema_version=1,
+            status="completed",
+            created_at=now,
+            updated_at=now,
+        )
+        review = TrainingReview(
+            public_id=str(uuid4()),
+            sample=sample,
+            candidate=candidate,
+            kind="title_structure",
+            reviewer_version="independent-review-v1",
+            prompt_schema_version=1,
+            decision="approve",
+            reason_code="grounded_improvement",
+            reason="Candidate is supported by the merged product facts.",
+            risk_flags=[],
+            confidence=.93,
+            active_rule_public_id=version.public_id,
+            active_pattern_revision=pattern.revision,
+            activated_rule_version=version.version,
+            reviewed_at=now,
+        )
+        session.add_all([run, sample, review])
         session.add(FeedbackEvent(public_id=str(uuid4()), knowledge_candidate_id=candidate.id, feedback_id="edit-1", row_id="row-1", accepted=True, event_type="accepted_edit", payload={"field": "title"}, created_at=now))
         session.add(AuditEvent(actor="owner", action="candidate_activated", entity_type="candidate", entity_id=candidate.public_id, details={"trace_id": "trace-safe"}, created_at=now))
         session.add(CompetitorEvidence(public_id="ev-" + "2" * 32, canonical_url="https://www.etsy.com/listing/123", source_key="etsy-listing:123", title="Crystal dance costume", snapshot="Crystal dance costume with fringe stage sparkle", tags=["dance costume"], source_timestamp=now, content_hash="c" * 64, snapshot_hash="d" * 64, created_at=now))
@@ -148,9 +200,13 @@ def test_export_is_portable_deterministic_and_excludes_sensitive_evidence(tmp_pa
         names = archive.namelist()
         assert "assets/SOUL.md" in names
         assert "assets/skills/etsy-performance-listing/scripts/run_task.py" in names
+        assert "assets/skills/etsy-performance-listing/scripts/visual_context.py" in names
         assert "data/conversations.jsonl" in names
         assert "data/knowledge_patterns.jsonl" in names
         assert "data/evidence_guard.jsonl" in names
+        assert "data/training_runs.jsonl" in names
+        assert "data/training_samples.jsonl" in names
+        assert "data/training_reviews.jsonl" in names
         assert not any(".env" in name or "state.db" in name or "session" in name.casefold() for name in names)
         all_text = b"\n".join(archive.read(name) for name in names).decode("utf-8")
         assert "etsy.com/listing" not in all_text
@@ -159,11 +215,20 @@ def test_export_is_portable_deterministic_and_excludes_sensitive_evidence(tmp_pa
         attachments = [json.loads(line) for line in archive.read("data/attachments.jsonl").decode().splitlines()]
         assert attachments[0]["filename"] == "reference.jpg"
         assert attachments[0]["content_included"] is False
+        samples = [json.loads(line) for line in archive.read("data/training_samples.jsonl").decode().splitlines()]
+        assert samples[0]["listing_id"] == "123"
+        assert samples[0]["main_image_hash"] == "f" * 64
+        assert samples[0]["image_included"] is False
+        assert samples[0]["image_path_included"] is False
+        assert "shop_url" not in samples[0]
+        assert "canonical_url" not in samples[0]
+        assert "main_image_path" not in samples[0]
         manifest = json.loads(archive.read("manifest.json"))
         assert manifest["schema_version"] == 1
         assert manifest["profile_id"] == "etsy-performance-us"
         assert manifest["credential_status"] == "pending"
         assert manifest["record_counts"]["conversations"] == 1
+        assert manifest["record_counts"]["training_samples"] == 1
         assert all(len(item["sha256"]) == 64 for item in manifest["files"])
 
     second = MigrationExporter(
@@ -214,6 +279,16 @@ def test_import_validates_then_restores_relationships_and_guard_only(tmp_path: P
         assert session.query(RuleVersion).one().pattern is not None
         assert session.query(ImportedEvidenceFingerprint).one().public_id == "ev-" + "2" * 32
         assert session.query(MigrationImport).one().credential_status == "pending"
+        restored_sample = session.query(TrainingSample).one()
+        restored_review = session.query(TrainingReview).one()
+        assert restored_sample.run.public_id == session.query(TrainingRun).one().public_id
+        assert restored_sample.listing_id == "123"
+        assert restored_sample.main_image_path is None
+        assert restored_sample.shop_url == "https://www.etsy.com/shop/imported-training"
+        assert restored_sample.canonical_url == "https://www.etsy.com/listing/123"
+        assert restored_review.sample is restored_sample
+        assert restored_review.candidate.public_id == "kc-" + "1" * 32
+        assert restored_review.activated_rule_version == "knowledge-title-v1"
         assert session.execute(__import__("sqlalchemy").text("SELECT count(*) FROM conversation_messages_fts WHERE conversation_messages_fts MATCH 'evidence'")).scalar_one() == 1
         assert session.execute(__import__("sqlalchemy").text("SELECT count(*) FROM knowledge_patterns_fts WHERE knowledge_patterns_fts MATCH 'buyer'")).scalar_one() == 1
     assert not (tmp_path / "target-assets").exists()
@@ -222,6 +297,25 @@ def test_import_validates_then_restores_relationships_and_guard_only(tmp_path: P
     with target_factory() as session:
         assert session.query(MigrationImport).count() == 1
         assert session.query(Conversation).count() == 1
+    engine.dispose()
+
+
+def test_import_rejects_training_fact_payload_with_local_path(tmp_path: Path) -> None:
+    package, _ = _export(tmp_path)
+    attacked = _rewrite_jsonl(
+        package,
+        tmp_path / "training-path.zip",
+        "data/training_samples.jsonl",
+        lambda row: {**row, "visual_facts": {"visible_facts": {"note": "C:/Users/owner/private.jpg"}}},
+    )
+    engine, target_factory = _database(tmp_path / "target.db")
+    importer = MigrationImporter(
+        target_factory,
+        repository_assets=tmp_path / "repo" / "employee",
+        workspace=tmp_path / "imports",
+    )
+    with pytest.raises(ImportValidationError, match="schema|sensitive"):
+        importer.import_package(attacked, dry_run=True)
     engine.dispose()
 
 
