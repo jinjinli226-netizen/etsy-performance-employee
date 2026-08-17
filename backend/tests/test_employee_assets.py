@@ -106,6 +106,7 @@ def create_verifier_fixture(tmp_path: Path) -> tuple[Path, Path, Path, dict[str,
         "skills.write_approval": "true",
         "model.provider": "custom",
         "model.default": "gpt-5.6-sol",
+        "model.supports_vision": "true",
         "model.base_url": "https://relay.example/v1",
         "agent.reasoning_effort": "high",
     }
@@ -114,6 +115,7 @@ def create_verifier_fixture(tmp_path: Path) -> tuple[Path, Path, Path, dict[str,
         "profileId": "etsy-performance-us",
         "provider": values["model.provider"],
         "model": values["model.default"],
+        "supportsVision": True,
         "baseUrl": values["model.base_url"],
         "hasBaseUrl": True,
         "reasoningEffort": values["agent.reasoning_effort"],
@@ -383,6 +385,7 @@ def test_provisioner_encodes_isolation_and_safe_secret_handling() -> None:
         "skills.write_approval",
         "model.provider",
         "model.default",
+        "model.supports_vision",
         "model.base_url",
         "agent.reasoning_effort",
     ):
@@ -405,6 +408,7 @@ def test_provisioner_encodes_isolation_and_safe_secret_handling() -> None:
         assert script_name in script
     assert "assetHashes" in script and "defaultBaseline" in script
     assert "keyConfigured" in script
+    assert "supportsVision" in script
     assert 'ValidateSet("minimal", "low", "medium", "high", "xhigh", "max", "ultra")' in script
     assert "__pycache__" not in script
 
@@ -435,6 +439,7 @@ def test_verifier_is_read_only_and_checks_isolation() -> None:
     for safe_model_field in (
         "model.provider",
         "model.default",
+        "model.supports_vision",
         "model.base_url",
         "agent.reasoning_effort",
     ):
@@ -449,6 +454,17 @@ def test_verifier_is_read_only_and_checks_isolation() -> None:
     assert "Remove-Item" not in script
     assert "Invoke-Expression" not in script
     assert "--yolo" not in lowered
+
+
+def test_verifier_rejects_non_vision_employee_profile(tmp_path: Path) -> None:
+    hermes_home, _, fake_hermes, values = create_verifier_fixture(tmp_path)
+    values["model.supports_vision"] = "false"
+    write_fake_hermes(fake_hermes, values)
+
+    result = run_verifier(hermes_home, fake_hermes)
+
+    assert result.returncode == 1
+    assert "model.supports_vision" in (result.stdout + result.stderr)
 
 
 def test_excel_scripts_disable_bytecode_before_dynamic_imports() -> None:

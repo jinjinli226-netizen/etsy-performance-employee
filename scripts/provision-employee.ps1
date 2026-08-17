@@ -174,6 +174,7 @@ try {
         "skills.write_approval" = "true"
         "model.provider" = $Provider
         "model.default" = $ModelId
+        "model.supports_vision" = "true"
         "agent.reasoning_effort" = $ReasoningEffort
     }
     if ($null -ne $NormalizedBaseUrl) {
@@ -211,6 +212,7 @@ try {
         profileId = $ProfileId
         provider = $Provider
         model = $ModelId
+        supportsVision = $true
         baseUrl = $NormalizedBaseUrl
         hasBaseUrl = $null -ne $NormalizedBaseUrl
         reasoningEffort = $ReasoningEffort

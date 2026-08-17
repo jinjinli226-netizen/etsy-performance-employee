@@ -11,6 +11,13 @@ from app.training.schemas import CandidateSet, MergedFacts, ReviewSet, VisualAna
 
 
 Contract = TypeVar("Contract", bound=BaseModel)
+KNOWLEDGE_KINDS = {
+    "title_structure",
+    "tag_taxonomy",
+    "occasion_vocabulary",
+    "buyer_instruction_style",
+    "category_mapping",
+}
 
 
 class TrainingModelError(RuntimeError):
@@ -86,12 +93,17 @@ class TrainingModel:
             ],
             "rules": {
                 "abstract_only": True,
+                "exactly_one_candidate_per_allowed_kind": True,
                 "no_source_url": True,
                 "no_shop_identity": True,
                 "no_raw_listing_copy": True,
                 "no_product_specific_promises": True,
             },
         }
+        def complete_candidates(result: CandidateSet) -> None:
+            if {candidate.kind for candidate in result.candidates} != KNOWLEDGE_KINDS:
+                raise ValueError("candidate kinds must exactly cover allowed kinds")
+
         return await self._invoke_contract(
             task="ABSTRACT_CANDIDATE_GENERATION",
             payload=payload,
@@ -99,6 +111,7 @@ class TrainingModel:
             image=None,
             error_code="invalid_candidate_response",
             error_label="candidate response",
+            post_validate=complete_candidates,
         )
 
     async def review_candidates(

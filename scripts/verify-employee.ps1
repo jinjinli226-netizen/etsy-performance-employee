@@ -386,7 +386,7 @@ else {
 if ($null -ne $Manifest) {
     $AllowedManifestFields = @(
         "schemaVersion", "profileId", "provider", "model", "baseUrl", "hasBaseUrl",
-        "reasoningEffort", "workspace", "keyConfigured", "assetHashes",
+        "supportsVision", "reasoningEffort", "workspace", "keyConfigured", "assetHashes",
         "defaultBaseline"
     )
     foreach ($ManifestField in $Manifest.PSObject.Properties.Name) {
@@ -396,6 +396,12 @@ if ($null -ne $Manifest) {
     }
     if ($Manifest.schemaVersion -ne 1 -or $Manifest.profileId -cne $ProfileId) {
         Add-Failure "Provisioning manifest identity or schema is invalid."
+    }
+    $SupportsVisionProperty = $Manifest.PSObject.Properties["supportsVision"]
+    if ($null -eq $SupportsVisionProperty -or
+        $SupportsVisionProperty.Value -isnot [bool] -or
+        -not [bool]$SupportsVisionProperty.Value) {
+        Add-Failure "Provisioning manifest must require native vision support."
     }
     $HasBaseUrl = [bool]$Manifest.hasBaseUrl
     $ProviderRequiresBaseUrl = ([string]$Manifest.provider).ToLowerInvariant() -notin @("openai-codex")
@@ -420,6 +426,7 @@ if ($null -ne $Manifest) {
     Test-ConfigEquals -Key "skills.write_approval" -Expected "true" -IgnoreCase
     Test-ConfigEquals -Key "model.provider" -Expected ([string]$Manifest.provider)
     Test-ConfigEquals -Key "model.default" -Expected ([string]$Manifest.model)
+    Test-ConfigEquals -Key "model.supports_vision" -Expected "true" -IgnoreCase
     if ($HasBaseUrl) {
         Test-ConfigEquals -Key "model.base_url" -Expected ([string]$Manifest.baseUrl)
     }

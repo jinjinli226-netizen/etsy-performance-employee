@@ -173,6 +173,18 @@ def test_candidate_extra_fields_and_review_kind_mismatch_are_rejected() -> None:
         ))
     assert candidate_error.value.code == "invalid_candidate_response"
 
+    incomplete = {
+        "schema_version": 1,
+        "candidates": CANDIDATE_REPLY["candidates"][:-1],
+    }
+    incomplete_generator = FakeHermes([json.dumps(incomplete), json.dumps(incomplete)])
+    with pytest.raises(TrainingModelError) as incomplete_error:
+        run(TrainingModel(incomplete_generator).generate_candidates(
+            merged(),
+            {"listing_id": "123456", "evidence_hash": "a" * 64},
+        ))
+    assert incomplete_error.value.code == "invalid_candidate_response"
+
     candidates = CandidateSet.model_validate(CANDIDATE_REPLY)
     mismatch = {
         "schema_version": 1,
