@@ -117,6 +117,23 @@ def sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def rename_first_media_member(path: Path) -> None:
+    with ZipFile(path, "r") as archive:
+        entries = {item.filename: archive.read(item.filename) for item in archive.infolist()}
+    original = next(name for name in entries if name.startswith("xl/media/"))
+    replacement = "xl/media/product-image.png"
+    payload = entries.pop(original)
+    old_target = f"/{original}".encode()
+    new_target = f"/{replacement}".encode()
+    for name, content in tuple(entries.items()):
+        if name.endswith(".rels"):
+            entries[name] = content.replace(old_target, new_target)
+    entries[replacement] = payload
+    with ZipFile(path, "w") as archive:
+        for name, content in entries.items():
+            archive.writestr(name, content)
+
+
 def canonical_sha(value: object) -> str:
     encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
@@ -494,6 +511,26 @@ def test_writer_preserves_workbook_and_changes_only_five_target_cells(tmp_path: 
                     assert peer.value == cell.value, address
                     assert peer.style_id == cell.style_id, address
                     assert (peer.hyperlink.target if peer.hyperlink else None) == (cell.hyperlink.target if cell.hyperlink else None), address
+
+
+def test_writer_accepts_equivalent_media_member_renaming(tmp_path: Path, excel_modules) -> None:
+    inspect, _, writer, _ = excel_modules
+    source = make_book(tmp_path / "renamed-media.xlsx")
+    rename_first_media_member(source)
+    manifest = inspect.inspect_workbook(source, tmp_path / "operation-renamed-media")
+
+    report = writer.write_workbook(
+        source,
+        tmp_path / "out-renamed-media",
+        manifest,
+        {manifest["rows"][0]["row_id"]: valid_result()},
+        rules={"rule_version": "rules-v1"},
+        expected_rule_version="rules-v1",
+    )
+
+    output = load_workbook(report["output_path"])
+    assert len(output["Products"]._images) == 1
+    assert output["Products"]["E5"].value == valid_result()["head_titles"]
 
 
 def test_writer_is_atomic_on_manifest_or_existing_destination_failure(tmp_path: Path, excel_modules) -> None:

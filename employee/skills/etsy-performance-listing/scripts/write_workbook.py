@@ -111,7 +111,7 @@ def write_workbook(
         inspect._validate_container(source)
     except inspect.WorkbookError as exc:
         raise WorkbookWriteError(exc.code, str(exc), details=exc.details) from exc
-    source_package_inventory = inspect._package_inventory(source, validate_supported=True)
+    source_package_inventory = inspect._package_preservation_signature(source, validate_supported=True)
     if _sha256(source) != manifest.get("source_sha256"):
         raise WorkbookWriteError("source_hash_mismatch", "The source workbook changed after inspection.")
     if not isinstance(expected_rule_version, str) or not expected_rule_version.strip():
@@ -180,7 +180,7 @@ def write_workbook(
                 changed.append(address)
                 expected_cells[address] = cell.value
         workbook.save(temp_path)
-        output_package_inventory = inspect._package_inventory(temp_path, validate_supported=True)
+        output_package_inventory = inspect._package_preservation_signature(temp_path, validate_supported=True)
         if output_package_inventory != source_package_inventory:
             raise WorkbookWriteError(
                 "package_preservation_failed",

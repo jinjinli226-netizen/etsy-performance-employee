@@ -6,6 +6,7 @@ sys.dont_write_bytecode = True
 import argparse
 import hashlib
 import json
+import posixpath
 import re
 import unicodedata
 import zipfile
@@ -152,6 +153,61 @@ def _package_inventory(path: Path, *, validate_supported: bool) -> dict[str, tup
                         details={"part": item.filename},
                     )
     return {"members": members, "relationships": tuple(sorted(relationships))}
+
+
+def _relationship_target_member(relationship_part: str, target: str) -> str:
+    normalized = target.replace("\\", "/")
+    if normalized.startswith("/"):
+        return posixpath.normpath(normalized.lstrip("/"))
+    if relationship_part == "_rels/.rels":
+        owner_directory = ""
+    else:
+        marker = "/_rels/"
+        if marker not in relationship_part or not relationship_part.endswith(".rels"):
+            return posixpath.normpath(normalized)
+        prefix, relationship_name = relationship_part.rsplit(marker, 1)
+        owner = f"{prefix}/{relationship_name[:-5]}"
+        owner_directory = posixpath.dirname(owner)
+    return posixpath.normpath(posixpath.join(owner_directory, normalized))
+
+
+def _package_preservation_signature(path: Path, *, validate_supported: bool) -> dict[str, tuple[Any, ...]]:
+    """Compare safe package structure while tolerating serializer-only XLSX rewrites."""
+    inventory = _package_inventory(path, validate_supported=validate_supported)
+    benign_members = {"docProps/app.xml", "docProps/core.xml", "xl/sharedStrings.xml"}
+    benign_relationship_kinds = {"sharedStrings", "extended-properties", "core-properties"}
+    with zipfile.ZipFile(path) as archive:
+        media_hashes = {
+            item.filename.replace("\\", "/"): hashlib.sha256(archive.read(item.filename)).hexdigest()
+            for item in archive.infolist()
+            if item.filename.replace("\\", "/").startswith("xl/media/")
+        }
+    members = tuple(sorted(
+        member
+        for member in inventory["members"]
+        if member not in benign_members and not member.startswith("xl/media/")
+    ))
+    relationships: list[tuple[str, str, str, str]] = []
+    for part, relationship_type, target, target_mode in inventory["relationships"]:
+        kind = relationship_type.rsplit("/", 1)[-1]
+        if kind in benign_relationship_kinds:
+            continue
+        canonical_target = target
+        if not target_mode:
+            target_member = _relationship_target_member(part, target)
+            if kind == "image":
+                digest = media_hashes.get(target_member)
+                if digest is None:
+                    raise WorkbookError("invalid_workbook", "An image relationship target is missing.")
+                canonical_target = f"sha256:{digest}"
+            else:
+                canonical_target = target_member
+        relationships.append((part, relationship_type, canonical_target, target_mode))
+    return {
+        "members": members,
+        "media_hashes": tuple(sorted(media_hashes.values())),
+        "relationships": tuple(sorted(relationships)),
+    }
 
 
 def _validate_container(path: Path) -> None:
