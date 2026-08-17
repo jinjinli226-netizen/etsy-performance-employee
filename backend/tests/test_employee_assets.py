@@ -229,6 +229,8 @@ def run_verifier(
         arguments,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         check=False,
     )
 
@@ -506,6 +508,8 @@ def test_powershell_scripts_parse(path: Path) -> None:
         [powershell_executable(), "-NoProfile", "-NonInteractive", "-Command", command],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         check=False,
     )
 
@@ -527,6 +531,8 @@ def test_verifier_fails_safely_for_an_absent_profile(tmp_path: Path) -> None:
         ],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         check=False,
     )
 
@@ -742,6 +748,8 @@ def test_structural_yaml_inspector_handles_quoted_nested_keys(tmp_path: Path) ->
         ["py", "-3.11", str(CONFIG_INSPECTOR_PATH), str(config_path)],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         check=False,
     )
 
@@ -778,6 +786,7 @@ def test_fake_real_hermes_provision_path_accepts_terminal_env_mirror(tmp_path: P
         "skills.write_approval": "true",
         "model.provider": "custom",
         "model.default": "gpt-5.6-sol",
+        "model.supports_vision": "true",
         "model.base_url": "https://relay.example/v1",
         "agent.reasoning_effort": "high",
     }
@@ -804,6 +813,8 @@ def test_fake_real_hermes_provision_path_accepts_terminal_env_mirror(tmp_path: P
         ],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         env=environment,
         check=False,
     )
@@ -838,6 +849,7 @@ def test_fake_hermes_provision_accepts_codex_without_base_url_and_xhigh(
         "skills.write_approval": "true",
         "model.provider": "openai-codex",
         "model.default": "gpt-5.6-sol",
+        "model.supports_vision": "true",
         "agent.reasoning_effort": "xhigh",
     }
     write_fake_hermes(
@@ -865,6 +877,8 @@ def test_fake_hermes_provision_accepts_codex_without_base_url_and_xhigh(
         ],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         env=environment,
         check=False,
     )
@@ -898,6 +912,8 @@ def test_custom_provider_still_requires_base_url_before_profile_creation(
         ],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         env=environment,
         check=False,
     )
@@ -1024,6 +1040,8 @@ def test_provisioner_rejects_noncanonical_url_before_profile_creation(
         ],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         env=environment,
         check=False,
     )

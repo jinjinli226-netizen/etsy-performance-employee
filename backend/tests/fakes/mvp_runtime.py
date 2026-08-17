@@ -23,8 +23,9 @@ def load_employee_runner():
 
 
 def listing_for_prompt(prompt: str) -> dict[str, object]:
-    row = json.loads(prompt.split("\n", 1)[1])
-    fields = {field["header"]: str(field["value"]) for field in row["candidate_fields"]}
+    envelope = json.loads(prompt.split("\n", 1)[1])
+    context = envelope["merged_product_context"]
+    fields = {field["header"]: str(field["value"]) for field in context["candidate_fields"]}
     sku = fields.get("SKU", "Costume")
     color = "Blue" if sku.endswith("001") else "Red"
     return {
@@ -40,7 +41,7 @@ def listing_for_prompt(prompt: str) -> dict[str, object]:
         "confidence": 0.93,
         "fact_warnings": [],
         "quality_warnings": [],
-        "rule_version": row["rules"]["rule_version"],
+        "rule_version": envelope["rules"]["rule_version"],
     }
 
 
@@ -91,6 +92,23 @@ class EmployeeSkillRunner(ExcelRunner):
         def fake_model(command: list[str], prompt: str):
             assert command[:4] == ["hermes", "-p", "etsy-performance-us", "chat"]
             assert "--resume" not in command and "--yolo" not in command
+            if "--image" in command:
+                visual = {
+                    "schema_version": 1,
+                    "visible_facts": {
+                        "product_family": ["performance costume"],
+                        "colors": ["blue"],
+                        "silhouette": ["fitted"],
+                        "garment_structure": ["one-piece"],
+                        "decorations": ["sequins"],
+                        "visible_components": ["costume"],
+                        "visual_style": ["stagewear"],
+                    },
+                    "uncertain_observations": [],
+                    "forbidden_inferences": [],
+                    "image_usable": True,
+                }
+                return subprocess.CompletedProcess(command, 0, json.dumps(visual), "")
             return subprocess.CompletedProcess(command, 0, json.dumps(listing_for_prompt(prompt)), "")
 
         report = await asyncio.to_thread(

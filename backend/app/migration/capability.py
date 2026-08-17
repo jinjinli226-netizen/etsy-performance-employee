@@ -19,6 +19,25 @@ class OwnedCapability:
     digest: str
 
 
+def _windows_powershell_environment() -> dict[str, str]:
+    environment = dict(os.environ)
+    casefolded = {key.casefold(): value for key, value in environment.items()}
+    system_root = casefolded.get("systemroot")
+    program_files = casefolded.get("programfiles")
+    if not system_root or not program_files:
+        raise RuntimeError("Windows PowerShell module roots are unavailable")
+    for key in tuple(environment):
+        if key.casefold() == "psmodulepath":
+            del environment[key]
+    environment["PSModulePath"] = os.pathsep.join(
+        (
+            str(Path(program_files) / "WindowsPowerShell" / "Modules"),
+            str(Path(system_root) / "System32" / "WindowsPowerShell" / "v1.0" / "Modules"),
+        )
+    )
+    return environment
+
+
 def _lock_windows_acl(path: Path) -> None:
     if os.name != "nt":
         return
@@ -48,7 +67,7 @@ def _lock_windows_acl(path: Path) -> None:
     )
     snapshot = subprocess.run(
         ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", acl_script], check=True,
-        capture_output=True, text=True, timeout=5,
+        capture_output=True, text=True, timeout=5, env=_windows_powershell_environment(),
     ).stdout
     _validate_windows_acl_snapshot(json.loads(snapshot), sid)
 

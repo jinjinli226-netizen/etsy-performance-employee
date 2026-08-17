@@ -40,6 +40,7 @@ from app.migration.importer import ImportConflict, ImportValidationError, Migrat
 from app.migration.secrets import SensitiveDataError, scan_for_secrets
 from app.core.config import Settings
 from app.migration.capability import _validate_windows_acl_snapshot, create_capability_file, remove_owned_capability_file
+from app.migration import capability as capability_module
 from app.migration.contracts import GuardRecord, ManifestRecord, MessageRecord
 from app.migration.guard import GuardValidationError, PortableGuard, merge_guards, validate_shingles
 from pydantic import ValidationError
@@ -339,7 +340,11 @@ def test_secret_scanner_catches_multiple_credentials_without_hash_false_positive
     for value in ("github_pat_" + "a" * 40, "xoxb-123456789-abcdefghijklmnop", "AKIA" + "A" * 16, "AIza" + "A" * 35, "Authorization: Bearer abc.def.ghi", "postgresql://owner:secret@example.test/db", "apikey is " + "Q" * 32, "cookievalue " + "Z" * 30, "session " + "R" * 40):
         with pytest.raises(SensitiveDataError):
             scan_for_secrets({"note": value})
-    scan_for_secrets({"sha256": "a" * 64, "id": str(uuid4()), "abstract": "sequence and color balance"})
+    scan_for_secrets({
+        "sha256": "a" * 64,
+        "id": str(uuid4()),
+        "abstract": "Candidate fields are authoritative over conflicting visual observations.",
+    })
 
 
 @pytest.mark.parametrize("parts", [
@@ -695,6 +700,23 @@ def test_windows_capability_acl_rejects_unexpected_allow_rules() -> None:
     _validate_windows_acl_snapshot({"protected": True, "allows": [sid, "S-1-5-18"]}, sid)
     with pytest.raises(RuntimeError, match="ACL"):
         _validate_windows_acl_snapshot({"protected": True, "allows": [sid, "S-1-1-0"]}, sid)
+
+
+def test_windows_acl_probe_uses_only_windows_powershell_module_roots(monkeypatch) -> None:
+    monkeypatch.setenv("SystemRoot", r"C:\Windows")
+    monkeypatch.setenv("ProgramFiles", r"C:\Program Files")
+    monkeypatch.setenv(
+        "PSModulePath",
+        r"C:\runtime\PowerShell\Modules;C:\Windows\System32\WindowsPowerShell\v1.0\Modules",
+    )
+
+    environment = capability_module._windows_powershell_environment()
+
+    assert [key for key in environment if key.casefold() == "psmodulepath"] == ["PSModulePath"]
+    assert environment["PSModulePath"].split(os.pathsep) == [
+        r"C:\Program Files\WindowsPowerShell\Modules",
+        r"C:\Windows\System32\WindowsPowerShell\v1.0\Modules",
+    ]
     script = (Path(__file__).parents[2] / "scripts" / "package-employee.ps1").read_text(encoding="utf-8")
     assert "unexpectedAllows" in script and "AreAccessRulesProtected" in script
 

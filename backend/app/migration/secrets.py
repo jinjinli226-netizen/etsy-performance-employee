@@ -15,7 +15,7 @@ _VALUE = re.compile(
     r"(?:sk-[A-Za-z0-9_-]{20,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[pbar]-[A-Za-z0-9-]{16,}|AKIA[A-Z0-9]{16}|AIza[A-Za-z0-9_-]{30,}|Bearer\s+[A-Za-z0-9._~-]{8,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis)://[^\s:@/]+:[^\s@/]+@)",
     re.I,
 )
-_ASSIGNMENT = re.compile(r"(?:api[ _-]?key|apikey|token|secret|password|cookie(?:value)?|session|auth(?:orization)?)\s*(?:(?:is|[:=])\s*)?[^\s,;]{8,}", re.I)
+_ASSIGNMENT = re.compile(r"\b(?:api[ _-]?key|apikey|token|secret|password|cookie(?:value)?|session|auth(?:orization)?)\b\s*(?:(?:is|[:=])\s*)?[^\s,;]{8,}", re.I)
 _JWT = re.compile(r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}")
 
 
