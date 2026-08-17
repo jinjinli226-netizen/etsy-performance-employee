@@ -74,7 +74,7 @@ onMounted(() => { if (!store.jobs.length && !store.loading) void store.initializ
         <ExcelDropzone ref="dropzone" :uploading="store.uploading" @select="upload" />
       </template>
       <template v-else>
-        <JobProgress :job="store.currentJob" :warnings="store.currentWarnings" :cancelling="store.cancelling" @cancel="store.cancelCurrent()" />
+        <JobProgress :job="store.currentJob" :warnings="store.currentWarnings" :skipped-count="store.currentSkippedCount" :cancelling="store.cancelling" @cancel="store.cancelCurrent()" />
         <ResultDownload
           :job="store.currentJob"
           :downloading="store.downloading"

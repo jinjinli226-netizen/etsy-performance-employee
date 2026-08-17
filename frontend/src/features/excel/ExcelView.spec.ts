@@ -216,6 +216,36 @@ describe("Excel automation workspace", () => {
     expect(api.getCalls).toBeGreaterThan(0);
   });
 
+  it("shows a deduplicated missing-image skip count without exposing row identity", async () => {
+    const api = new FakeExcelApi();
+    const job = makeJob("running");
+    api.jobs = [job];
+    api.events.set(job.id, [
+      {
+        id: 2,
+        event: {
+          type: "worker_row_skipped",
+          status: "running",
+          progress_percent: 2,
+          row_id: "internal-row-6",
+          row_number: 6,
+          skip_reason: "missing_product_image",
+          message: "已跳过：缺少商品图片",
+          warnings: ["已跳过：缺少商品图片"],
+        },
+      },
+    ]);
+
+    const { store, wrapper } = await render(api);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    await flushPromises();
+
+    expect(store.currentSkippedCount).toBe(1);
+    expect(wrapper.text()).toContain("已跳过：缺少商品图片");
+    expect(wrapper.text()).toContain("已跳过 1 行");
+    expect(wrapper.text()).not.toContain("internal-row-6");
+  });
+
   it("monitors multiple active jobs without stale controllers and cancels idempotently", async () => {
     const api = new FakeExcelApi();
     const first = makeJob("running");

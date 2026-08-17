@@ -97,7 +97,7 @@ async def _bounded_stream(stream: asyncio.StreamReader, *, max_bytes: int) -> by
 
 
 class SubprocessExcelRunner:
-    _EVENTS = {"started", "row_started", "row_completed", "row_failed", "completed", "failed"}
+    _EVENTS = {"started", "row_started", "row_completed", "row_skipped", "row_failed", "completed", "failed"}
 
     def __init__(
         self,

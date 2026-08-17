@@ -31,6 +31,7 @@ from app.db.init_db import init_db
 from app.db.models import Artifact, ExcelJob, JobEvent
 from app.db.session import create_engine_for_url, create_session_factory
 from app.excel_jobs.schemas import JobStatus
+from app.excel_jobs.service import ExcelJobService
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "performance-listing-template.xlsx"
@@ -73,7 +74,15 @@ class RealProtocolRunner(FakeExcelRunner):
         await emit({"event": "row_started", "row_id": "row-1", "row_number": 3})
         await emit({"event": "row_completed", "row_id": "row-1", "row_number": 3, "warnings": ["Confirm fabric details"]})
         await emit({"event": "row_started", "row_id": "row-2", "row_number": 4})
-        await emit({"event": "row_completed", "row_id": "row-2", "row_number": 4})
+        await emit({
+            "event": "row_skipped",
+            "row_id": "row-2",
+            "row_number": 4,
+            "reason": {
+                "code": "missing_product_image",
+                "message": "Product image is required; this row was skipped.",
+            },
+        })
         output = request.operation_dir / "generated.xlsx"
         shutil.copyfile(request.source_path, output)
         result = WorkerResult(output, sha256(output))
@@ -124,6 +133,27 @@ def wait_terminal(client: TestClient, public_id: str) -> dict:
 
         time.sleep(0.01)
     raise AssertionError("job did not reach a terminal state")
+
+
+def running_service(tmp_path):
+    settings = Settings(data_dir=tmp_path / "data", database_url=f"sqlite:///{tmp_path / 'events.db'}")
+    settings.ensure_runtime_dirs()
+    engine = create_engine_for_url(settings.resolved_database_url)
+    init_db(engine)
+    factory = create_session_factory(engine)
+    public_id = "11111111-1111-4111-8111-111111111111"
+    with factory() as session:
+        session.add(ExcelJob(
+            public_id=public_id,
+            source_filename="events.xlsx",
+            source_sha256="a" * 64,
+            source_size_bytes=1,
+            status=JobStatus.RUNNING,
+            progress_percent=1,
+            warning_messages=[],
+        ))
+        session.commit()
+    return ExcelJobService(factory, FakeExcelRunner(), settings), factory, engine, public_id
 
 
 def test_upload_runs_employee_job_persists_events_and_downloads_new_artifact(api) -> None:
@@ -296,7 +326,8 @@ def test_malformed_progress_event_fails_job_safely(tmp_path) -> None:
         assert terminal["error"]["code"] == "invalid_worker_event"
 
 
-def test_real_multi_row_worker_protocol_reaches_terminal_and_persists_events(tmp_path) -> None:
+def test_real_multi_row_worker_protocol_reaches_terminal_and_persists_events(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr("app.migration.capability._lock_windows_acl", lambda _path: None)
     settings = Settings(data_dir=tmp_path / "data", database_url=f"sqlite:///{tmp_path / 'api.db'}")
     with TestClient(create_app(settings=settings, excel_runner=RealProtocolRunner())) as client:
         job = upload(client).json()
@@ -306,11 +337,81 @@ def test_real_multi_row_worker_protocol_reaches_terminal_and_persists_events(tmp
             event_types = [line[7:] for line in response.iter_lines() if line.startswith("event: ")]
         assert event_types == [
             "queued", "running", "worker_started", "worker_row_started",
-            "worker_row_completed", "worker_row_started", "worker_row_completed",
+            "worker_row_completed", "worker_row_started", "worker_row_skipped",
             "worker_completed", "completed",
         ]
         detail = client.get(f"/api/excel-jobs/{job['id']}").json()
-        assert detail["warnings"] == ["Confirm fabric details"]
+        assert detail["warnings"] == ["Confirm fabric details", "已跳过：缺少商品图片"]
+        assert detail["progress_percent"] == 100
+
+        events, _terminal = client.app.state.excel_job_service.events_after(job["id"], 0)
+        skipped = next(event for event in events if event.event_type == "worker_row_skipped")
+        assert skipped.payload == {
+            "status": "running",
+            "row_id": "row-2",
+            "row_number": 4,
+            "skip_reason": "missing_product_image",
+            "message": "已跳过：缺少商品图片",
+            "warnings": ["已跳过：缺少商品图片"],
+            "progress_percent": 3,
+        }
+
+
+@pytest.mark.parametrize(
+    ("row_id", "message"),
+    [
+        ("row/../../secret", "Product image is required; this row was skipped."),
+        ("row-1", "C:\\private\\image.png"),
+        ("row-1", "https://example.invalid/image.png"),
+        ("row-1", "unsafe\u0007message"),
+    ],
+)
+def test_worker_skip_event_rejects_unsafe_identity_or_message(
+    tmp_path, row_id: str, message: str
+) -> None:
+    service, _factory, engine, public_id = running_service(tmp_path)
+    try:
+        with pytest.raises(WorkerProtocolError):
+            asyncio.run(service._persist_worker_event(public_id, {
+                "event": "row_skipped",
+                "row_id": row_id,
+                "row_number": 3,
+                "reason": {"code": "missing_product_image", "message": message},
+            }))
+        assert service.get_job(public_id).warnings == []
+    finally:
+        engine.dispose()
+
+
+def test_worker_skip_event_persists_safe_warning_and_monotonic_progress(tmp_path) -> None:
+    service, factory, engine, public_id = running_service(tmp_path)
+    try:
+        asyncio.run(service._persist_worker_event(public_id, {
+            "event": "row_skipped",
+            "row_id": "row-3",
+            "row_number": 3,
+            "reason": {
+                "code": "missing_product_image",
+                "message": "Product image is required; this row was skipped.",
+            },
+        }))
+        asyncio.run(service._persist_worker_event(public_id, {
+            "event": "row_completed",
+            "row_id": "row-4",
+            "row_number": 4,
+            "warnings": [],
+        }))
+
+        view = service.get_job(public_id)
+        assert view.progress_percent == 3
+        assert view.warnings == ["已跳过：缺少商品图片"]
+        with factory() as session:
+            events = list(session.scalars(select(JobEvent).order_by(JobEvent.id)))
+        assert [event.event_type for event in events] == ["worker_row_skipped", "worker_row_completed"]
+        assert events[0].payload["skip_reason"] == "missing_product_image"
+        assert "path" not in json.dumps(events[0].payload).casefold()
+    finally:
+        engine.dispose()
 
 
 def test_list_jobs_does_not_load_event_collections_and_detail_warnings_stay_bounded(tmp_path, monkeypatch) -> None:

@@ -38,8 +38,11 @@ from app.knowledge.service import KnowledgeValidationError
 
 TERMINAL = {JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED, JobStatus.NEEDS_REVIEW}
 _SAFE_CODE = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
+_ROW_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _WARNING_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _WARNING_URL = re.compile(r"(?:https?://|www\.)", re.IGNORECASE)
+MISSING_IMAGE_WORKER_MESSAGE = "Product image is required; this row was skipped."
+MISSING_IMAGE_PUBLIC_MESSAGE = "已跳过：缺少商品图片"
 MAX_JOB_WARNINGS = 40
 MAX_JOB_WARNING_CHARS = 500
 MAX_JOB_WARNING_TOTAL_CHARS = 5_000
@@ -357,13 +360,13 @@ class ExcelJobService:
         if len(json.dumps(event, ensure_ascii=False).encode("utf-8")) > self.settings.max_worker_event_bytes:
             raise WorkerProtocolError("Worker event exceeded its limit.")
         kind = event["event"]
-        if kind not in {"started", "row_started", "row_completed", "row_failed", "completed", "failed"}:
+        if kind not in {"started", "row_started", "row_completed", "row_skipped", "row_failed", "completed", "failed"}:
             raise WorkerProtocolError("Unknown worker event.")
         payload: dict = {"status": "running"}
         if kind.startswith("row_"):
             row_id = event.get("row_id")
             row_number = event.get("row_number")
-            if not isinstance(row_id, str) or len(row_id) > 128:
+            if not isinstance(row_id, str) or not _ROW_ID.fullmatch(row_id):
                 raise WorkerProtocolError("Invalid row event.")
             payload["row_id"] = row_id
             if row_number is not None:
@@ -372,6 +375,22 @@ class ExcelJobService:
                 payload["row_number"] = row_number
         if kind == "row_completed":
             payload["warnings"] = _safe_worker_warnings(event.get("warnings", []))
+        elif kind == "row_skipped":
+            if "row_number" not in payload:
+                raise WorkerProtocolError("Invalid skipped row event.")
+            reason = event.get("reason")
+            if (
+                not isinstance(reason, dict)
+                or set(reason) != {"code", "message"}
+                or reason.get("code") != "missing_product_image"
+                or reason.get("message") != MISSING_IMAGE_WORKER_MESSAGE
+            ):
+                raise WorkerProtocolError("Invalid skipped row reason.")
+            payload.update({
+                "skip_reason": "missing_product_image",
+                "message": MISSING_IMAGE_PUBLIC_MESSAGE,
+                "warnings": [MISSING_IMAGE_PUBLIC_MESSAGE],
+            })
         await asyncio.to_thread(self._persist_worker_event_sync, public_id, kind, payload)
         self._signal(public_id)
 
@@ -380,8 +399,9 @@ class ExcelJobService:
             job = self._get(session, public_id)
             if job.status is not JobStatus.RUNNING:
                 raise JobConflictError("Job is no longer running.")
-            if kind == "row_completed":
+            if kind in {"row_completed", "row_skipped"}:
                 job.progress_percent = min(99, max(job.progress_percent, job.progress_percent + 1))
+            if kind in {"row_completed", "row_skipped"}:
                 job.warning_messages = _merge_warning_values(
                     job.warning_messages, payload.get("warnings", [])
                 )

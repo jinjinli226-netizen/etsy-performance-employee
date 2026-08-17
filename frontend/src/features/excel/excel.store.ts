@@ -7,6 +7,8 @@ const CURRENT_KEY = "etsy-excel-current-job";
 const TERMINAL = new Set<ExcelJobStatus>(["needs_review", "completed", "failed", "cancelled"]);
 const ACTIVE = new Set<ExcelJobStatus>(["queued", "running"]);
 const MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
+const MISSING_IMAGE_WARNING = "已跳过：缺少商品图片";
+const SAFE_ROW_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 
 interface Monitor { controller: AbortController; token: symbol }
 export interface ExcelStoreOptions { pollIntervalMs?: number; pollAttempts?: number }
@@ -42,6 +44,7 @@ export const createExcelStore = (api: ExcelApi = excelApi, options: ExcelStoreOp
   const jobs = ref<ExcelJob[]>([]);
   const currentJobId = ref<string | null>(null);
   const warnings = reactive(new Map<string, string[]>());
+  const skippedRows = reactive(new Map<string, Set<string>>());
   const lastEventIds = reactive(new Map<string, number>());
   const loading = ref(false);
   const loadingMore = ref(false);
@@ -64,6 +67,7 @@ export const createExcelStore = (api: ExcelApi = excelApi, options: ExcelStoreOp
   const currentJob = computed(() => jobs.value.find((job) => job.id === currentJobId.value) ?? null);
   const hasMore = computed(() => jobs.value.length < total.value);
   const currentWarnings = computed(() => currentJobId.value ? warnings.get(currentJobId.value) ?? [] : []);
+  const currentSkippedCount = computed(() => currentJobId.value ? skippedRows.get(currentJobId.value)?.size ?? 0 : 0);
   const retainedFileCount = computed(() => localFiles.size);
 
   const persistSelection = (id: string | null) => {
@@ -74,7 +78,11 @@ export const createExcelStore = (api: ExcelApi = excelApi, options: ExcelStoreOp
   };
 
   const upsertAuthoritative = (incoming: ExcelJob) => {
-    warnings.set(incoming.id, boundedWarnings(incoming.warnings));
+    const safeWarnings = boundedWarnings(incoming.warnings);
+    warnings.set(incoming.id, safeWarnings);
+    if (safeWarnings.includes(MISSING_IMAGE_WARNING) && !skippedRows.has(incoming.id)) {
+      skippedRows.set(incoming.id, new Set(["persisted-skip"]));
+    }
     const index = jobs.value.findIndex((job) => job.id === incoming.id);
     if (index < 0) jobs.value = [incoming, ...jobs.value];
     else {
@@ -97,6 +105,17 @@ export const createExcelStore = (api: ExcelApi = excelApi, options: ExcelStoreOp
       job.progress_percent = Math.max(job.progress_percent, Math.min(100, Math.max(0, Math.round(event.progress_percent))));
     }
     if (event.status && ["queued", "running"].includes(event.status)) job.status = event.status;
+    if (
+      event.type === "worker_row_skipped"
+      && event.skip_reason === "missing_product_image"
+      && typeof event.row_id === "string"
+      && SAFE_ROW_ID.test(event.row_id)
+    ) {
+      const rows = new Set(skippedRows.get(job.id) ?? []);
+      rows.delete("persisted-skip");
+      rows.add(event.row_id);
+      skippedRows.set(job.id, rows);
+    }
     const receivedWarnings = boundedWarnings(event.warnings);
     if (receivedWarnings.length) warnings.set(job.id, boundedWarnings(warnings.get(job.id), receivedWarnings));
   };
@@ -151,6 +170,15 @@ export const createExcelStore = (api: ExcelApi = excelApi, options: ExcelStoreOp
     const handle: Monitor = { controller: new AbortController(), token: Symbol("excel-monitor") };
     monitors.set(job.id, handle);
     if (TERMINAL.has(job.status)) {
+      try {
+        await api.streamJob(job.id, {
+          lastEventId: lastEventIds.get(job.id) || undefined,
+          signal: handle.controller.signal,
+          onEvent: (event, id) => applyEvent(job, event, id, handle),
+        });
+      } catch (error) {
+        if (!handle.controller.signal.aborted) errorCode.value = safeErrorCode(error);
+      }
       await refreshTerminal(job, handle);
       if (monitors.get(job.id)?.token === handle.token) monitors.delete(job.id);
       return;
@@ -197,7 +225,11 @@ export const createExcelStore = (api: ExcelApi = excelApi, options: ExcelStoreOp
       const page = await api.listJobs(controller.signal, 20, 0);
       if (disposed.value || loadToken !== token) return;
       jobs.value = page.items;
-      page.items.forEach((job) => warnings.set(job.id, boundedWarnings(job.warnings)));
+      page.items.forEach((job) => {
+        const safeWarnings = boundedWarnings(job.warnings);
+        warnings.set(job.id, safeWarnings);
+        if (safeWarnings.includes(MISSING_IMAGE_WARNING)) skippedRows.set(job.id, new Set(["persisted-skip"]));
+      });
       total.value = page.total;
       let preferred: string | null = null;
       try { preferred = localStorage.getItem(CURRENT_KEY); } catch { /* Ignore unavailable storage. */ }
@@ -338,10 +370,11 @@ export const createExcelStore = (api: ExcelApi = excelApi, options: ExcelStoreOp
     monitors.clear();
     cancelLocks.clear();
     localFiles.clear();
+    skippedRows.clear();
   };
 
   return reactive({
-    jobs, currentJobId, currentJob, currentWarnings, retainedFileCount, total, hasMore, loading, loadingMore, uploading, cancelling, downloading,
+    jobs, currentJobId, currentJob, currentWarnings, currentSkippedCount, retainedFileCount, total, hasMore, loading, loadingMore, uploading, cancelling, downloading,
     errorCode, disposed: readonly(disposed), initialize, loadMore, selectJob, upload, retryCurrent, cancelCurrent, downloadCurrent, clearError, dispose,
     hasLocalFile: (id: string) => localFiles.has(id),
   });

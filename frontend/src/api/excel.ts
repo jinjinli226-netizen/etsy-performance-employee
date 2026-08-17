@@ -32,13 +32,20 @@ export interface ExcelJobPage {
   offset: number;
 }
 
+export type ExcelJobEventType =
+  | "queued" | "running" | "needs_review" | "completed" | "failed" | "cancelled" | "cleanup_failed" | "progress"
+  | "worker_started" | "worker_row_started" | "worker_row_completed"
+  | "worker_row_skipped" | "worker_row_failed" | "worker_completed" | "worker_failed";
+
 export interface ExcelJobEvent {
-  type: string;
+  type: ExcelJobEventType;
   status?: ExcelJobStatus;
   progress_percent?: number;
   row_id?: string;
   row_number?: number;
   warnings?: unknown;
+  skip_reason?: "missing_product_image";
+  message?: unknown;
   error?: unknown;
 }
 

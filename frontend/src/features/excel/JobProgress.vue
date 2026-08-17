@@ -3,7 +3,7 @@ import { Ban, Check, Clock3, LoaderCircle, TriangleAlert, X } from "lucide-vue-n
 import { computed } from "vue";
 import type { ExcelJob } from "../../api/excel";
 
-const props = defineProps<{ job: ExcelJob; warnings: string[]; cancelling: boolean }>();
+const props = defineProps<{ job: ExcelJob; warnings: string[]; skippedCount: number; cancelling: boolean }>();
 defineEmits<{ cancel: [] }>();
 
 const copy = {
@@ -61,6 +61,10 @@ const size = computed(() => props.job.source_size_bytes < 1024 * 1024
       <strong><TriangleAlert :size="15" aria-hidden="true" />员工提醒</strong>
       <ul><li v-for="warning in warnings" :key="warning">{{ warning }}</li></ul>
     </div>
+    <div v-if="skippedCount > 0" class="job-progress__skipped" data-testid="skipped-rows">
+      <strong>已跳过 {{ skippedCount }} 行</strong>
+      <span>已跳过：缺少商品图片</span>
+    </div>
   </section>
 </template>
 
@@ -84,6 +88,8 @@ const size = computed(() => props.job.source_size_bytes < 1024 * 1024
 .job-progress__warnings { padding: 18px 0 2px; border-top: 1px solid var(--border); }
 .job-progress__warnings strong { display: flex; align-items: center; gap: 7px; color: var(--warning); font-size: 12px; font-weight: 500; }
 .job-progress__warnings ul { display: grid; gap: 6px; margin: 10px 0 0; padding-left: 18px; color: var(--text-secondary); font-size: 12px; }
+.job-progress__skipped { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 0 0; color: var(--text-secondary); font-size: 12px; }
+.job-progress__skipped strong { color: var(--warning); font-weight: 600; }
 .spin { animation: spin .8s linear infinite; } @keyframes spin { to { transform: rotate(360deg); } }
 @media (max-width: 640px) { .job-progress__header { align-items: flex-start; } .job-progress__identity { width: 100%; } .job-progress__identity > div { max-width: calc(100% - 56px); } .job-progress h2 { max-width: 100%; } .job-progress__cancel { min-height: 44px; } .job-progress__status { grid-template-columns: minmax(0, 1fr) auto; } .job-progress__status span { grid-column: 1 / -1; grid-row: 2; } .job-progress__status strong { font-size: 21px; } .job-progress__status b { justify-self: end; } .job-progress__rows { gap: 12px; } .job-progress__rows span { min-width: 0; } }
 </style>
