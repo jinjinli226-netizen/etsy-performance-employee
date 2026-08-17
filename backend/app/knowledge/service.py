@@ -617,6 +617,38 @@ class KnowledgeService:
         )
         return (version.public_id if version is not None else None), pattern.revision
 
+    def training_review_context(
+        self,
+        kinds: tuple[str, ...] | list[str],
+    ) -> tuple[dict[str, ActiveToken], dict[str, dict[str, object]]]:
+        if not kinds or len(kinds) > 5 or len(set(kinds)) != len(kinds):
+            raise KnowledgeValidationError("invalid review context kinds")
+        tokens: dict[str, ActiveToken] = {}
+        rules: dict[str, dict[str, object]] = {}
+        with self.session_factory() as session:
+            for kind in kinds:
+                if not __import__("re").fullmatch(r"[a-z][a-z0-9_-]{0,126}", kind):
+                    raise KnowledgeValidationError("invalid review context kind")
+                pattern = session.scalar(select(KnowledgePattern).where(KnowledgePattern.kind == kind))
+                version = None
+                if pattern is not None:
+                    version = session.scalar(
+                        select(RuleVersion).where(
+                            RuleVersion.pattern_id == pattern.id,
+                            RuleVersion.status == KnowledgeStatus.ACTIVE,
+                        )
+                    )
+                token = ActiveToken(
+                    active_rule_public_id=version.public_id if version is not None else None,
+                    pattern_revision=pattern.revision if pattern is not None else None,
+                )
+                tokens[kind] = token
+                rules[kind] = {
+                    "abstract": pattern.abstract_summary if pattern is not None else "",
+                    **token.model_dump(mode="json"),
+                }
+        return tokens, rules
+
     def record_accepted_edit(self, candidate_id: int, *, feedback_id: str, row_id: str) -> KnowledgeCandidate:
         if not feedback_id or not row_id or len(feedback_id) > 128 or len(row_id) > 128:
             raise KnowledgeValidationError("invalid feedback reference")

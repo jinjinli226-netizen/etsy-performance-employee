@@ -272,3 +272,26 @@ def test_reviewed_batch_is_idempotent_for_same_sample(services) -> None:
         assert session.scalar(select(func.count()).select_from(TrainingReview)) == 1
         assert session.scalar(select(func.count()).select_from(KnowledgeCandidate)) == 1
         assert session.scalar(select(func.count()).select_from(RuleVersion)) == 1
+
+
+def test_training_review_context_returns_active_abstract_and_version_token(services) -> None:
+    service, _factory, _sample_id = services
+    seed = service.ingest_candidate(
+        CandidateInput(
+            kind="title_structure",
+            abstract="Put the verified product type before secondary style descriptors.",
+            confidence=0.5,
+            evidence_refs=[],
+        ),
+        actor="owner",
+        trace_id="seed-context",
+    )
+    service.approve_candidate(seed.id, actor="owner")
+
+    tokens, rules = service.training_review_context(("title_structure", "tag_taxonomy"))
+
+    assert tokens["title_structure"].active_rule_public_id is not None
+    assert tokens["title_structure"].pattern_revision == 1
+    assert rules["title_structure"]["abstract"].startswith("Put the verified product type")
+    assert tokens["tag_taxonomy"] == ActiveToken(active_rule_public_id=None, pattern_revision=None)
+    assert rules["tag_taxonomy"]["abstract"] == ""
