@@ -7,6 +7,7 @@ from typing import Any, Callable, TypeVar
 from pydantic import BaseModel, ValidationError
 
 from app.employee.adapter import HermesAdapter
+from app.knowledge.schemas import CandidateInput
 from app.training.schemas import CandidateSet, MergedFacts, ReviewSet, VisualAnalysis
 
 
@@ -94,6 +95,16 @@ class TrainingModel:
             "rules": {
                 "abstract_only": True,
                 "exactly_one_candidate_per_allowed_kind": True,
+                "abstracts_describe_fact_bound_methods_without_raw_data_markers": True,
+                "prohibited_abstract_markers": [
+                    "competitor",
+                    "evidence",
+                    "snapshot",
+                    "raw listing",
+                    "source URL",
+                    "http://",
+                    "https://",
+                ],
                 "no_source_url": True,
                 "no_shop_identity": True,
                 "no_raw_listing_copy": True,
@@ -103,6 +114,13 @@ class TrainingModel:
         def complete_candidates(result: CandidateSet) -> None:
             if {candidate.kind for candidate in result.candidates} != KNOWLEDGE_KINDS:
                 raise ValueError("candidate kinds must exactly cover allowed kinds")
+            for candidate in result.candidates:
+                CandidateInput(
+                    kind=candidate.kind,
+                    abstract=candidate.abstract,
+                    confidence=candidate.confidence,
+                    evidence_refs=[],
+                )
 
         return await self._invoke_contract(
             task="ABSTRACT_CANDIDATE_GENERATION",

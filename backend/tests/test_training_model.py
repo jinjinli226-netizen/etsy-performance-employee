@@ -36,7 +36,7 @@ KINDS = (
 CANDIDATE_REPLY = {
     "schema_version": 1,
     "candidates": [
-        {"kind": kind, "abstract": f"Reusable evidence-bound method for {kind}", "confidence": 0.9}
+        {"kind": kind, "abstract": f"Reusable fact-bound method for {kind}", "confidence": 0.9}
         for kind in KINDS
     ],
 }
@@ -184,6 +184,16 @@ def test_candidate_extra_fields_and_review_kind_mismatch_are_rejected() -> None:
             {"listing_id": "123456", "evidence_hash": "a" * 64},
         ))
     assert incomplete_error.value.code == "invalid_candidate_response"
+
+    unsafe = json.loads(json.dumps(CANDIDATE_REPLY))
+    unsafe["candidates"][0]["abstract"] = "Copy the raw listing evidence from the source URL into the title method."
+    unsafe_generator = FakeHermes([json.dumps(unsafe), json.dumps(unsafe)])
+    with pytest.raises(TrainingModelError) as unsafe_error:
+        run(TrainingModel(unsafe_generator).generate_candidates(
+            merged(),
+            {"listing_id": "123456", "evidence_hash": "a" * 64},
+        ))
+    assert unsafe_error.value.code == "invalid_candidate_response"
 
     candidates = CandidateSet.model_validate(CANDIDATE_REPLY)
     mismatch = {
