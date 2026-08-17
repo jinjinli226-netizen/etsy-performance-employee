@@ -48,3 +48,35 @@ A knowledge export is data, not proof of trust. The trusted caller must supply `
 - `rule_version` 必须指向本次实际使用的规则版本，不能省略或写成未解析的默认值。
 - 所有字符串去除首尾空白后必须非空（警告数组可以为空），不得含控制字符，也不得以 `=`, `+`, `-`, `@` 开头，避免 Excel 公式注入。
 - 默认参考规则为标题 3–14 个词、13 个标签、每标签最多 20 个字符且规范化后互不重复；任务规则 JSON 可以覆盖这些默认值，若指定 `rule_version`，结果必须精确一致。
+
+## 图片可见事实中间结果
+
+有图行先在独立会话中返回 schema-v1 视觉 JSON。根字段固定为 `schema_version`、`visible_facts`、`uncertain_observations`、`forbidden_inferences` 和 `image_usable`，禁止额外字段。`visible_facts` 仅允许以下数组字段：
+
+- `product_family`
+- `colors`
+- `silhouette`
+- `garment_structure`
+- `decorations`
+- `visible_components`
+- `visual_style`
+
+每个值必须是规范化、非空、无控制字符、无公式前缀、无路径或 URL 的短文本。视觉阶段只观察首张商品图；不得推断材质、尺寸、套装内容、未见配件、性能、品牌、认证、价格、库存、配送。行候选字段与视觉观察冲突时，行文本字段优先。最终 Listing 会话只接收脱敏合并上下文，不接收图片、图片路径或图片字节。
+
+## 缺图行事件
+
+没有 `image_paths` 的商品行必须在 `row_started` 之前发出：
+
+```json
+{
+  "event": "row_skipped",
+  "row_id": "<bounded row identity>",
+  "row_number": 6,
+  "reason": {
+    "code": "missing_product_image",
+    "message": "Product image is required; this row was skipped."
+  }
+}
+```
+
+该行不得调用 Hermes，也不得写入五个输出单元格。若全部商品行均缺图，任务以 `no_rows_with_images` 失败，不发布工作簿。

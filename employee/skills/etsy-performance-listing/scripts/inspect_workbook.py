@@ -340,7 +340,16 @@ def inspect_workbook(source_path: str | Path, operation_dir: str | Path) -> dict
             raise WorkbookError("workbook_input_limit_exceeded", "A product row exceeds the safe context limit.", details={"row": row_no})
         context_hash = hashlib.sha256(context.encode("utf-8")).hexdigest()
         row_id = hashlib.sha256(f"{source_sha}:{ws.title}:{row_no}:{context_hash}".encode("utf-8")).hexdigest()
-        rows.append({"row_id": row_id, "row_number": row_no, "context_hash": context_hash, "context": context, "candidate_fields": candidate_fields, "image_paths": [], "warnings": []})
+        rows.append({
+            "row_id": row_id,
+            "row_number": row_no,
+            "context_hash": context_hash,
+            "context": context,
+            "candidate_fields": candidate_fields,
+            "image_paths": [],
+            "visual_context": None,
+            "warnings": [],
+        })
     images = _extract_images(ws, {item["row_number"] for item in rows}, operation)
     for item in rows:
         item["image_paths"] = images[item["row_number"]]

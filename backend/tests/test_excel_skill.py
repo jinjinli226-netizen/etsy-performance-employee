@@ -68,7 +68,7 @@ def make_book(
     headers: tuple[str, ...] = HEADERS,
     rows: tuple[tuple[object, ...], ...] = (("SKU-1", "Blue sequin dance costume", 29.5, "internal"),),
     second_candidate: bool = False,
-    image_rows: tuple[int, ...] = (),
+    image_rows: tuple[int, ...] = (5,),
 ) -> Path:
     wb = Workbook()
     ws = wb.active
@@ -612,13 +612,59 @@ def test_writer_reopens_and_verifies_every_written_value(tmp_path: Path, excel_m
 
 
 class FakeHermes:
-    def __init__(self, outputs: list[str]) -> None:
+    def __init__(self, outputs: list[str], *, visual_outputs: list[str] | None = None) -> None:
         self.outputs = outputs
+        self.visual_outputs = visual_outputs
         self.calls: list[tuple[list[str], str]] = []
 
     def __call__(self, command: list[str], prompt: str) -> subprocess.CompletedProcess[str]:
         self.calls.append((command, prompt))
-        return subprocess.CompletedProcess(command, 0, self.outputs.pop(0), "session_id: secret")
+        if "--image" in command:
+            output = (
+                self.visual_outputs.pop(0)
+                if self.visual_outputs is not None
+                else json.dumps(valid_visual_context())
+            )
+        else:
+            output = self.outputs.pop(0)
+        return subprocess.CompletedProcess(command, 0, output, "session_id: secret")
+
+
+def valid_visual_context(*, color: str = "blue") -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "visible_facts": {
+            "product_family": ["performance costume"],
+            "colors": [color],
+            "silhouette": ["fitted"],
+            "garment_structure": ["long sleeves"],
+            "decorations": ["sequins"],
+            "visible_components": ["dress"],
+            "visual_style": ["stagewear"],
+        },
+        "uncertain_observations": [],
+        "forbidden_inferences": [],
+        "image_usable": True,
+    }
+
+
+def listing_calls(fake: FakeHermes) -> list[tuple[list[str], str]]:
+    return [call for call in fake.calls if "--image" not in call[0]]
+
+
+def test_visual_context_contract_is_strict_sanitized_and_backend_independent() -> None:
+    visual = load_script("visual_context")
+    valid = valid_visual_context()
+
+    assert visual.validate_visual_context(valid)["visible_facts"]["colors"] == ["blue"]
+    assert "from app." not in (SCRIPTS / "visual_context.py").read_text(encoding="utf-8")
+
+    extra = {**valid, "unexpected": True}
+    with pytest.raises(visual.VisualContextError):
+        visual.validate_visual_context(extra)
+    unsafe = valid_visual_context(color="https://example.invalid/image.jpg")
+    with pytest.raises(visual.VisualContextError):
+        visual.validate_visual_context(unsafe)
 
 
 def test_run_task_retries_malformed_json_keeps_rows_isolated_and_uses_one_image(tmp_path: Path, excel_modules) -> None:
@@ -645,12 +691,12 @@ def test_run_task_retries_malformed_json_keeps_rows_isolated_and_uses_one_image(
 
     assert [event["event"] for event in events] == ["started", "row_started", "row_completed", "row_started", "row_completed", "completed"]
     assert Path(report["output_path"]).is_file()
-    assert len(fake.calls) == 3
-    for command, prompt in fake.calls:
+    assert len(fake.calls) == 5
+    for command, prompt in listing_calls(fake):
         assert command[:7] == ["hermes", "-p", "etsy-performance-us", "chat", "-Q", "--source", "tool"]
         assert "--max-turns" in command and "--resume" not in command and "--yolo" not in command
         assert command[-2] == "-q" and command[-1] == prompt
-        assert command.count("--image") <= 1
+        assert "--image" not in command
         assert "Cost price" not in prompt and "Logistics status" not in prompt
         assert "competitor" in prompt.lower() and "raw" in prompt.lower()
         assert "SECRET COMPETITOR COPY" not in prompt
@@ -665,7 +711,152 @@ def test_run_task_retries_malformed_json_keeps_rows_isolated_and_uses_one_image(
         assert '"const":"rules-v1"' in prompt
         assert '"pattern":"^(?![=+@-])"' in prompt
         assert '"maxLength":20' in prompt
-    assert "SKU-2" not in fake.calls[0][1] and "SKU-1" not in fake.calls[-1][1]
+    row_listing_calls = listing_calls(fake)
+    assert "SKU-2" not in row_listing_calls[0][1] and "SKU-1" not in row_listing_calls[-1][1]
+
+
+def test_run_task_uses_first_image_then_text_only_and_skips_no_image_rows(
+    tmp_path: Path, excel_modules
+) -> None:
+    _, _, _, run = excel_modules
+    source = make_book(
+        tmp_path / "mixed.xlsx",
+        rows=(("SKU-1", "Blue costume", 10, "air"), ("SKU-2", "No image", 20, "sea")),
+        image_rows=(5, 5),
+    )
+    source_hash = sha(source)
+    fake = FakeHermes(
+        [json.dumps(valid_result())],
+        visual_outputs=[json.dumps(valid_visual_context(color="red"))],
+    )
+    events: list[dict[str, object]] = []
+
+    report = run.run_task(
+        source,
+        tmp_path / "job-mixed",
+        knowledge_path=None,
+        rules={"rule_version": "rules-v1"},
+        command_runner=fake,
+        emit=events.append,
+    )
+
+    assert [event["event"] for event in events] == [
+        "started",
+        "row_started",
+        "row_completed",
+        "row_skipped",
+        "completed",
+    ]
+    skipped = events[3]
+    assert skipped["row_number"] == 6
+    assert skipped["reason"] == {
+        "code": "missing_product_image",
+        "message": "Product image is required; this row was skipped.",
+    }
+    assert len(fake.calls) == 2
+    visual_command, visual_prompt = fake.calls[0]
+    listing_command, listing_prompt = fake.calls[1]
+    assert visual_command.count("--image") == 1
+    assert Path(visual_command[visual_command.index("--image") + 1]).name == "row-000005-image-001.png"
+    assert "row-000005-image-002" not in " ".join(visual_command)
+    assert "Blue costume" in visual_prompt and "VISUAL_FACT_EXTRACTION" in visual_prompt
+    assert "--image" not in listing_command
+    assert '"conflict_policy":"candidate_fields_override_visual_observations"' in listing_prompt
+    assert '"colors":["red"]' in listing_prompt and "Blue costume" in listing_prompt
+    assert "image_paths" not in listing_prompt and str(tmp_path) not in listing_prompt
+
+    visual_file = tmp_path / "job-mixed" / "visual-context.json"
+    visual_store = json.loads(visual_file.read_text(encoding="utf-8"))
+    assert visual_store["schema_version"] == 1
+    assert len(visual_store["rows"]) == 1
+    assert "red" in json.dumps(visual_store)
+    serialized_visual = json.dumps(visual_store).casefold()
+    assert str(tmp_path).casefold() not in serialized_visual
+    assert "http://" not in serialized_visual and "https://" not in serialized_visual
+    assert sha(source) == source_hash
+    output = load_workbook(report["output_path"])
+    assert output["Products"]["E5"].value == valid_result()["head_titles"]
+    assert output["Products"]["E6"].value is None
+
+
+def test_run_task_repairs_visual_schema_once_before_listing_generation(
+    tmp_path: Path, excel_modules
+) -> None:
+    _, _, _, run = excel_modules
+    source = make_book(tmp_path / "visual-repair.xlsx")
+    fake = FakeHermes(
+        [json.dumps(valid_result())],
+        visual_outputs=["not json", json.dumps(valid_visual_context())],
+    )
+
+    report = run.run_task(
+        source,
+        tmp_path / "job-visual-repair",
+        knowledge_path=None,
+        rules={"rule_version": "rules-v1"},
+        command_runner=fake,
+        emit=lambda _event: None,
+    )
+
+    assert Path(report["output_path"]).is_file()
+    assert len(fake.calls) == 3
+    assert all("--image" in command for command, _prompt in fake.calls[:2])
+    assert "REPAIR_VISUAL_SCHEMA" in fake.calls[1][1]
+    assert "--image" not in fake.calls[2][0]
+
+
+def test_run_task_all_no_image_rows_fail_without_model_or_artifact(
+    tmp_path: Path, excel_modules
+) -> None:
+    _, _, _, run = excel_modules
+    source = make_book(
+        tmp_path / "no-images.xlsx",
+        rows=(("SKU-1", "Blue costume", 10, "air"), ("SKU-2", "Red costume", 20, "sea")),
+        image_rows=(),
+    )
+    fake = FakeHermes([])
+    events: list[dict[str, object]] = []
+
+    with pytest.raises(run.TaskError) as raised:
+        run.run_task(
+            source,
+            tmp_path / "job-no-images",
+            knowledge_path=None,
+            rules={"rule_version": "rules-v1"},
+            command_runner=fake,
+            emit=events.append,
+        )
+
+    assert raised.value.code == "no_rows_with_images"
+    assert fake.calls == []
+    assert [event["event"] for event in events] == ["started", "row_skipped", "row_skipped", "failed"]
+    assert not list((tmp_path / "job-no-images").glob("*.xlsx"))
+
+
+def test_run_task_rejects_unusable_image_before_listing_generation(
+    tmp_path: Path, excel_modules
+) -> None:
+    _, _, _, run = excel_modules
+    source = make_book(tmp_path / "unusable-image.xlsx")
+    visual = valid_visual_context()
+    visual["image_usable"] = False
+    fake = FakeHermes([], visual_outputs=[json.dumps(visual)])
+    events: list[dict[str, object]] = []
+
+    with pytest.raises(run.TaskError) as raised:
+        run.run_task(
+            source,
+            tmp_path / "job-unusable-image",
+            knowledge_path=None,
+            rules={"rule_version": "rules-v1"},
+            command_runner=fake,
+            emit=events.append,
+        )
+
+    assert raised.value.code == "image_unusable"
+    assert len(fake.calls) == 1 and listing_calls(fake) == []
+    assert [event["event"] for event in events][-2:] == ["row_failed", "failed"]
+    assert not list((tmp_path / "job-unusable-image").glob("*.xlsx"))
 
 
 def test_run_task_emits_only_validated_listing_warnings_on_completed_rows(tmp_path: Path, excel_modules) -> None:
@@ -725,10 +916,11 @@ def test_run_task_repairs_well_formed_but_invalid_output_once(tmp_path: Path, ex
     report = run.run_task(source, tmp_path / "job", knowledge_path=None, rules={"rule_version": "rules-v1"}, command_runner=fake, emit=lambda event: None)
 
     assert Path(report["output_path"]).is_file()
-    assert len(fake.calls) == 2
-    assert "head_titles" in fake.calls[1][1]
-    assert "formula prefix" in fake.calls[1][1]
-    assert "SECRET" not in fake.calls[1][1]
+    calls = listing_calls(fake)
+    assert len(calls) == 2
+    assert "head_titles" in calls[1][1]
+    assert "formula prefix" in calls[1][1]
+    assert "SECRET" not in calls[1][1]
 
 
 def test_run_task_retries_originality_failure_without_putting_raw_evidence_in_prompt(tmp_path: Path, excel_modules) -> None:
@@ -745,11 +937,12 @@ def test_run_task_retries_originality_failure_without_putting_raw_evidence_in_pr
         rules={"rule_version": "rules-v1"}, command_runner=fake, emit=lambda event: None, **trust,
     )
     assert Path(report["output_path"]).is_file()
-    assert len(fake.calls) == 2
-    assert raw not in fake.calls[0][1] and raw not in fake.calls[1][1]
-    assert "originality_failed" in fake.calls[1][1]
-    assert "ev-" + "a" * 32 in fake.calls[1][1]
-    assert "matched_text" not in fake.calls[1][1]
+    calls = listing_calls(fake)
+    assert len(calls) == 2
+    assert raw not in calls[0][1] and raw not in calls[1][1]
+    assert "originality_failed" in calls[1][1]
+    assert "ev-" + "a" * 32 in calls[1][1]
+    assert "matched_text" not in calls[1][1]
 
 
 def test_run_task_rejects_second_originality_failure_without_workbook_or_raw_leak(tmp_path: Path, excel_modules) -> None:
@@ -779,7 +972,7 @@ def test_run_task_limits_schema_repair_to_one_retry(tmp_path: Path, excel_module
     with pytest.raises(run.TaskError) as raised:
         run.run_task(source, tmp_path / "job", knowledge_path=None, rules={"rule_version": "rules-v1"}, command_runner=fake, emit=lambda event: None)
     assert raised.value.code == "invalid_model_output"
-    assert len(fake.calls) == 2
+    assert len(listing_calls(fake)) == 2
 
 
 def test_run_task_rejects_self_asserted_knowledge_without_detached_trust(tmp_path: Path, excel_modules) -> None:
@@ -870,7 +1063,7 @@ def test_run_task_checks_rules_prompt_response_and_windows_argv_limits_before_sp
     with pytest.raises(run.TaskError) as raised:
         run.run_task(source, tmp_path / "job-response", knowledge_path=None, rules={"rule_version": "rules-v1"}, command_runner=huge_response, emit=lambda event: None)
     assert raised.value.code == "employee_response_too_large"
-    assert len(huge_response.calls) == 1
+    assert len(listing_calls(huge_response)) == 1
 
     oversized_rules = tmp_path / "oversized-rules.json"
     oversized_rules.write_text(" " * (run.MAX_RULES_BYTES + 1), encoding="utf-8")
