@@ -51,6 +51,27 @@ hermes -p etsy-performance-us auth add openai-codex --type oauth
 4. 运行 `.\scripts\verify-employee.ps1 -RunModelCheck -RunDoctor`，只有检查成功后才可把 Profile 视为可用；
 5. 把真实工作簿复制到临时目录，只处理副本，核对五字段、图片、公式和布局。不要修改 Downloads 中的源文件。
 
+### 图片 + Listing 一键训练
+
+训练命令从 `.xlsx` 中按原顺序读取 Etsy 店铺链接，在可见的 Chrome/Edge 独立窗口中选择首个尚未成功训练的 Listing。每条样本只下载第一张主图；Listing 文本事实与图片可见事实会确定性合并，材质、尺寸、配件、性能等不可见信息不会由图片推断。候选知识必须经过独立 AI 审批和版本令牌复核，满足置信度与安全门禁后才会激活。
+
+默认只训练一条，建议先这样验收：
+
+```powershell
+.\scripts\train-vision-listings.ps1 `
+  -Workbook "C:\Work\shops-copy.xlsx" `
+  -DataDirectory "D:\EtsyEmployeeData"
+```
+
+明确限量或批量运行：
+
+```powershell
+.\scripts\train-vision-listings.ps1 -Workbook "C:\Work\shops-copy.xlsx" -Limit 5
+.\scripts\train-vision-listings.ps1 -Workbook "C:\Work\shops-copy.xlsx" -Batch
+```
+
+`-Batch` 必须显式提供，且不能与 `-Limit` 同时使用。每次 Etsy 页面访问后固定等待 15–25 秒（默认 20 秒）；遇到人机校验或空页面时不会尝试绕过。源工作簿只读，运行前后 SHA-256 必须一致；规范化图片保存在 `training-evidence`，运行、样本、AI 审批和激活谱系保存在 `app.db`。终端只输出运行 ID、状态和计数，不输出原始 Listing、图片内容或凭据。
+
 ## 3. 启动与停止
 
 默认启动：
@@ -152,11 +173,11 @@ MVP 暂未提供迁移导入页面或独立导入脚本；导入需要由维护�
 - 仅支持 `.xlsx`；不支持 `.xls`、`.xlsm` 和含宏工作簿；
 - 一次运行仅供本机单用户使用，不是公网、多租户或多人协作服务；
 - 业务数据使用本机 SQLite；Excel 单文件上限为 50 MB；
-- 不自动抓取 Etsy、登录店铺或发布 Listing；
+- 只有负责人显式运行图片 + Listing 训练命令时，系统才会在可见浏览器中读取公开 Etsy 页面；不会绕过验证、登录店铺或发布 Listing；
 - 当前不生成产品图片；聊天可接收图片作为上下文，但图片生成不在 MVP 范围；
 - 竞品数据必须经清洗和抽象知识审批，生成侧拿不到原始竞品正文；
 - 原创保护属于启发式相似度护栏，不能替代人工审核或法律判断；
-- 知识不会无人审核地永久升级，候选规则仍需负责人批准；
+- 训练候选只有通过独立 AI 审批、置信度、安全约束和活动版本令牌复核后才会自动激活；未通过的候选保持 proposed 或 rejected；
 - Excel 任务失败后没有服务端原文件“一键重跑”，刷新页面后需重新选文件；
 - 迁移不包含模型凭据、附件二进制、浏览器会话和 Etsy 账号信息；
 - AI 输出可能需要人工补事实、调整类目或遵守最新平台政策，发布责任仍由店铺负责人承担。
