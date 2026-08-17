@@ -37,6 +37,7 @@ class Settings(BaseSettings):
         (self.data_dir / "attachments").mkdir(parents=True, exist_ok=True)
         (self.data_dir / "excel-jobs").mkdir(parents=True, exist_ok=True)
         (self.data_dir / "trust").mkdir(parents=True, exist_ok=True)
+        (self.data_dir / "training-evidence").mkdir(parents=True, exist_ok=True)
         (self.data_dir / "migration-packages").mkdir(parents=True, exist_ok=True)
         (self.data_dir / "migration-workspace").mkdir(parents=True, exist_ok=True)
 

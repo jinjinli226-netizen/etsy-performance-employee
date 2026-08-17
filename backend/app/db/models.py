@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from enum import Enum as PythonEnum
 from typing import Any, TypeVar
 
-from sqlalchemy import JSON, BigInteger, CheckConstraint, DateTime, Enum, ForeignKey, Integer, String, Text, TypeDecorator
+from sqlalchemy import JSON, BigInteger, CheckConstraint, DateTime, Enum, ForeignKey, Integer, String, Text, TypeDecorator, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.chat.schemas import MessageRole
@@ -323,6 +323,121 @@ class AuditEvent(Base):
     entity_id: Mapped[str] = mapped_column(String(127), nullable=False)
     details: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now, nullable=False)
+
+
+class TrainingRun(TimestampMixin, Base):
+    __tablename__ = "training_runs"
+    __table_args__ = (
+        CheckConstraint("length(public_id)=36", name="ck_training_runs_public_id"),
+        CheckConstraint(
+            "length(source_workbook_hash)=64 AND source_workbook_hash NOT GLOB '*[^0-9a-f]*'",
+            name="ck_training_runs_workbook_hash",
+        ),
+        CheckConstraint(
+            "requested_limit IS NULL OR requested_limit > 0",
+            name="ck_training_runs_requested_limit",
+        ),
+        CheckConstraint(
+            "status IN ('running','completed','failed')",
+            name="ck_training_runs_status",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    public_id: Mapped[str] = mapped_column(String(36), unique=True, index=True, nullable=False)
+    source_workbook_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_workbook_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    requested_limit: Mapped[int | None] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(31), default="running", nullable=False)
+    counts: Mapped[dict[str, int]] = mapped_column(JSON, default=dict, nullable=False)
+    started_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now, nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+
+    samples: Mapped[list[TrainingSample]] = relationship(
+        back_populates="run", cascade="all, delete-orphan", order_by="TrainingSample.id"
+    )
+
+
+class TrainingSample(TimestampMixin, Base):
+    __tablename__ = "training_samples"
+    __table_args__ = (
+        UniqueConstraint("training_run_id", "listing_id", name="uq_training_sample_run_listing"),
+        CheckConstraint("length(public_id)=36", name="ck_training_samples_public_id"),
+        CheckConstraint("listing_id GLOB '[0-9]*' AND length(listing_id) >= 1", name="ck_training_samples_listing_id"),
+        CheckConstraint("schema_version=1", name="ck_training_samples_schema_version"),
+        CheckConstraint(
+            "status IN ('claimed','fetching','image_ready','facts_ready','candidates_ready','reviewing','activating','completed','skipped','failed')",
+            name="ck_training_samples_status",
+        ),
+        CheckConstraint(
+            "listing_snapshot_hash IS NULL OR (length(listing_snapshot_hash)=64 AND listing_snapshot_hash NOT GLOB '*[^0-9a-f]*')",
+            name="ck_training_samples_snapshot_hash",
+        ),
+        CheckConstraint(
+            "main_image_hash IS NULL OR (length(main_image_hash)=64 AND main_image_hash NOT GLOB '*[^0-9a-f]*')",
+            name="ck_training_samples_image_hash",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    public_id: Mapped[str] = mapped_column(String(36), unique=True, index=True, nullable=False)
+    training_run_id: Mapped[int] = mapped_column(
+        ForeignKey("training_runs.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    shop_url: Mapped[str] = mapped_column(String(2048), nullable=False)
+    listing_id: Mapped[str] = mapped_column(String(32), index=True, nullable=False)
+    canonical_url: Mapped[str] = mapped_column(String(2048), nullable=False)
+    source_timestamp: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    listing_snapshot_hash: Mapped[str | None] = mapped_column(String(64), index=True)
+    main_image_hash: Mapped[str | None] = mapped_column(String(64), index=True)
+    main_image_path: Mapped[str | None] = mapped_column(Text)
+    visual_facts: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    merged_facts: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    conflicts: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON)
+    schema_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    status: Mapped[str] = mapped_column(String(31), default="claimed", nullable=False)
+    error_code: Mapped[str | None] = mapped_column(String(63))
+
+    run: Mapped[TrainingRun] = relationship(back_populates="samples")
+    reviews: Mapped[list[TrainingReview]] = relationship(
+        back_populates="sample", cascade="all, delete-orphan", order_by="TrainingReview.id"
+    )
+
+
+class TrainingReview(Base):
+    __tablename__ = "training_reviews"
+    __table_args__ = (
+        UniqueConstraint("training_sample_id", "kind", name="uq_training_review_sample_kind"),
+        CheckConstraint("length(public_id)=36", name="ck_training_reviews_public_id"),
+        CheckConstraint("prompt_schema_version=1", name="ck_training_reviews_schema_version"),
+        CheckConstraint("decision IN ('approve','reject')", name="ck_training_reviews_decision"),
+        CheckConstraint("confidence >= 0 AND confidence <= 1", name="ck_training_reviews_confidence"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    public_id: Mapped[str] = mapped_column(String(36), unique=True, index=True, nullable=False)
+    training_sample_id: Mapped[int] = mapped_column(
+        ForeignKey("training_samples.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    knowledge_candidate_id: Mapped[int | None] = mapped_column(
+        ForeignKey("knowledge_candidates.id", ondelete="SET NULL"), index=True
+    )
+    kind: Mapped[str] = mapped_column(String(127), nullable=False)
+    reviewer_version: Mapped[str] = mapped_column(String(127), nullable=False)
+    prompt_schema_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    decision: Mapped[str] = mapped_column(String(15), nullable=False)
+    reason_code: Mapped[str] = mapped_column(String(63), nullable=False)
+    reason: Mapped[str] = mapped_column(String(500), nullable=False)
+    risk_flags: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    confidence: Mapped[float] = mapped_column(nullable=False)
+    active_rule_public_id: Mapped[str | None] = mapped_column(String(36))
+    active_pattern_revision: Mapped[int | None] = mapped_column(Integer)
+    activated_rule_version: Mapped[str | None] = mapped_column(String(127))
+    not_activated_reason: Mapped[str | None] = mapped_column(String(63))
+    reviewed_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now, nullable=False)
+
+    sample: Mapped[TrainingSample] = relationship(back_populates="reviews")
+    candidate: Mapped[KnowledgeCandidate | None] = relationship()
 
 
 class ImportedEvidenceFingerprint(Base):

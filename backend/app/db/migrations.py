@@ -691,6 +691,87 @@ def _task11_excel_warning_aggregate(connection: Connection) -> None:
     persist()
 
 
+def _task12_multimodal_training_lineage(connection: Connection) -> None:
+    connection.execute(text(
+        "CREATE TABLE IF NOT EXISTS training_runs ("
+        "id INTEGER PRIMARY KEY, public_id VARCHAR(36) NOT NULL UNIQUE, "
+        "source_workbook_hash VARCHAR(64) NOT NULL, source_workbook_name VARCHAR(255) NOT NULL, "
+        "requested_limit INTEGER, status VARCHAR(31) NOT NULL, counts JSON NOT NULL, "
+        "started_at DATETIME NOT NULL, completed_at DATETIME, created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL)"
+    ))
+    connection.execute(text(
+        "CREATE TABLE IF NOT EXISTS training_samples ("
+        "id INTEGER PRIMARY KEY, public_id VARCHAR(36) NOT NULL UNIQUE, training_run_id INTEGER NOT NULL, "
+        "shop_url VARCHAR(2048) NOT NULL, listing_id VARCHAR(32) NOT NULL, canonical_url VARCHAR(2048) NOT NULL, "
+        "source_timestamp DATETIME, listing_snapshot_hash VARCHAR(64), main_image_hash VARCHAR(64), main_image_path TEXT, "
+        "visual_facts JSON, merged_facts JSON, conflicts JSON, schema_version INTEGER NOT NULL DEFAULT 1, "
+        "status VARCHAR(31) NOT NULL, error_code VARCHAR(63), created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL, "
+        "FOREIGN KEY(training_run_id) REFERENCES training_runs(id) ON DELETE CASCADE, "
+        "CONSTRAINT uq_training_sample_run_listing UNIQUE(training_run_id, listing_id))"
+    ))
+    connection.execute(text(
+        "CREATE TABLE IF NOT EXISTS training_reviews ("
+        "id INTEGER PRIMARY KEY, public_id VARCHAR(36) NOT NULL UNIQUE, training_sample_id INTEGER NOT NULL, "
+        "knowledge_candidate_id INTEGER, kind VARCHAR(127) NOT NULL, reviewer_version VARCHAR(127) NOT NULL, "
+        "prompt_schema_version INTEGER NOT NULL DEFAULT 1, decision VARCHAR(15) NOT NULL, "
+        "reason_code VARCHAR(63) NOT NULL, reason VARCHAR(500) NOT NULL, risk_flags JSON NOT NULL, confidence FLOAT NOT NULL, "
+        "active_rule_public_id VARCHAR(36), active_pattern_revision INTEGER, activated_rule_version VARCHAR(127), "
+        "not_activated_reason VARCHAR(63), reviewed_at DATETIME NOT NULL, "
+        "FOREIGN KEY(training_sample_id) REFERENCES training_samples(id) ON DELETE CASCADE, "
+        "FOREIGN KEY(knowledge_candidate_id) REFERENCES knowledge_candidates(id) ON DELETE SET NULL, "
+        "CONSTRAINT uq_training_review_sample_kind UNIQUE(training_sample_id, kind))"
+    ))
+    for statement in (
+        "CREATE UNIQUE INDEX IF NOT EXISTS ix_training_runs_public_id ON training_runs(public_id)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS ix_training_samples_public_id ON training_samples(public_id)",
+        "CREATE INDEX IF NOT EXISTS ix_training_samples_training_run_id ON training_samples(training_run_id)",
+        "CREATE INDEX IF NOT EXISTS ix_training_samples_listing_id ON training_samples(listing_id)",
+        "CREATE INDEX IF NOT EXISTS ix_training_samples_listing_snapshot_hash ON training_samples(listing_snapshot_hash)",
+        "CREATE INDEX IF NOT EXISTS ix_training_samples_main_image_hash ON training_samples(main_image_hash)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS ix_training_samples_success_identity ON training_samples(listing_id,main_image_hash,schema_version) WHERE status='completed' AND main_image_hash IS NOT NULL",
+        "CREATE UNIQUE INDEX IF NOT EXISTS ix_training_reviews_public_id ON training_reviews(public_id)",
+        "CREATE INDEX IF NOT EXISTS ix_training_reviews_training_sample_id ON training_reviews(training_sample_id)",
+        "CREATE INDEX IF NOT EXISTS ix_training_reviews_candidate_id ON training_reviews(knowledge_candidate_id)",
+    ):
+        connection.execute(text(statement))
+
+    uuid_invalid = (
+        "length(NEW.public_id)!=36 OR NEW.public_id!=lower(NEW.public_id) "
+        "OR substr(NEW.public_id,9,1)!='-' OR substr(NEW.public_id,14,1)!='-' "
+        "OR substr(NEW.public_id,19,1)!='-' OR substr(NEW.public_id,24,1)!='-' "
+        "OR length(replace(NEW.public_id,'-',''))!=32 "
+        "OR replace(NEW.public_id,'-','') GLOB '*[^0-9a-f]*'"
+    )
+    conditions = {
+        "training_runs": (
+            f"{uuid_invalid} OR length(NEW.source_workbook_hash)!=64 "
+            "OR NEW.source_workbook_hash GLOB '*[^0-9a-f]*' "
+            "OR length(trim(NEW.source_workbook_name))=0 "
+            "OR (NEW.requested_limit IS NOT NULL AND NEW.requested_limit<=0) "
+            "OR NEW.status NOT IN ('running','completed','failed')"
+        ),
+        "training_samples": (
+            f"{uuid_invalid} OR length(NEW.listing_id)=0 OR NEW.listing_id GLOB '*[^0-9]*' "
+            "OR NEW.schema_version!=1 "
+            "OR NEW.status NOT IN ('claimed','fetching','image_ready','facts_ready','candidates_ready','reviewing','activating','completed','skipped','failed') "
+            "OR (NEW.listing_snapshot_hash IS NOT NULL AND (length(NEW.listing_snapshot_hash)!=64 OR NEW.listing_snapshot_hash GLOB '*[^0-9a-f]*')) "
+            "OR (NEW.main_image_hash IS NOT NULL AND (length(NEW.main_image_hash)!=64 OR NEW.main_image_hash GLOB '*[^0-9a-f]*'))"
+        ),
+        "training_reviews": (
+            f"{uuid_invalid} OR NEW.prompt_schema_version!=1 "
+            "OR NEW.decision NOT IN ('approve','reject') OR NEW.confidence<0 OR NEW.confidence>1"
+        ),
+    }
+    for table, condition in conditions.items():
+        for operation in ("INSERT", "UPDATE"):
+            trigger = f"trg_{table}_v14_{operation.casefold()}"
+            connection.execute(text(f"DROP TRIGGER IF EXISTS {trigger}"))
+            connection.execute(text(
+                f"CREATE TRIGGER {trigger} BEFORE {operation} ON {table} WHEN {condition} "
+                f"BEGIN SELECT RAISE(ABORT, '{table} v14 contract violation'); END"
+            ))
+
+
 MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (1, _task4_chat_columns),
     (2, _task6_excel_job_columns),
@@ -706,6 +787,7 @@ MIGRATIONS: tuple[tuple[int, Migration], ...] = (
     (11, _task10_chat_recovery),
     (12, _task10_atomic_attachments),
     (13, _task11_excel_warning_aggregate),
+    (14, _task12_multimodal_training_lineage),
 )
 
 
