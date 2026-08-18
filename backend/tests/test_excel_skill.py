@@ -469,6 +469,25 @@ def test_validation_bounds_cell_text_and_warning_collections(excel_modules) -> N
         validate.validate_generated(valid_result(), {"tag_count": validate.MAX_CONFIGURED_COUNT + 1})
 
 
+def test_validation_normalizes_warning_whitespace_for_worker_events(excel_modules) -> None:
+    _, validate, _, _ = excel_modules
+    payload = valid_result()
+    payload["fact_warnings"] = [" First line\r\nsecond\tline "]
+
+    cleaned = validate.validate_generated(payload, {"rule_version": "rules-v1"})
+
+    assert cleaned["fact_warnings"] == ["First line second line"]
+
+
+def test_validation_rejects_warning_urls_for_worker_events(excel_modules) -> None:
+    _, validate, _, _ = excel_modules
+    payload = valid_result()
+    payload["quality_warnings"] = ["Confirm details at https://example.invalid/product"]
+
+    with pytest.raises(validate.OutputValidationError):
+        validate.validate_generated(payload, {"rule_version": "rules-v1"})
+
+
 def test_writer_preserves_workbook_and_changes_only_five_target_cells(tmp_path: Path, excel_modules) -> None:
     inspect, _, writer, _ = excel_modules
     source = copy_fixture(tmp_path)

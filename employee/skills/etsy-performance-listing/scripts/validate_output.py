@@ -29,6 +29,7 @@ DEFAULT_RULES = {
     "tag_max_chars": 20,
 }
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_WARNING_URL = re.compile(r"(?:https?://|www\.)", re.IGNORECASE)
 _FORMULA_PREFIX = ("=", "+", "-", "@")
 EXCEL_CELL_MAX_CHARS = 32_767
 MAX_TITLE_CHARS = 140
@@ -71,6 +72,16 @@ def _safe_text(value: Any, field: str, issues: list[dict[str, str]], *, nonempty
         issues.append({"field": field, "message": "must not begin with an Excel formula prefix"})
     if len(normalized) > min(max_chars, EXCEL_CELL_MAX_CHARS):
         issues.append({"field": field, "message": f"must not exceed {min(max_chars, EXCEL_CELL_MAX_CHARS)} characters"})
+    return normalized
+
+
+def _safe_warning(value: Any, field: str, issues: list[dict[str, str]]) -> str | None:
+    normalized = _safe_text(value, field, issues, max_chars=MAX_WARNING_CHARS)
+    if normalized is None:
+        return None
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if _WARNING_URL.search(normalized):
+        issues.append({"field": field, "message": "must not contain URLs"})
     return normalized
 
 
@@ -143,7 +154,7 @@ def validate_generated(payload: Any, rules: dict[str, Any] | None = None) -> dic
         else:
             if len(values) > MAX_WARNINGS_PER_FIELD:
                 issues.append({"field": field, "message": f"must not contain more than {MAX_WARNINGS_PER_FIELD} warnings"})
-            cleaned[field] = [_safe_text(value, f"{field}[{index}]", issues, max_chars=MAX_WARNING_CHARS) for index, value in enumerate(values)]
+            cleaned[field] = [_safe_warning(value, f"{field}[{index}]", issues) for index, value in enumerate(values)]
     warning_total = sum(len(value) for field in ("fact_warnings", "quality_warnings") for value in cleaned.get(field, []) if isinstance(value, str))
     if warning_total > MAX_WARNINGS_TOTAL_CHARS:
         issues.append({"field": "warnings", "message": f"combined warning text must not exceed {MAX_WARNINGS_TOTAL_CHARS} characters"})
