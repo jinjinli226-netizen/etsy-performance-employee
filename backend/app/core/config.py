@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     max_excel_upload_bytes: int = 50 * 1024 * 1024
     max_worker_event_bytes: int = 64 * 1024
     excel_cancel_timeout_seconds: float = 5.0
-    excel_worker_timeout_seconds: float = 900.0
+    excel_worker_timeout_seconds: float = 3600.0
     originality_threshold: float = Field(default=0.72, ge=0.1, le=1)
     max_migration_package_bytes: int = 128 * 1024 * 1024
     migration_capability: str | None = None

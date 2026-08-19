@@ -134,6 +134,26 @@ def rename_first_media_member(path: Path) -> None:
             archive.writestr(name, content)
 
 
+def rename_first_worksheet_member(path: Path) -> None:
+    with ZipFile(path, "r") as archive:
+        entries = {item.filename: archive.read(item.filename) for item in archive.infolist()}
+    original = "xl/worksheets/sheet1.xml"
+    replacement = "xl/worksheets/sheet2.xml"
+    entries[replacement] = entries.pop(original)
+    original_relationships = "xl/worksheets/_rels/sheet1.xml.rels"
+    if original_relationships in entries:
+        entries["xl/worksheets/_rels/sheet2.xml.rels"] = entries.pop(original_relationships)
+    entries["xl/_rels/workbook.xml.rels"] = entries["xl/_rels/workbook.xml.rels"].replace(
+        b"worksheets/sheet1.xml", b"worksheets/sheet2.xml"
+    )
+    entries["[Content_Types].xml"] = entries["[Content_Types].xml"].replace(
+        b"/xl/worksheets/sheet1.xml", b"/xl/worksheets/sheet2.xml"
+    )
+    with ZipFile(path, "w") as archive:
+        for name, content in entries.items():
+            archive.writestr(name, content)
+
+
 def canonical_sha(value: object) -> str:
     encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
@@ -390,25 +410,22 @@ def test_inspection_rejects_ole_package_and_untrusted_external_relationships(
     assert raised.value.code == "unsupported_workbook_part"
 
 
-def test_writer_rejects_package_member_or_relationship_drift_after_save(tmp_path: Path, excel_modules, monkeypatch) -> None:
+def test_writer_rejects_package_member_or_relationship_drift_after_patch(tmp_path: Path, excel_modules, monkeypatch) -> None:
     inspect, _, writer, _ = excel_modules
     source = copy_fixture(tmp_path)
     manifest = inspect.inspect_workbook(source, tmp_path / "operation")
     row_id = manifest["rows"][0]["row_id"]
-    from openpyxl.workbook.workbook import Workbook as OpenpyxlWorkbook
+    real_rewrite = writer._rewrite_workbook_package
 
-    real_save = OpenpyxlWorkbook.save
-
-    def lossy_save(workbook, filename):
-        real_save(workbook, filename)
-        path = Path(filename)
+    def lossy_rewrite(path, sheet_name, values):
+        real_rewrite(path, sheet_name, values)
         with ZipFile(path, "r") as archive:
             entries = {item.filename: archive.read(item.filename) for item in archive.infolist() if item.filename != "xl/theme/theme1.xml"}
         with ZipFile(path, "w") as archive:
             for name, content in entries.items():
                 archive.writestr(name, content)
 
-    monkeypatch.setattr(OpenpyxlWorkbook, "save", lossy_save)
+    monkeypatch.setattr(writer, "_rewrite_workbook_package", lossy_rewrite)
     with pytest.raises(writer.WorkbookWriteError) as raised:
         writer.write_workbook(
             source,
@@ -552,6 +569,27 @@ def test_writer_accepts_equivalent_media_member_renaming(tmp_path: Path, excel_m
     assert output["Products"]["E5"].value == valid_result()["head_titles"]
 
 
+def test_writer_preserves_noncanonical_worksheet_part_names(tmp_path: Path, excel_modules) -> None:
+    inspect, _, writer, _ = excel_modules
+    source = make_book(tmp_path / "sheet2-source.xlsx")
+    rename_first_worksheet_member(source)
+    manifest = inspect.inspect_workbook(source, tmp_path / "operation-sheet2")
+    source_signature = inspect._package_preservation_signature(source, validate_supported=True)
+
+    report = writer.write_workbook(
+        source,
+        tmp_path / "out-sheet2",
+        manifest,
+        {manifest["rows"][0]["row_id"]: valid_result()},
+        rules={"rule_version": "rules-v1"},
+        expected_rule_version="rules-v1",
+    )
+
+    output = Path(report["output_path"])
+    assert inspect._package_preservation_signature(output, validate_supported=True) == source_signature
+    assert load_workbook(output)["Products"]["E5"].value == valid_result()["head_titles"]
+
+
 def test_writer_is_atomic_on_manifest_or_existing_destination_failure(tmp_path: Path, excel_modules) -> None:
     inspect, _, writer, _ = excel_modules
     source = make_book(tmp_path / "source.xlsx")
@@ -672,9 +710,13 @@ class FakeHermes:
         self.outputs = outputs
         self.visual_outputs = visual_outputs
         self.calls: list[tuple[list[str], str]] = []
+        self.output_schemas: list[dict[str, object]] = []
 
     def __call__(self, command: list[str], prompt: str) -> subprocess.CompletedProcess[str]:
         self.calls.append((command, prompt))
+        if "--output-schema" in command:
+            schema_path = Path(command[command.index("--output-schema") + 1])
+            self.output_schemas.append(json.loads(schema_path.read_text(encoding="utf-8")))
         if "--image" in command:
             output = (
                 self.visual_outputs.pop(0)
@@ -833,6 +875,75 @@ def test_run_task_uses_first_image_then_text_only_and_skips_no_image_rows(
     output = load_workbook(report["output_path"])
     assert output["Products"]["E5"].value == valid_result()["head_titles"]
     assert output["Products"]["E6"].value is None
+
+
+def test_codex_engine_uses_http_only_route_and_preserves_visual_contract(
+    tmp_path: Path, excel_modules, monkeypatch
+) -> None:
+    _, _, _, run = excel_modules
+    monkeypatch.setenv("ETSY_EMPLOYEE_MODEL_ENGINE", "codex")
+    monkeypatch.setenv("ETSY_EMPLOYEE_CODEX_MODEL", "gpt-5.4")
+    source = make_book(tmp_path / "codex-engine.xlsx")
+    fake = FakeHermes(
+        [json.dumps(valid_result())],
+        visual_outputs=[json.dumps(valid_visual_context())],
+    )
+
+    report = run.run_task(
+        source,
+        tmp_path / "job-codex-engine",
+        knowledge_path=None,
+        rules={"rule_version": "rules-v1"},
+        command_runner=fake,
+        emit=lambda _event: None,
+    )
+
+    assert Path(report["output_path"]).is_file()
+    assert len(fake.calls) == 2
+    visual_command, visual_prompt = fake.calls[0]
+    listing_command, listing_prompt = fake.calls[1]
+    for command, prompt in fake.calls:
+        assert "\n" not in prompt and "\r" not in prompt
+        assert command[0] == ("codex.cmd" if os.name == "nt" else "codex")
+        assert command[1:3] == ["exec", "--ephemeral"]
+        assert "--ignore-user-config" in command
+        assert "--ignore-rules" in command
+        assert ["-s", "read-only"] == command[command.index("-s") : command.index("-s") + 2]
+        assert ["-m", "gpt-5.4"] == command[command.index("-m") : command.index("-m") + 2]
+        assert 'model_provider="chatgpt-http"' in command
+        provider_config = next(value for value in command if value.startswith("model_providers.chatgpt-http="))
+        assert 'base_url = "https://chatgpt.com/backend-api/codex"' in provider_config
+        assert "requires_openai_auth = true" in provider_config
+        assert "supports_websockets = false" in provider_config
+        assert "-q" not in command
+        assert command[-2:] == ["--", prompt]
+    assert visual_command.count("--image") == 1
+    assert Path(visual_command[visual_command.index("--image") + 1]).name == "row-000005-image-001.png"
+    assert "VISUAL_FACT_EXTRACTION" in visual_prompt
+    assert "--image" not in listing_command
+    assert '"colors":["blue"]' in listing_prompt
+    assert len(fake.output_schemas) == 2
+    visual_schema, listing_schema = fake.output_schemas
+    assert visual_schema["properties"]["schema_version"] == {"type": "integer", "const": 1}
+    assert set(visual_schema["properties"]["visible_facts"]["required"]) == {
+        "product_family", "colors", "silhouette", "garment_structure",
+        "decorations", "visible_components", "visual_style",
+    }
+    assert "uniqueItems" not in visual_schema["properties"]["visible_facts"]["properties"]["colors"]
+    assert listing_schema["properties"]["tags"]["minItems"] == 13
+    assert listing_schema["properties"]["tags"]["maxItems"] == 13
+    assert "uniqueItems" not in listing_schema["properties"]["tags"]
+    assert listing_schema["properties"]["rule_version"]["const"] == "rules-v1"
+
+
+def test_unknown_model_engine_fails_closed(excel_modules, monkeypatch) -> None:
+    _, _, _, run = excel_modules
+    monkeypatch.setenv("ETSY_EMPLOYEE_MODEL_ENGINE", "unexpected")
+
+    with pytest.raises(run.TaskError) as raised:
+        run._model_command()
+
+    assert raised.value.code == "invalid_model_engine"
 
 
 def test_run_task_repairs_visual_schema_once_before_listing_generation(
@@ -1130,6 +1241,8 @@ def test_run_task_checks_rules_prompt_response_and_windows_argv_limits_before_sp
 
 def test_controlled_runner_times_out_and_windows_tree_kill_uses_exact_argv(excel_modules) -> None:
     _, _, _, run = excel_modules
+
+    assert run.DEFAULT_TIMEOUT_SECONDS <= 240
 
     class TimeoutProcess:
         def __init__(self):

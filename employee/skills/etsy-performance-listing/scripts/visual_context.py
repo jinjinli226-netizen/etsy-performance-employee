@@ -93,7 +93,7 @@ def schema() -> dict[str, Any]:
         "additionalProperties": False,
         "required": sorted(ROOT_FIELDS),
         "properties": {
-            "schema_version": {"const": 1},
+            "schema_version": {"type": "integer", "const": 1},
             "visible_facts": {
                 "type": "object",
                 "additionalProperties": False,

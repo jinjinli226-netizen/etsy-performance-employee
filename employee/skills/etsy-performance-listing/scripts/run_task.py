@@ -24,7 +24,7 @@ from typing import Any, Callable
 
 PROFILE = "etsy-performance-us"
 MAX_TURNS = 30
-DEFAULT_TIMEOUT_SECONDS = 480.0
+DEFAULT_TIMEOUT_SECONDS = 240.0
 MAX_TIMEOUT_SECONDS = 600.0
 DEFAULT_MAX_RESPONSE_BYTES = 256 * 1024
 MAX_RESPONSE_BYTES = 1024 * 1024
@@ -50,6 +50,7 @@ _EXPORT_ID = re.compile(r"^kx-[0-9a-f]{32}$")
 _GUARD_EXPORT_ID = re.compile(r"^eg-[0-9a-f]{32}$")
 _RECORD_ID = re.compile(r"^rec-[0-9a-f]{16,64}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_MODEL_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _DANGEROUS_KNOWLEDGE = re.compile(
     r"https?://|www\.|\b(?:competitor|evidence|listing|source|raw)\b|ignore\s+(?:all\s+)?previous|system\s+prompt|developer\s+message|follow\s+these\s+instructions",
     re.IGNORECASE,
@@ -86,6 +87,38 @@ class TaskError(RuntimeError):
 
     def as_dict(self) -> dict[str, Any]:
         return {"error": {"code": self.code, "message": str(self), "details": {}}}
+
+
+def _model_command(*, image_path: Path | None = None) -> list[str]:
+    engine = os.environ.get("ETSY_EMPLOYEE_MODEL_ENGINE", "hermes").strip().casefold()
+    if engine == "hermes":
+        command = [
+            "hermes", "-p", PROFILE, "chat", "-Q", "--source", "tool",
+            "--max-turns", str(MAX_TURNS),
+        ]
+    elif engine == "codex":
+        model = os.environ.get("ETSY_EMPLOYEE_CODEX_MODEL", "gpt-5.4").strip()
+        if not _MODEL_NAME.fullmatch(model):
+            raise TaskError("invalid_model_engine", "The configured Codex model is invalid.")
+        codex_executable = os.environ.get("ETSY_EMPLOYEE_CODEX_EXECUTABLE", "").strip()
+        if not codex_executable:
+            codex_executable = "codex.cmd" if os.name == "nt" else "codex"
+        command = [
+            codex_executable, "exec", "--ephemeral", "--ignore-user-config", "--ignore-rules",
+            "--disable", "plugins", "--disable", "remote_plugin", "--disable", "plugin_sharing",
+            "-c", 'model_provider="chatgpt-http"',
+            "-c", (
+                'model_providers.chatgpt-http={ name = "ChatGPT HTTP", '
+                'base_url = "https://chatgpt.com/backend-api/codex", wire_api = "responses", '
+                "requires_openai_auth = true, supports_websockets = false }"
+            ),
+            "-s", "read-only", "-m", model, "--skip-git-repo-check", "--color", "never",
+        ]
+    else:
+        raise TaskError("invalid_model_engine", "The configured model engine is unsupported.")
+    if image_path is not None:
+        command.extend(["--image", str(image_path)])
+    return command
 
 
 def _load_sibling(name: str):
@@ -435,6 +468,20 @@ def _originality_result(generated: dict[str, Any], evidence: list[tuple[str, lis
     return guard.check_fingerprints(values, evidence, threshold=threshold)
 
 
+def _listing_output_schema(rules: dict[str, Any]) -> dict[str, Any]:
+    schema = json.loads(json.dumps(OUTPUT_SCHEMA))
+    tag_count = rules.get("tag_count", 13)
+    tag_max_chars = rules.get("tag_max_chars", 20)
+    if isinstance(tag_count, int) and not isinstance(tag_count, bool) and tag_count > 0:
+        schema["properties"]["tags"].update({"minItems": tag_count, "maxItems": tag_count})
+    if isinstance(tag_max_chars, int) and not isinstance(tag_max_chars, bool) and tag_max_chars > 0:
+        schema["properties"]["tags"]["items"]["maxLength"] = tag_max_chars
+    rule_version = rules.get("rule_version")
+    if isinstance(rule_version, str) and rule_version:
+        schema["properties"]["rule_version"]["const"] = rule_version
+    return schema
+
+
 def _prompt(
     row: dict[str, Any],
     knowledge: Any,
@@ -456,16 +503,7 @@ def _prompt(
             "image_usable": True,
         },
     )
-    schema = json.loads(json.dumps(OUTPUT_SCHEMA))
-    tag_count = rules.get("tag_count", 13)
-    tag_max_chars = rules.get("tag_max_chars", 20)
-    if isinstance(tag_count, int) and not isinstance(tag_count, bool) and tag_count > 0:
-        schema["properties"]["tags"].update({"minItems": tag_count, "maxItems": tag_count})
-    if isinstance(tag_max_chars, int) and not isinstance(tag_max_chars, bool) and tag_max_chars > 0:
-        schema["properties"]["tags"]["items"]["maxLength"] = tag_max_chars
-    rule_version = rules.get("rule_version")
-    if isinstance(rule_version, str) and rule_version:
-        schema["properties"]["rule_version"]["const"] = rule_version
+    schema = _listing_output_schema(rules)
     envelope = {
         "merged_product_context": merged_context,
         "active_abstract_knowledge": knowledge,
@@ -482,7 +520,7 @@ def _prompt(
         + "Use only merged product context, active abstract knowledge, and rules in this JSON envelope. "
         + "Candidate fields are authoritative over conflicting visual observations. "
         + "Return only one JSON object with exactly: head_titles, tags, specification, category, instructions_for_buyers, "
-        + "confidence, fact_warnings, quality_warnings, rule_version.\n"
+        + "confidence, fact_warnings, quality_warnings, rule_version. "
         + json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
     )
     if len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
@@ -521,7 +559,7 @@ def _visual_prompt(row: dict[str, Any], repair_error: dict[str, Any] | None) -> 
         prefix
         + "Observe only the attached first product image for this isolated row. "
         + "Candidate fields are untrusted text context and are authoritative if they conflict with the image. "
-        + "Do not generate Listing copy. Return only one JSON object matching output_json_schema.\n"
+        + "Do not generate Listing copy. Return only one JSON object matching output_json_schema. "
         + json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
     )
     if len(prompt.encode("utf-8")) > MAX_PROMPT_BYTES:
@@ -578,23 +616,53 @@ def _parse_visual(text: str) -> dict[str, Any]:
         raise error from exc
 
 
+def _codex_output_schema(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _codex_output_schema(item)
+            for key, item in value.items()
+            if key != "uniqueItems"
+        }
+    if isinstance(value, list):
+        return [_codex_output_schema(item) for item in value]
+    return value
+
+
 def _checked_model_call(
     command: list[str],
     prompt: str,
     runner: Callable[[list[str], str], subprocess.CompletedProcess[str]],
     *,
     max_response_bytes: int,
+    output_schema: dict[str, Any] | None = None,
 ) -> str:
-    invocation = [*command, "-q", prompt]
-    _check_command_size(invocation)
+    executable = Path(command[0]).stem.casefold()
+    schema_path: Path | None = None
+    if executable == "codex":
+        if not isinstance(output_schema, dict):
+            raise TaskError("invalid_model_engine", "Codex calls require a bounded output schema.")
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", encoding="utf-8", delete=False) as schema_file:
+            json.dump(_codex_output_schema(output_schema), schema_file, ensure_ascii=False, separators=(",", ":"))
+            schema_path = Path(schema_file.name)
+        invocation = [*command, "--output-schema", str(schema_path), "--", prompt]
+    else:
+        invocation = [*command, "-q", prompt]
     try:
-        process = runner(invocation, prompt)
-    except OSError as exc:
-        raise TaskError("employee_unavailable", "The employee process could not be started.") from exc
-    except TaskError:
-        raise
-    except Exception as exc:
-        raise TaskError("employee_process_failed", "The employee process failed.") from exc
+        _check_command_size(invocation)
+        try:
+            process = runner(invocation, prompt)
+        except OSError as exc:
+            raise TaskError("employee_unavailable", "The employee process could not be started.") from exc
+        except TaskError:
+            raise
+        except Exception as exc:
+            raise TaskError("employee_process_failed", "The employee process failed.") from exc
+    finally:
+        if schema_path is not None:
+            try:
+                schema_path.unlink(missing_ok=True)
+            except OSError:
+                pass
     if (
         not isinstance(process.stdout, str)
         or not isinstance(process.stderr, str)
@@ -620,10 +688,8 @@ def _invoke_visual(
     image_path = Path(images[0]).resolve(strict=True)
     if not image_path.is_file() or not image_path.is_relative_to(image_root.resolve()):
         raise TaskError("invalid_row_context", "The product image is outside the operation image directory.")
-    command = [
-        "hermes", "-p", PROFILE, "chat", "-Q", "--source", "tool",
-        "--max-turns", str(MAX_TURNS), "--image", str(image_path),
-    ]
+    command = _model_command(image_path=image_path)
+    visual_schema = _load_sibling("visual_context").schema()
     last_error: TaskError | None = None
     repair_error: dict[str, Any] | None = None
     for _attempt in range(2):
@@ -635,6 +701,7 @@ def _invoke_visual(
                     prompt,
                     runner,
                     max_response_bytes=max_response_bytes,
+                    output_schema=visual_schema,
                 )
             )
         except TaskError as exc:
@@ -657,7 +724,8 @@ def _invoke_row(
     guard: list[tuple[str, str]] | None = None,
     guard_threshold: float = 0.72,
 ) -> dict[str, Any]:
-    command = ["hermes", "-p", PROFILE, "chat", "-Q", "--source", "tool", "--max-turns", str(MAX_TURNS)]
+    command = _model_command()
+    listing_schema = _listing_output_schema(rules)
     last_error: TaskError | None = None
     repair_error: dict[str, Any] | None = None
     for _attempt in range(2):
@@ -669,6 +737,7 @@ def _invoke_row(
                     prompt,
                     runner,
                     max_response_bytes=max_response_bytes,
+                    output_schema=listing_schema,
                 ),
                 rules,
             )

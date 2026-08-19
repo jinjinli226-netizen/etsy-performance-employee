@@ -31,6 +31,12 @@ def test_settings_default_database_is_inside_configured_data_directory(tmp_path)
     assert settings.resolved_database_url == f"sqlite:///{(tmp_path / 'data/app.db').as_posix()}"
 
 
+def test_excel_batch_timeout_allows_image_enriched_workbooks() -> None:
+    settings = Settings()
+
+    assert settings.excel_worker_timeout_seconds >= 3600
+
+
 def test_job_status_values_are_stable() -> None:
     assert [status.value for status in JobStatus] == [
         "queued",

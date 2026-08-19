@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import sys
@@ -713,6 +714,34 @@ def test_artifact_contract_rejects_duplicate_fixed_header(tmp_path) -> None:
         terminal = wait_terminal(client, job["id"])
         assert terminal["status"] == "failed"
         assert terminal["error"]["code"] == "invalid_artifact"
+
+
+def test_artifact_contract_scans_workbook_with_stale_dimension(tmp_path) -> None:
+    source = tmp_path / "source.xlsx"
+    operation = tmp_path / "operation"
+    operation.mkdir()
+    artifact = operation / "generated.xlsx"
+    shutil.copyfile(FIXTURE, source)
+    shutil.copyfile(FIXTURE, artifact)
+    with zipfile.ZipFile(artifact, "r") as archive:
+        entries = {item.filename: archive.read(item.filename) for item in archive.infolist()}
+    worksheet = next(name for name in entries if name.startswith("xl/worksheets/sheet") and name.endswith(".xml"))
+    stale = re.sub(br'<dimension ref="[^"]+"\s*/>', b'<dimension ref="A1"/>', entries[worksheet], count=1)
+    assert stale != entries[worksheet]
+    entries[worksheet] = stale
+    with zipfile.ZipFile(artifact, "w") as archive:
+        for name, payload in entries.items():
+            archive.writestr(name, payload)
+
+    digest, size = excel_storage.validate_artifact(
+        artifact,
+        operation_dir=operation,
+        source_path=source,
+        source_sha256=sha256(source),
+    )
+
+    assert digest == sha256(artifact)
+    assert size == artifact.stat().st_size
 
 
 def test_unknown_job_and_invalid_pagination_are_rejected(api) -> None:

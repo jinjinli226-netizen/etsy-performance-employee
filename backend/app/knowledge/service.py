@@ -912,6 +912,8 @@ class KnowledgeService:
             workbook = load_workbook(path, read_only=True, data_only=False)
             try:
                 for sheet in workbook.worksheets:
+                    sheet.reset_dimensions()
+                    sheet.calculate_dimension(force=True)
                     header_row, columns = None, {}
                     for row in sheet.iter_rows(min_row=1, max_row=min(sheet.max_row, 200)):
                         found = {str(cell.value).strip(): cell.column for cell in row if isinstance(cell.value, str)}

@@ -8,10 +8,15 @@ import hashlib
 import importlib.util
 import json
 import os
+import posixpath
+import re
 import shutil
 import tempfile
+from io import BytesIO
 from pathlib import Path
 from typing import Any
+from xml.etree import ElementTree
+from zipfile import ZIP_DEFLATED, ZipFile
 
 from openpyxl import load_workbook
 from openpyxl.utils import column_index_from_string, get_column_letter
@@ -30,6 +35,12 @@ HEADER_TO_KEY = {
     "Category": "category",
     "Instructions for buyers": "instructions_for_buyers",
 }
+
+_SPREADSHEET_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+_DOCUMENT_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+_PACKAGE_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+_XML_NS = "http://www.w3.org/XML/1998/namespace"
+_CELL_REFERENCE = re.compile(r"^([A-Z]+)([1-9][0-9]*)$")
 
 
 class WorkbookWriteError(RuntimeError):
@@ -91,6 +102,104 @@ def _validate_manifest_mapping(workbook, manifest: dict[str, Any]) -> tuple[Any,
             raise WorkbookWriteError("manifest_mismatch", "An output header became merged.")
         columns[header] = column
     return ws, columns
+
+
+def _worksheet_part(archive: ZipFile, sheet_name: str) -> str:
+    workbook_root = ElementTree.fromstring(archive.read("xl/workbook.xml"))
+    relationship_id: str | None = None
+    for sheet in workbook_root.findall(f".//{{{_SPREADSHEET_NS}}}sheet"):
+        if sheet.get("name") == sheet_name:
+            relationship_id = sheet.get(f"{{{_DOCUMENT_REL_NS}}}id")
+            break
+    if not relationship_id:
+        raise WorkbookWriteError("manifest_mismatch", "The manifest sheet relationship is missing.")
+    relationships = ElementTree.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+    target: str | None = None
+    for relationship in relationships.findall(f"{{{_PACKAGE_REL_NS}}}Relationship"):
+        if relationship.get("Id") == relationship_id:
+            if relationship.get("TargetMode") == "External":
+                raise WorkbookWriteError("manifest_mismatch", "The manifest sheet relationship is external.")
+            target = relationship.get("Target")
+            break
+    if not target:
+        raise WorkbookWriteError("manifest_mismatch", "The manifest sheet target is missing.")
+    part = posixpath.normpath(target.lstrip("/") if target.startswith("/") else posixpath.join("xl", target))
+    if not part.startswith("xl/worksheets/") or part not in archive.namelist():
+        raise WorkbookWriteError("manifest_mismatch", "The manifest sheet target is unsafe or missing.")
+    return part
+
+
+def _registered_namespaces(xml: bytes) -> None:
+    for _event, (prefix, uri) in ElementTree.iterparse(BytesIO(xml), events=("start-ns",)):
+        try:
+            ElementTree.register_namespace(prefix or "", uri)
+        except ValueError as exc:
+            raise WorkbookWriteError("workbook_write_failed", "The worksheet namespace map is invalid.") from exc
+
+
+def _cell_column(cell: ElementTree.Element) -> int:
+    match = _CELL_REFERENCE.fullmatch(cell.get("r", ""))
+    return column_index_from_string(match.group(1)) if match else 1_000_000
+
+
+def _patch_worksheet_xml(xml: bytes, values: dict[str, str]) -> bytes:
+    _registered_namespaces(xml)
+    root = ElementTree.fromstring(xml)
+    sheet_data = root.find(f"{{{_SPREADSHEET_NS}}}sheetData")
+    if sheet_data is None:
+        raise WorkbookWriteError("manifest_mismatch", "The manifest worksheet has no sheet data.")
+    rows = {int(row.get("r")): row for row in sheet_data.findall(f"{{{_SPREADSHEET_NS}}}row") if (row.get("r") or "").isdigit()}
+    for address, value in sorted(
+        values.items(),
+        key=lambda item: (
+            int(_CELL_REFERENCE.fullmatch(item[0]).group(2)),
+            _cell_column(ElementTree.Element("c", {"r": item[0]})),
+        ),
+    ):
+        match = _CELL_REFERENCE.fullmatch(address)
+        if match is None:
+            raise WorkbookWriteError("manifest_mismatch", "An output cell address is invalid.")
+        row_number = int(match.group(2))
+        row = rows.get(row_number)
+        if row is None:
+            row = ElementTree.Element(f"{{{_SPREADSHEET_NS}}}row", {"r": str(row_number)})
+            insertion = next((index for index, current in enumerate(sheet_data) if int(current.get("r", "0")) > row_number), len(sheet_data))
+            sheet_data.insert(insertion, row)
+            rows[row_number] = row
+        cells = row.findall(f"{{{_SPREADSHEET_NS}}}c")
+        cell = next((item for item in cells if item.get("r") == address), None)
+        if cell is None:
+            cell = ElementTree.Element(f"{{{_SPREADSHEET_NS}}}c", {"r": address})
+            column = column_index_from_string(match.group(1))
+            insertion = next((index for index, current in enumerate(row) if current.tag == f"{{{_SPREADSHEET_NS}}}c" and _cell_column(current) > column), len(row))
+            row.insert(insertion, cell)
+        for child in list(cell):
+            cell.remove(child)
+        cell.set("t", "inlineStr")
+        inline = ElementTree.SubElement(cell, f"{{{_SPREADSHEET_NS}}}is")
+        text = ElementTree.SubElement(inline, f"{{{_SPREADSHEET_NS}}}t")
+        if value != value.strip():
+            text.set(f"{{{_XML_NS}}}space", "preserve")
+        text.text = value
+    return ElementTree.tostring(root, encoding="utf-8", xml_declaration=True)
+
+
+def _rewrite_workbook_package(path: Path, sheet_name: str, values: dict[str, str]) -> None:
+    fd, replacement_name = tempfile.mkstemp(prefix=".listing-package-", suffix=".xlsx", dir=path.parent)
+    os.close(fd)
+    replacement = Path(replacement_name)
+    try:
+        with ZipFile(path, "r") as source_archive, ZipFile(replacement, "w", compression=ZIP_DEFLATED) as output_archive:
+            worksheet_part = _worksheet_part(source_archive, sheet_name)
+            output_archive.comment = source_archive.comment
+            for member in source_archive.infolist():
+                payload = source_archive.read(member.filename)
+                if member.filename == worksheet_part:
+                    payload = _patch_worksheet_xml(payload, values)
+                output_archive.writestr(member, payload)
+        os.replace(replacement, path)
+    finally:
+        replacement.unlink(missing_ok=True)
 
 
 def write_workbook(
@@ -173,13 +282,13 @@ def write_workbook(
             for header, key in HEADER_TO_KEY.items():
                 if key not in result:
                     raise WorkbookWriteError("invalid_result", f"The generated result is missing {key}.")
-                cell = ws.cell(row_number, columns[header])
-                cell.value = _safe_excel_string(result[key])
-                cell.data_type = "s"
+                value = _safe_excel_string(result[key])
                 address = f"{ws.title}!{get_column_letter(columns[header])}{row_number}"
                 changed.append(address)
-                expected_cells[address] = cell.value
-        workbook.save(temp_path)
+                expected_cells[address] = value
+        workbook.close()
+        package_values = {address.split("!", 1)[1]: value for address, value in expected_cells.items()}
+        _rewrite_workbook_package(temp_path, manifest["sheet"], package_values)
         output_package_inventory = inspect._package_preservation_signature(temp_path, validate_supported=True)
         if output_package_inventory != source_package_inventory:
             raise WorkbookWriteError(

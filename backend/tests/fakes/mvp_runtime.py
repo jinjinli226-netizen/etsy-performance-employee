@@ -23,7 +23,7 @@ def load_employee_runner():
 
 
 def listing_for_prompt(prompt: str) -> dict[str, object]:
-    envelope = json.loads(prompt.split("\n", 1)[1])
+    envelope = json.loads(prompt[prompt.index("{"):])
     context = envelope["merged_product_context"]
     fields = {field["header"]: str(field["value"]) for field in context["candidate_fields"]}
     sku = fields.get("SKU", "Costume")

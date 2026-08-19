@@ -3,8 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import stat
 import threading
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -93,6 +95,27 @@ def test_workbook_originality_validator_always_closes_workbook(knowledge, tmp_pa
     else:
         service.validate_generated_workbook(tmp_path / "generated.xlsx")
     assert workbook.closed is True
+
+
+def test_workbook_originality_validator_scans_stale_dimensions(knowledge, tmp_path) -> None:
+    service, _, _ = knowledge
+    evidence = add_evidence(service, 1)[0]
+    path = tmp_path / "stale-dimension.xlsx"
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.append(["head titles", "SPECIFICATION", "Instructions for buyers"])
+    sheet.append([evidence.title, evidence.snapshot, evidence.tags[0]])
+    workbook.save(path)
+    with zipfile.ZipFile(path, "r") as archive:
+        entries = {item.filename: archive.read(item.filename) for item in archive.infolist()}
+    worksheet = next(name for name in entries if name.startswith("xl/worksheets/sheet") and name.endswith(".xml"))
+    entries[worksheet] = re.sub(br'<dimension ref="[^"]+"\s*/>', b'<dimension ref="A1"/>', entries[worksheet], count=1)
+    with zipfile.ZipFile(path, "w") as archive:
+        for name, payload in entries.items():
+            archive.writestr(name, payload)
+
+    with pytest.raises(KnowledgeValidationError):
+        service.validate_generated_workbook(path)
 
 
 def test_raw_competitor_data_remains_evidence_only_and_generation_gets_only_active_abstracts(knowledge) -> None:
