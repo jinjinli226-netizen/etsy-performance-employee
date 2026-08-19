@@ -15,6 +15,7 @@ CLEAN_E2E = ROOT / "scripts" / "clean-e2e-data.ps1"
 README = ROOT / "README.md"
 RUNBOOK = ROOT / "docs" / "operations" / "mvp-runbook.md"
 MIGRATION_GUIDE = ROOT / "docs" / "operations" / "网站与数字员工部署迁移指南.md"
+HERMES_GUIDE = ROOT / "docs" / "operations" / "HermesAgent配置指南.md"
 VITE_CONFIG = ROOT / "frontend" / "vite.config.ts"
 UV_LOCK = ROOT / "backend" / "uv.lock"
 
@@ -255,6 +256,25 @@ def test_migration_guide_covers_code_data_credentials_import_and_acceptance() ->
         "ETSY_EMPLOYEE_ROW_WORKERS",
         "不发布残缺工作簿",
         "不是公网网站",
+    ):
+        assert required in document
+
+
+def test_hermes_guide_covers_profile_dual_login_runtime_and_secret_boundaries() -> None:
+    document = read(HERMES_GUIDE)
+    assert "\ufffd" not in document
+    for required in (
+        "provision-employee.ps1",
+        "-Provider openai-codex",
+        "-ModelId gpt-5.4",
+        "auth add openai-codex --type oauth",
+        "codex login status",
+        "verify-employee.ps1 -RunModelCheck -RunDoctor",
+        "ETSY_EMPLOYEE_MODEL_ENGINE",
+        "ETSY_EMPLOYEE_ROW_WORKERS",
+        "DataDirectory",
+        "不发布残缺工作簿",
+        "不向 GitHub 提交",
     ):
         assert required in document
 

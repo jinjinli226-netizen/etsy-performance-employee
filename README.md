@@ -81,7 +81,7 @@ $env:ETSY_EMPLOYEE_ROW_WORKERS = '3'
 .\scripts\start.ps1 -Stop -DataDirectory "D:\EtsyEmployeeData"
 ```
 
-完整的故障恢复与任务重试见 [运维手册](docs/operations/mvp-runbook.md)；换电脑或重新部署请按 [网站与数字员工部署迁移指南](docs/operations/网站与数字员工部署迁移指南.md) 执行。
+HermesAgent 的安装、Profile、登录和模型参数见 [HermesAgent 配置指南](docs/operations/HermesAgent配置指南.md)；完整的故障恢复与任务重试见 [运维手册](docs/operations/mvp-runbook.md)；换电脑或重新部署请按 [网站与数字员工部署迁移指南](docs/operations/网站与数字员工部署迁移指南.md) 执行。
 
 ## 开发与验证
 
