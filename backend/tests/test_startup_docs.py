@@ -3,6 +3,7 @@ from __future__ import annotations
 import shutil
 import subprocess
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 START = ROOT / "scripts" / "start.ps1"
+BOOTSTRAP = ROOT / "scripts" / "bootstrap-new-machine.ps1"
 CONFIGURED_START = ROOT / "scripts" / "start-configured.ps1"
 START_ENV = ROOT / "scripts" / "start-environment.ps1"
 CLEAN_E2E = ROOT / "scripts" / "clean-e2e-data.ps1"
@@ -64,6 +66,58 @@ def test_configured_start_sets_verified_non_secret_runtime_and_delegates() -> No
     ):
         assert forwarded in script
     assert "[switch]$Stop" in script
+
+
+def test_codex_bootstrap_is_bounded_idempotent_and_fail_closed() -> None:
+    script = read(BOOTSTRAP)
+
+    for required in (
+        "uv", "sync", "--extra", "dev", "--frozen",
+        "pnpm", "install", "--frozen-lockfile",
+        "provision-employee.ps1", "verify-employee.ps1",
+        "-RunModelCheck", "-RunDoctor",
+        "auth", "add", "openai-codex", "--type", "oauth",
+        "login", "status", "start-configured.ps1",
+        "NonInteractive", "Test-Path", "LASTEXITCODE",
+    ):
+        assert required in script
+    for forbidden in (
+        "winget", "Set-ExecutionPolicy", "Remove-Item $Profile",
+        "Get-Content $Profile", "api_key", "access_token",
+    ):
+        assert forbidden.casefold() not in script.casefold()
+
+
+def test_codex_bootstrap_fails_before_writes_when_python_is_missing(tmp_path: Path) -> None:
+    powershell = shutil.which("pwsh") or shutil.which("powershell")
+    if powershell is None:
+        pytest.skip("PowerShell is not available")
+    local_app_data = tmp_path / "local-app-data"
+    environment = dict(os.environ)
+    environment["LOCALAPPDATA"] = str(local_app_data)
+
+    result = subprocess.run(
+        [
+            powershell,
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(BOOTSTRAP),
+            "-PythonLauncher",
+            str(tmp_path / "missing-python.exe"),
+            "-NonInteractive",
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=environment,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "Python 3.11" in result.stdout + result.stderr
+    assert not (local_app_data / "hermes" / "profiles").exists()
 
     script = read(START)
     environment_script = read(START_ENV)
@@ -307,7 +361,7 @@ def test_e2e_cleanup_is_manifest_scoped_and_scripts_parse() -> None:
     powershell = shutil.which("pwsh") or shutil.which("powershell")
     if powershell is None:
         pytest.skip("PowerShell is not available")
-    for path in (START, CONFIGURED_START, START_ENV, CLEAN_E2E):
+    for path in (START, BOOTSTRAP, CONFIGURED_START, START_ENV, CLEAN_E2E):
         result = subprocess.run(
             [powershell, "-NoProfile", "-NonInteractive", "-Command", f"$e=$null; [void][System.Management.Automation.Language.Parser]::ParseFile('{path}', [ref]$null, [ref]$e); if($e.Count){{exit 1}}"],
             check=False,
