@@ -7,6 +7,8 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
@@ -505,6 +507,46 @@ def test_validation_rejects_warning_urls_for_worker_events(excel_modules) -> Non
         validate.validate_generated(payload, {"rule_version": "rules-v1"})
 
 
+def test_validation_enforces_configured_emoji_description_sections(excel_modules) -> None:
+    _, validate, _, _ = excel_modules
+    rules = {"rule_version": "rules-v2", "description_emoji_sections": 5}
+    payload = valid_result()
+    payload["rule_version"] = "rules-v2"
+
+    with pytest.raises(validate.OutputValidationError) as raised:
+        validate.validate_generated(payload, rules)
+    assert any(issue["field"] == "specification" for issue in raised.value.issues)
+
+    payload["specification"] = "\n".join([
+        "🌑 Bold Look: A dark statement style grounded in the visible design.",
+        "🎭 Stage Ready: Designed as an eye-catching costume for performance settings.",
+        "🎨 Visual Detail: Contrasting shapes create a distinctive appearance.",
+        "✨ Styling Option: Pair it with coordinated pieces for a complete look.",
+        "🎉 Event Appeal: Suitable for the verified party and festival occasions.",
+    ])
+    cleaned = validate.validate_generated(payload, rules)
+    assert cleaned["specification"].count("\n") == 4
+
+
+def test_prompt_requests_example_style_without_unsupported_claims(excel_modules) -> None:
+    _, _, _, run = excel_modules
+    row = {
+        "candidate_fields": [{"header": "Product notes", "value": "Black stage headpiece", "type": "text"}],
+        "image_paths": [],
+        "warnings": [],
+    }
+
+    prompt = run._prompt(
+        row,
+        [],
+        {"rule_version": "rules-v2", "description_emoji_sections": 5},
+        None,
+    )
+
+    assert "exactly 5 newline-separated emoji-led" in prompt
+    assert "Never claim size, material, handmade status, or included pieces unless verified" in prompt
+
+
 def test_writer_preserves_workbook_and_changes_only_five_target_cells(tmp_path: Path, excel_modules) -> None:
     inspect, _, writer, _ = excel_modules
     source = copy_fixture(tmp_path)
@@ -877,6 +919,113 @@ def test_run_task_uses_first_image_then_text_only_and_skips_no_image_rows(
     assert output["Products"]["E6"].value is None
 
 
+def test_run_task_processes_image_rows_with_bounded_parallelism(
+    tmp_path: Path, excel_modules, monkeypatch
+) -> None:
+    _, _, _, run = excel_modules
+    monkeypatch.setenv("ETSY_EMPLOYEE_MODEL_ENGINE", "hermes")
+    monkeypatch.setenv("ETSY_EMPLOYEE_ROW_WORKERS", "2")
+    source = make_book(
+        tmp_path / "parallel.xlsx",
+        rows=(("SKU-1", "Blue costume", 10, "ready"), ("SKU-2", "Red costume", 12, "ready")),
+        image_rows=(5, 6),
+    )
+    visual_barrier = threading.Barrier(2)
+
+    def runner(command: list[str], prompt: str) -> subprocess.CompletedProcess[str]:
+        if "--image" in command:
+            visual_barrier.wait(timeout=2)
+            return subprocess.CompletedProcess(command, 0, json.dumps(valid_visual_context()), "")
+        return subprocess.CompletedProcess(command, 0, json.dumps(valid_result()), "")
+
+    report = run.run_task(
+        source,
+        tmp_path / "parallel-job",
+        knowledge_path=None,
+        rules={"rule_version": "rules-v1"},
+        command_runner=runner,
+        emit=lambda _event: None,
+    )
+
+    output = load_workbook(report["output_path"])
+    assert output["Products"]["E5"].value and output["Products"]["E6"].value
+
+
+def test_run_task_retries_a_transient_row_failure_before_skipping(
+    tmp_path: Path, excel_modules, monkeypatch
+) -> None:
+    _, _, _, run = excel_modules
+    monkeypatch.setenv("ETSY_EMPLOYEE_MODEL_ENGINE", "hermes")
+    monkeypatch.setenv("ETSY_EMPLOYEE_ROW_WORKERS", "1")
+    source = make_book(tmp_path / "retry-row.xlsx")
+    image_attempts = 0
+
+    def runner(command: list[str], prompt: str) -> subprocess.CompletedProcess[str]:
+        nonlocal image_attempts
+        if "--image" in command:
+            image_attempts += 1
+            if image_attempts == 1:
+                raise OSError("synthetic transient launch failure")
+            return subprocess.CompletedProcess(command, 0, json.dumps(valid_visual_context()), "")
+        return subprocess.CompletedProcess(command, 0, json.dumps(valid_result()), "")
+
+    report = run.run_task(
+        source,
+        tmp_path / "retry-row-job",
+        knowledge_path=None,
+        rules={"rule_version": "rules-v1"},
+        command_runner=runner,
+        emit=lambda _event: None,
+    )
+
+    assert image_attempts == 2
+    assert load_workbook(report["output_path"])["Products"]["E5"].value
+
+
+def test_parallel_row_recovery_waits_until_the_parallel_batch_drains(
+    tmp_path: Path, excel_modules, monkeypatch
+) -> None:
+    _, _, _, run = excel_modules
+    monkeypatch.setenv("ETSY_EMPLOYEE_MODEL_ENGINE", "hermes")
+    monkeypatch.setenv("ETSY_EMPLOYEE_ROW_WORKERS", "2")
+    source = make_book(
+        tmp_path / "parallel-recovery.xlsx",
+        rows=(("SKU-1", "Blue costume", 10, "ready"), ("SKU-2", "Red costume", 12, "ready")),
+        image_rows=(5, 6),
+    )
+    second_row_started = threading.Event()
+    parallel_batch_drained = threading.Event()
+    first_row_attempts = 0
+
+    def runner(command: list[str], prompt: str) -> subprocess.CompletedProcess[str]:
+        nonlocal first_row_attempts
+        if "--image" in command and "SKU-1" in prompt:
+            first_row_attempts += 1
+            assert second_row_started.wait(timeout=2)
+            if first_row_attempts == 1 or not parallel_batch_drained.is_set():
+                raise OSError("synthetic concurrency pressure")
+            return subprocess.CompletedProcess(command, 0, json.dumps(valid_visual_context()), "")
+        if "--image" in command and "SKU-2" in prompt:
+            second_row_started.set()
+            time.sleep(0.2)
+            parallel_batch_drained.set()
+            return subprocess.CompletedProcess(command, 0, json.dumps(valid_visual_context()), "")
+        return subprocess.CompletedProcess(command, 0, json.dumps(valid_result()), "")
+
+    report = run.run_task(
+        source,
+        tmp_path / "parallel-recovery-job",
+        knowledge_path=None,
+        rules={"rule_version": "rules-v1"},
+        command_runner=runner,
+        emit=lambda _event: None,
+    )
+
+    assert first_row_attempts == 2
+    output = load_workbook(report["output_path"])
+    assert output["Products"]["E5"].value and output["Products"]["E6"].value
+
+
 def test_codex_engine_uses_http_only_route_and_preserves_visual_contract(
     tmp_path: Path, excel_modules, monkeypatch
 ) -> None:
@@ -1056,7 +1205,38 @@ def test_run_task_emits_row_failure_and_leaves_no_partial_output(tmp_path: Path,
     with pytest.raises(run.TaskError):
         run.run_task(source, tmp_path / "job", knowledge_path=None, rules={"rule_version": "rules-v1"}, command_runner=fake, emit=events.append)
     assert [event["event"] for event in events][-2:] == ["row_failed", "failed"]
+    assert events[-2]["row_number"] == 5
     assert not list((tmp_path / "job").glob("*.xlsx"))
+
+
+def test_run_task_does_not_publish_a_partial_workbook_when_one_row_fails(
+    tmp_path: Path, excel_modules, monkeypatch
+) -> None:
+    _, _, _, run = excel_modules
+    monkeypatch.setenv("ETSY_EMPLOYEE_MODEL_ENGINE", "hermes")
+    monkeypatch.setenv("ETSY_EMPLOYEE_ROW_WORKERS", "1")
+    source = make_book(
+        tmp_path / "partial.xlsx",
+        rows=(("SKU-1", "Blue costume", 10, "ready"), ("SKU-2", "Red costume", 12, "ready")),
+        image_rows=(5, 6),
+    )
+    fake = FakeHermes([
+        json.dumps(valid_result()),
+        "bad response", "bad response", "bad response", "bad response",
+    ])
+
+    with pytest.raises(run.TaskError) as raised:
+        run.run_task(
+            source,
+            tmp_path / "partial-job",
+            knowledge_path=None,
+            rules={"rule_version": "rules-v1"},
+            command_runner=fake,
+            emit=lambda _event: None,
+        )
+
+    assert raised.value.code == "rows_failed"
+    assert not list((tmp_path / "partial-job").glob("*generated*.xlsx"))
 
 
 def test_run_task_sanitizes_unexpected_runner_errors_from_progress(tmp_path: Path, excel_modules) -> None:

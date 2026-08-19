@@ -30,6 +30,7 @@ DEFAULT_RULES = {
 }
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _WARNING_URL = re.compile(r"(?:https?://|www\.)", re.IGNORECASE)
+_EMOJI_PREFIX = re.compile(r"^[\u2600-\u27bf\U0001f300-\U0001faff](?:\ufe0f)?\s")
 _FORMULA_PREFIX = ("=", "+", "-", "@")
 EXCEL_CELL_MAX_CHARS = 32_767
 MAX_TITLE_CHARS = 140
@@ -108,6 +109,9 @@ def validate_generated(payload: Any, rules: dict[str, Any] | None = None) -> dic
     title_max = _positive_int(active_rules, "title_max_words", DEFAULT_RULES["title_max_words"], issues)
     tag_count = _positive_int(active_rules, "tag_count", DEFAULT_RULES["tag_count"], issues)
     tag_max = _positive_int(active_rules, "tag_max_chars", DEFAULT_RULES["tag_max_chars"], issues)
+    description_sections = None
+    if "description_emoji_sections" in active_rules:
+        description_sections = _positive_int(active_rules, "description_emoji_sections", 5, issues)
     if title_min > title_max:
         issues.append({"field": "rules", "message": "title_min_words must not exceed title_max_words"})
 
@@ -134,10 +138,19 @@ def validate_generated(payload: Any, rules: dict[str, Any] | None = None) -> dic
         if len(normalized_tags) != len(set(normalized_tags)):
             issues.append({"field": "tags", "message": "must be distinct after normalization"})
 
+    specification = _safe_text(payload.get("specification"), "specification", issues, max_chars=MAX_SPECIFICATION_CHARS)
+    if specification and description_sections is not None:
+        sections = [line.strip() for line in specification.splitlines() if line.strip()]
+        if len(sections) != description_sections:
+            issues.append({"field": "specification", "message": f"must contain exactly {description_sections} newline-separated sections"})
+        for index, section in enumerate(sections):
+            if not _EMOJI_PREFIX.match(section):
+                issues.append({"field": f"specification[{index}]", "message": "must begin with an emoji followed by a space"})
+
     cleaned: dict[str, Any] = {
         "head_titles": title,
         "tags": cleaned_tags,
-        "specification": _safe_text(payload.get("specification"), "specification", issues, max_chars=MAX_SPECIFICATION_CHARS),
+        "specification": specification,
         "category": _safe_text(payload.get("category"), "category", issues, max_chars=MAX_CATEGORY_CHARS),
         "instructions_for_buyers": _safe_text(payload.get("instructions_for_buyers"), "instructions_for_buyers", issues, max_chars=MAX_INSTRUCTIONS_CHARS),
     }
