@@ -2,6 +2,34 @@
 
 这是一个仅在本机运行的 Etsy 表演服工作台：通过长期对话训练独立的 Hermes 员工，并把 `.xlsx` 工作簿交给员工处理。员工按产品行原创生成并填写固定的五个 Listing 字段，系统另存结果，不覆盖源文件。
 
+## 交给 Codex 一键配置
+
+把本仓库地址交给 Codex，并让它阅读本 README。Codex 在仓库根目录只需运行：
+
+```powershell
+.\scripts\bootstrap-new-machine.ps1 -Start
+```
+
+脚本会自动检查系统依赖、按锁文件安装项目依赖、创建或复核 Hermes Profile、检查 Hermes/Codex 双登录、运行模型与 Doctor 校验，并使用已验证的参数启动本地网站。Hermes OAuth 和 `codex login` 出现时，需要你本人在可见页面确认；这是唯一不能无人值守完成的步骤。
+
+如果要把业务数据放到指定磁盘，使用：
+
+```powershell
+.\scripts\bootstrap-new-machine.ps1 `
+  -DataDirectory 'D:\EtsyEmployeeData' `
+  -BackendPort 8765 `
+  -Start
+```
+
+交给 Codex 时同时说明以下边界：
+
+- 不得读取或输出凭据文件，不得索要 API Key；
+- 不得覆盖、删除或重建已有但校验失败的 Hermes Profile；
+- 缺少 Git、Python、Node、pnpm、uv、Hermes 或 Codex 时，报告缺失项，不擅自申请管理员权限安装；
+- 只有 `http://127.0.0.1:8765/api/health`、`/api/employee/status` 和 `http://127.0.0.1:5173/excel` 均通过检查后，才能报告配置完成。
+
+详细边界见 [HermesAgent 配置指南](docs/operations/HermesAgent配置指南.md)，换电脑并恢复知识数据见 [网站与数字员工部署迁移指南](docs/operations/网站与数字员工部署迁移指南.md)。
+
 ## 第一版能做什么
 
 - 长期对话、附件与训练纠正记录持久保存；

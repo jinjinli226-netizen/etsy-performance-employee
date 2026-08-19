@@ -275,6 +275,27 @@ def test_chinese_readme_documents_truthful_setup_start_stop_and_storage() -> Non
         assert required in document
 
 
+def test_readme_is_the_single_codex_bootstrap_entrypoint() -> None:
+    document = read(README)
+
+    for required in (
+        "交给 Codex 一键配置",
+        ".\\scripts\\bootstrap-new-machine.ps1",
+        "-DataDirectory 'D:\\EtsyEmployeeData'",
+        "-BackendPort 8765",
+        "-Start",
+        "Hermes",
+        "Codex",
+        "不得读取或输出凭据文件",
+        "/api/health",
+        "/api/employee/status",
+        "/excel",
+        "HermesAgent配置指南.md",
+        "网站与数字员工部署迁移指南.md",
+    ):
+        assert required in document
+
+
 def test_runbook_covers_recovery_migration_capacity_and_known_limits() -> None:
     document = read(RUNBOOK)
     assert "\ufffd" not in document

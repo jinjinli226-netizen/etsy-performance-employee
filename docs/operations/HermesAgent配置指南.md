@@ -51,6 +51,14 @@ codex --version
 
 ## 3. 下载仓库并安装项目依赖
 
+推荐让 Codex 在克隆后的仓库根目录运行一键配置；脚本会执行本节及后续 Profile、登录和校验步骤：
+
+```powershell
+.\scripts\bootstrap-new-machine.ps1 -Start
+```
+
+系统级程序缺失时脚本会安全停止并列出缺失项，不会自行申请管理员权限。下面保留手工步骤用于排错。
+
 ```powershell
 git clone https://github.com/jinjinli226-netizen/etsy-performance-employee.git
 Set-Location .\etsy-performance-employee
@@ -134,7 +142,7 @@ codex login status
 
 ## 7. 设置当前生产运行参数
 
-每次打开新的 PowerShell 窗口，启动前设置：
+正常使用不需要手工设置；`start-configured.ps1` 会集中设置以下非秘密参数：
 
 ```powershell
 $env:ETSY_EMPLOYEE_MODEL_ENGINE = 'codex'
@@ -164,7 +172,7 @@ $env:ETSY_EMPLOYEE_EXCEL_WORKER_TIMEOUT_SECONDS = '3600'
 
 ```powershell
 $DataDirectory = 'D:\EtsyEmployeeData'
-.\scripts\start.ps1 -DataDirectory $DataDirectory -BackendPort 8765
+.\scripts\start-configured.ps1 -DataDirectory $DataDirectory -BackendPort 8765
 ```
 
 启动后打开：
@@ -176,13 +184,13 @@ $DataDirectory = 'D:\EtsyEmployeeData'
 如果 8765 被其他项目占用：
 
 ```powershell
-.\scripts\start.ps1 -DataDirectory $DataDirectory -BackendPort 8766
+.\scripts\start-configured.ps1 -DataDirectory $DataDirectory -BackendPort 8766
 ```
 
 停止时必须使用与启动一致的数据目录和端口：
 
 ```powershell
-.\scripts\start.ps1 -DataDirectory $DataDirectory -BackendPort 8765 -Stop
+.\scripts\start-configured.ps1 -DataDirectory $DataDirectory -BackendPort 8765 -Stop
 ```
 
 也可以在启动窗口按 `Ctrl+C`。不要按进程名结束全部 Python、Node 或 Hermes 进程。
