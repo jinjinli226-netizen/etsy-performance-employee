@@ -10,6 +10,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 START = ROOT / "scripts" / "start.ps1"
+CONFIGURED_START = ROOT / "scripts" / "start-configured.ps1"
 START_ENV = ROOT / "scripts" / "start-environment.ps1"
 CLEAN_E2E = ROOT / "scripts" / "clean-e2e-data.ps1"
 README = ROOT / "README.md"
@@ -47,6 +48,22 @@ def test_production_start_script_parses_and_uses_bounded_owned_processes() -> No
         check=False,
     )
     assert parsed.returncode == 0, parsed.stdout + parsed.stderr
+
+
+def test_configured_start_sets_verified_non_secret_runtime_and_delegates() -> None:
+    script = read(CONFIGURED_START)
+
+    assert '$env:ETSY_EMPLOYEE_MODEL_ENGINE = "codex"' in script
+    assert '$env:ETSY_EMPLOYEE_CODEX_MODEL = $ModelId' in script
+    assert '$env:ETSY_EMPLOYEE_ROW_WORKERS = "3"' in script
+    assert '$env:ETSY_EMPLOYEE_HERMES_MAX_TURNS = "30"' in script
+    assert '$env:ETSY_EMPLOYEE_EXCEL_WORKER_TIMEOUT_SECONDS = "3600"' in script
+    assert "start.ps1" in script
+    for forwarded in (
+        "DataDirectory", "BackendPort", "FrontendPort", "HermesExecutable", "HermesHome"
+    ):
+        assert forwarded in script
+    assert "[switch]$Stop" in script
 
     script = read(START)
     environment_script = read(START_ENV)
@@ -290,7 +307,7 @@ def test_e2e_cleanup_is_manifest_scoped_and_scripts_parse() -> None:
     powershell = shutil.which("pwsh") or shutil.which("powershell")
     if powershell is None:
         pytest.skip("PowerShell is not available")
-    for path in (START, START_ENV, CLEAN_E2E):
+    for path in (START, CONFIGURED_START, START_ENV, CLEAN_E2E):
         result = subprocess.run(
             [powershell, "-NoProfile", "-NonInteractive", "-Command", f"$e=$null; [void][System.Management.Automation.Language.Parser]::ParseFile('{path}', [ref]$null, [ref]$e); if($e.Count){{exit 1}}"],
             check=False,
