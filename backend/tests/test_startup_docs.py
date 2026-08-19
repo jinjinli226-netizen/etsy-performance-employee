@@ -14,6 +14,7 @@ START_ENV = ROOT / "scripts" / "start-environment.ps1"
 CLEAN_E2E = ROOT / "scripts" / "clean-e2e-data.ps1"
 README = ROOT / "README.md"
 RUNBOOK = ROOT / "docs" / "operations" / "mvp-runbook.md"
+MIGRATION_GUIDE = ROOT / "docs" / "operations" / "网站与数字员工部署迁移指南.md"
 VITE_CONFIG = ROOT / "frontend" / "vite.config.ts"
 UV_LOCK = ROOT / "backend" / "uv.lock"
 
@@ -197,7 +198,7 @@ def test_chinese_readme_documents_truthful_setup_start_stop_and_storage() -> Non
         "五个",
         "不会自动发布",
         "uv sync --extra dev --frozen",
-        "生产激活未完成",
+        "生产路径已经激活",
     ):
         assert required in document
 
@@ -227,10 +228,33 @@ def test_runbook_covers_recovery_migration_capacity_and_known_limits() -> None:
         "excel-jobs",
         "migration-packages",
         "限制",
-        "生产激活未完成",
+        "生产路径已激活",
         "logged out",
         "RunModelCheck",
         "RunDoctor",
+    ):
+        assert required in document
+
+
+def test_migration_guide_covers_code_data_credentials_import_and_acceptance() -> None:
+    document = read(MIGRATION_GUIDE)
+    assert "\ufffd" not in document
+    for required in (
+        "git bundle create",
+        "package-employee.ps1",
+        "data-full",
+        "migration-capability",
+        "dry_run=true",
+        "dry_run=false",
+        "credential_status=pending",
+        "provision-employee.ps1",
+        "verify-employee.ps1 -RunModelCheck -RunDoctor",
+        "hermes -p etsy-performance-us auth add openai-codex --type oauth",
+        "codex login status",
+        "ETSY_EMPLOYEE_MODEL_ENGINE",
+        "ETSY_EMPLOYEE_ROW_WORKERS",
+        "不发布残缺工作簿",
+        "不是公网网站",
     ):
         assert required in document
 

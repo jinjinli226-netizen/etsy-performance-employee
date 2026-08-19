@@ -15,15 +15,16 @@
 ## 环境要求
 
 - Windows 10/11 与 Windows PowerShell 5.1 或 PowerShell 7；
-- Python 3.11（`py -3.11` 可用）；
+- Python 3.11（`py -3.11` 可用）与 `uv`；
 - Node.js 24、pnpm 11；
 - 已安装 Hermes CLI 0.18.2；
+- 已安装并登录 Codex CLI（用于 Excel 图片识别与 Listing 生成）；
 - 独立 Profile `etsy-performance-us` 已通过 `scripts\verify-employee.ps1` 校验。
 
 全新电脑先创建员工 Profile；脚本不会覆盖同名旧员工：
 
 ```powershell
-.\scripts\provision-employee.ps1 -Provider openai-codex -ModelId gpt-5.6-sol
+.\scripts\provision-employee.ps1 -Provider openai-codex -ModelId gpt-5.4
 ```
 
 如果校验提示旧 Profile 的员工资产或清单与当前版本不一致，不要强行覆盖。先停止应用并完整备份该 Profile，再由维护人员迁移或把旧目录整体移出后重新 provision；业务对话与知识仍应随显式 `DataDirectory` 单独备份/迁移。
@@ -44,6 +45,7 @@ Set-Location ..
 
 ```powershell
 hermes -p etsy-performance-us auth add openai-codex --type oauth
+codex login
 ```
 
 启动脚本只做只读 Profile 与凭据就绪检查，不会自动认证，也不会打印凭据。
@@ -53,6 +55,9 @@ hermes -p etsy-performance-us auth add openai-codex --type oauth
 在项目根目录运行：
 
 ```powershell
+$env:ETSY_EMPLOYEE_MODEL_ENGINE = 'codex'
+$env:ETSY_EMPLOYEE_CODEX_MODEL = 'gpt-5.4'
+$env:ETSY_EMPLOYEE_ROW_WORKERS = '3'
 .\scripts\start.ps1
 ```
 
@@ -76,7 +81,7 @@ hermes -p etsy-performance-us auth add openai-codex --type oauth
 .\scripts\start.ps1 -Stop -DataDirectory "D:\EtsyEmployeeData"
 ```
 
-完整的故障恢复、任务重试、备份和迁移步骤见 [运维手册](docs/operations/mvp-runbook.md)。
+完整的故障恢复与任务重试见 [运维手册](docs/operations/mvp-runbook.md)；换电脑或重新部署请按 [网站与数字员工部署迁移指南](docs/operations/网站与数字员工部署迁移指南.md) 执行。
 
 ## 开发与验证
 
@@ -98,8 +103,8 @@ pnpm build
 
 ## 当前发布状态
 
-软件与假 Hermes 的自动化验收已经完成；**生产激活未完成**。本机只读检查显示现有 `etsy-performance-us` Profile 的旧 provisioning manifest 与当前员工资产不一致，且 `openai-codex` 仍为 `logged out`，因此不能声称 `PROFILE_READY`，也没有运行真实模型或写入用户工作簿。
+截至 2026-08-19，本机生产路径已经激活并通过真实工作簿验收：22 个有图商品行全部生成，五字段完整，描述为 5 段 emoji 卖点；员工 Profile 校验通过。生成任务采用有限并发和瞬时错误补跑，任一有图商品行最终失败时不会发布残缺工作簿。
 
-正式启用前必须：先停止程序并备份旧 Profile 和 DataDirectory；迁移或移出旧 Profile 后重新 provision；在可见终端执行 `hermes -p etsy-performance-us auth add openai-codex --type oauth`；再运行 `verify-employee.ps1 -RunModelCheck -RunDoctor`；最后仅对真实表格的副本做验收，确认结果后再交由负责人审核。不要对 Downloads 中的原文件直接运行生成任务。
+迁移到新电脑时仍必须重新创建 Profile、重新登录 Hermes/Codex，并运行 `verify-employee.ps1 -RunModelCheck -RunDoctor`。只对真实表格的副本做验收，不修改源文件。
 
 第一版使用本机单用户 SQLite，不包含 Etsy 自动发布、在线多用户部署、后台浏览器采集、AI 图片生成、宏工作簿（`.xlsm`）、旧版 `.xls`、移动端原生应用或无人审核的自动知识升级。Excel 单文件上限为 50 MB；原创保护是启发式相似度护栏，不能替代人工审核或法律判断。迁移包不包含模型凭据。
