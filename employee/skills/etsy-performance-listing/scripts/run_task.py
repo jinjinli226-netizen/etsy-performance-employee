@@ -52,6 +52,10 @@ ROW_ATTEMPTS = 3
 _RETRYABLE_ROW_ERRORS = {
     "employee_timeout", "employee_process_failed", "employee_unavailable",
 }
+_PARALLEL_RECOVERY_ROW_ERRORS = _RETRYABLE_ROW_ERRORS | {
+    "malformed_visual_json", "invalid_visual_context",
+    "malformed_model_json", "invalid_model_output", "originality_failed",
+}
 _KNOWLEDGE_ROOT_FIELDS = {"schema_version", "export_id", "issuer", "records", "content_sha256"}
 _GUARD_ROOT_FIELDS = {"schema_version", "export_id", "issuer", "threshold", "records", "content_sha256"}
 _KNOWLEDGE_ITEM_FIELDS = {"id", "status", "approved", "abstract", "content_sha256"}
@@ -133,7 +137,7 @@ def _model_command(*, image_path: Path | None = None) -> list[str]:
 def _row_worker_count() -> int:
     configured = os.environ.get("ETSY_EMPLOYEE_ROW_WORKERS", "").strip()
     if not configured:
-        return 3 if os.environ.get("ETSY_EMPLOYEE_MODEL_ENGINE", "hermes").strip().casefold() == "codex" else 1
+        return 2 if os.environ.get("ETSY_EMPLOYEE_MODEL_ENGINE", "hermes").strip().casefold() == "codex" else 1
     try:
         workers = int(configured)
     except ValueError as exc:
@@ -883,12 +887,13 @@ def run_task(
             row: dict[str, Any],
             *,
             attempts: int = ROW_ATTEMPTS,
+            retryable_errors: set[str] = _RETRYABLE_ROW_ERRORS,
         ) -> tuple[dict[str, Any], dict[str, Any]]:
             for attempt in range(attempts):
                 try:
                     return generate_row(row)
                 except TaskError as exc:
-                    if attempt + 1 == attempts or exc.code not in _RETRYABLE_ROW_ERRORS:
+                    if attempt + 1 == attempts or exc.code not in retryable_errors:
                         raise
             raise TaskError("employee_process_failed", "The employee process failed.")
 
@@ -949,11 +954,15 @@ def run_task(
                         continue
                     record_success(row, visual, generated)
             for row, first_error in recovery:
-                if first_error.code not in _RETRYABLE_ROW_ERRORS:
+                if first_error.code not in _PARALLEL_RECOVERY_ROW_ERRORS:
                     record_failure(row, first_error)
                     continue
                 try:
-                    visual, generated = generate_row_with_retry(row, attempts=ROW_ATTEMPTS - 1)
+                    visual, generated = generate_row_with_retry(
+                        row,
+                        attempts=ROW_ATTEMPTS - 1,
+                        retryable_errors=_PARALLEL_RECOVERY_ROW_ERRORS,
+                    )
                 except TaskError as exc:
                     record_failure(row, exc)
                     continue

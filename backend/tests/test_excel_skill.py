@@ -1083,6 +1083,48 @@ def test_parallel_row_recovery_uses_remaining_transient_retry_budget(
     assert output["Products"]["E5"].value and output["Products"]["E6"].value
 
 
+def test_parallel_row_recovery_retries_exhausted_model_output_errors(
+    tmp_path: Path, excel_modules, monkeypatch
+) -> None:
+    _, _, _, run = excel_modules
+    monkeypatch.setenv("ETSY_EMPLOYEE_MODEL_ENGINE", "hermes")
+    monkeypatch.setenv("ETSY_EMPLOYEE_ROW_WORKERS", "2")
+    source = make_book(
+        tmp_path / "parallel-model-output-recovery.xlsx",
+        rows=(("SKU-1", "Blue costume", 10, "ready"), ("SKU-2", "Red costume", 12, "ready")),
+        image_rows=(5, 6),
+    )
+    first_row_visual_calls = 0
+    first_row_listing_calls = 0
+
+    def runner(command: list[str], prompt: str) -> subprocess.CompletedProcess[str]:
+        nonlocal first_row_visual_calls, first_row_listing_calls
+        if "SKU-1" in prompt:
+            if "--image" in command:
+                first_row_visual_calls += 1
+                return subprocess.CompletedProcess(command, 0, json.dumps(valid_visual_context()), "")
+            first_row_listing_calls += 1
+            output = "not json" if first_row_listing_calls < 3 else json.dumps(valid_result())
+            return subprocess.CompletedProcess(command, 0, output, "")
+        if "--image" in command:
+            return subprocess.CompletedProcess(command, 0, json.dumps(valid_visual_context()), "")
+        return subprocess.CompletedProcess(command, 0, json.dumps(valid_result()), "")
+
+    report = run.run_task(
+        source,
+        tmp_path / "parallel-model-output-recovery-job",
+        knowledge_path=None,
+        rules={"rule_version": "rules-v1"},
+        command_runner=runner,
+        emit=lambda _event: None,
+    )
+
+    assert first_row_visual_calls == 2
+    assert first_row_listing_calls == 3
+    output = load_workbook(report["output_path"])
+    assert output["Products"]["E5"].value and output["Products"]["E6"].value
+
+
 def test_codex_engine_uses_http_only_route_and_preserves_visual_contract(
     tmp_path: Path, excel_modules, monkeypatch
 ) -> None:
