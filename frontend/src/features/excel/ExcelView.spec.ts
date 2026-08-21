@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { excelApi, safeDownloadFilename, type ExcelApi, type ExcelJob, type ExcelJobEvent } from "../../api/excel";
 import ExcelView from "../../views/ExcelView.vue";
-import { createExcelStore } from "./excel.store";
+import { createExcelStore, validateExcelFile } from "./excel.store";
 
 const now = "2026-08-13T08:00:00Z";
 const makeJob = (status: ExcelJob["status"] = "queued", overrides: Partial<ExcelJob> = {}): ExcelJob => ({
@@ -106,6 +106,12 @@ const chooseFile = async (wrapper: VueWrapper, file: File) => {
   await flushPromises();
 };
 
+const sizedFile = (size: number, name = "products.xlsx") => {
+  const file = new File(["x"], name, { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+  Object.defineProperty(file, "size", { value: size, configurable: true });
+  return file;
+};
+
 beforeEach(() => {
   localStorage.clear();
   vi.stubGlobal("URL", {
@@ -123,9 +129,16 @@ afterEach(() => {
 });
 
 describe("Excel automation workspace", () => {
+  it("accepts the 50.68 MiB production workbook and caps uploads at 200 MiB", () => {
+    expect(validateExcelFile(sizedFile(53_142_485))).toBeNull();
+    expect(validateExcelFile(sizedFile(200 * 1024 * 1024))).toBeNull();
+    expect(validateExcelFile(sizedFile(200 * 1024 * 1024 + 1))).toBe("too_large");
+  });
+
   it("accepts only a real-sized .xlsx selection and never asks for header configuration", async () => {
     const { wrapper, api } = await render();
     expect(wrapper.text()).toContain("员工会自动识别表头");
+    expect(wrapper.text()).toContain("最大 200 MB");
     expect(wrapper.text()).not.toMatch(/配置表头|选择列|映射字段/);
     expect(wrapper.get('[data-testid="excel-file-input"]').attributes("accept")).toBe(".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
 
@@ -133,7 +146,7 @@ describe("Excel automation workspace", () => {
       new File(["x"], "bad.xlsm", { type: "application/vnd.ms-excel.sheet.macroEnabled.12" }),
       new File(["x"], "bad.xls"),
       new File(["x"], "bad.csv", { type: "text/csv" }),
-      new File([new Uint8Array(50 * 1024 * 1024 + 1)], "large.xlsx"),
+      sizedFile(200 * 1024 * 1024 + 1, "large.xlsx"),
     ]) {
       await chooseFile(wrapper, file);
       expect(api.uploads).toHaveLength(0);

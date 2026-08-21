@@ -270,6 +270,12 @@ def test_inspection_finds_moved_headers_isolates_rows_and_filters_internal_field
     assert "Costume style" in {field["header"] for field in semantic_manifest["rows"][0]["candidate_fields"]}
 
 
+def test_workbook_inspector_uses_the_same_200_mib_upload_cap(excel_modules) -> None:
+    inspect, _, _, _ = excel_modules
+
+    assert inspect.MAX_FILE_BYTES == 200 * 1024 * 1024
+
+
 def test_tracked_fixture_contains_instruction_two_products_and_two_images(tmp_path: Path, excel_modules) -> None:
     inspect, _, _, _ = excel_modules
     source = copy_fixture(tmp_path)

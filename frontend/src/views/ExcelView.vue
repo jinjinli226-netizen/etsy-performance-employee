@@ -27,7 +27,7 @@ const errorCopy: Record<HttpErrorCode | "capacity" | "unsupported" | "empty" | "
   capacity: "知识库容量需要先处理，当前无法开始新的生成任务。",
   unsupported: "仅支持 .xlsx 文件，不支持 .xlsm、.xls 或 .csv。",
   empty: "这个工作簿是空文件，请重新选择。",
-  too_large: "工作簿超过 50 MB，请缩小文件后重试。",
+  too_large: "工作簿超过 200 MB，请缩小文件后重试。",
 };
 const errorMessage = computed(() => store.errorCode ? errorCopy[store.errorCode] : "");
 

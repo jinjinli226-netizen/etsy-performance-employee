@@ -6,7 +6,7 @@ import { HttpError, type HttpErrorCode } from "../../api/client";
 const CURRENT_KEY = "etsy-excel-current-job";
 const TERMINAL = new Set<ExcelJobStatus>(["needs_review", "completed", "failed", "cancelled"]);
 const ACTIVE = new Set<ExcelJobStatus>(["queued", "running"]);
-const MAX_UPLOAD_BYTES = 50 * 1024 * 1024;
+const MAX_UPLOAD_BYTES = 200 * 1024 * 1024;
 const MISSING_IMAGE_WARNING = "已跳过：缺少商品图片";
 const SAFE_ROW_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 
