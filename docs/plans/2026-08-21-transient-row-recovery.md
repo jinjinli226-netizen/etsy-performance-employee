@@ -83,3 +83,28 @@ Skip every non-visible worksheet while counting fixed output headers in `validat
 **Step 4: Verify and rerun the real workbook**
 
 Run the artifact tests and full backend suite, then resubmit the preserved source and require a completed job with a validated downloadable artifact.
+
+### Task 5: Recover exhausted model-response errors after parallel generation
+
+**Files:**
+- Modify: `backend/tests/test_excel_skill.py`
+- Modify: `employee/skills/etsy-performance-listing/scripts/run_task.py`
+- Modify: `scripts/start-configured.ps1`
+
+**Step 1: Write the failing test**
+
+Simulate one parallel row whose visual call succeeds but whose two Listing calls return malformed output. A later serial whole-row attempt returns valid output. Require a complete workbook.
+
+**Step 2: Run test to verify it fails**
+
+Run: `python -m pytest backend/tests/test_excel_skill.py::test_parallel_row_recovery_retries_exhausted_model_output_errors -q`
+
+Expected: FAIL with `rows_failed` because exhausted model output errors are not currently in the parallel recovery set.
+
+**Step 3: Write minimal implementation**
+
+Add a parallel-only recovery set containing the existing transient process errors plus exhausted visual JSON, Listing JSON, schema, and originality errors. Do not add deterministic image or workbook errors. Set configured production row workers to two.
+
+**Step 4: Verify and rerun**
+
+Run the Excel skill tests and full backend suite, restart with two workers, and require the real workbook to reach 100% with a downloadable artifact.
