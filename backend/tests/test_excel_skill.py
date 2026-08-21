@@ -356,6 +356,19 @@ def test_inspection_rejects_ambiguous_sheet_and_non_xlsx(tmp_path: Path, excel_m
     assert raised.value.code == "unsupported_workbook_type"
 
 
+def test_inspection_ignores_hidden_candidate_sheets(tmp_path: Path, excel_modules) -> None:
+    inspect, _, _, _ = excel_modules
+    path = make_book(tmp_path / "one-visible-sheet.xlsx", second_candidate=True)
+    workbook = load_workbook(path)
+    workbook["Also Products"].sheet_state = "hidden"
+    workbook.save(path)
+    workbook.close()
+
+    manifest = inspect.inspect_workbook(path, tmp_path / "operation")
+
+    assert manifest["sheet"] == "Products"
+
+
 def test_inspection_rejects_zero_products_and_oversized_candidate_input(tmp_path: Path, excel_modules) -> None:
     inspect, _, _, _ = excel_modules
     empty = make_book(tmp_path / "empty.xlsx", rows=())

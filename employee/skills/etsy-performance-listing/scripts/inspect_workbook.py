@@ -247,6 +247,8 @@ def _locate_header(wb) -> tuple[Any, int, dict[str, int]]:
     for ws in wb.worksheets:
         if ws.max_row > MAX_ROWS or ws.max_column > MAX_COLUMNS:
             raise WorkbookError("worksheet_dimensions_exceeded", "A worksheet exceeds safe dimension limits.", details={"sheet": ws.title})
+        if ws.sheet_state != "visible":
+            continue
         for row_no in range(1, ws.max_row + 1):
             positions: dict[str, list[int]] = {header: [] for header in OUTPUT_HEADERS}
             for cell in ws[row_no]:
