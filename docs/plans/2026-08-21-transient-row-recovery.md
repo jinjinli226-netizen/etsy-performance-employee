@@ -59,3 +59,27 @@ Restart the configured local environment, confirm ports 8766 and 5174, then resu
 **Step 3: Commit and push**
 
 Commit only the recovery, tests, documentation, and synchronized profile-manifest changes; push the active branch to the configured GitHub remote.
+
+### Task 4: Align final artifact validation with visible-sheet selection
+
+**Files:**
+- Modify: `backend/tests/test_excel_jobs_api.py`
+- Modify: `backend/app/excel_jobs/storage.py`
+
+**Step 1: Write the failing test**
+
+Create an otherwise valid artifact containing a hidden copy of the product worksheet. Verify that the hidden duplicate headers do not invalidate the artifact.
+
+**Step 2: Run test to verify it fails**
+
+Run: `python -m pytest backend/tests/test_excel_jobs_api.py::test_artifact_contract_ignores_hidden_duplicate_headers -q`
+
+Expected: FAIL because the current validator counts all worksheets.
+
+**Step 3: Write minimal implementation**
+
+Skip every non-visible worksheet while counting fixed output headers in `validate_artifact`. Keep the existing exact-one check across visible worksheets.
+
+**Step 4: Verify and rerun the real workbook**
+
+Run the artifact tests and full backend suite, then resubmit the preserved source and require a completed job with a validated downloadable artifact.
