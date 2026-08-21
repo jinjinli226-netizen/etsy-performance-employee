@@ -48,7 +48,7 @@ _RULE_FIELDS = {
     "description_emoji_sections",
 }
 MAX_ROW_WORKERS = 4
-ROW_ATTEMPTS = 2
+ROW_ATTEMPTS = 3
 _RETRYABLE_ROW_ERRORS = {
     "employee_timeout", "employee_process_failed", "employee_unavailable",
 }
@@ -879,12 +879,16 @@ def run_task(
             )
             return visual, generated
 
-        def generate_row_with_retry(row: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
-            for attempt in range(ROW_ATTEMPTS):
+        def generate_row_with_retry(
+            row: dict[str, Any],
+            *,
+            attempts: int = ROW_ATTEMPTS,
+        ) -> tuple[dict[str, Any], dict[str, Any]]:
+            for attempt in range(attempts):
                 try:
                     return generate_row(row)
                 except TaskError as exc:
-                    if attempt + 1 == ROW_ATTEMPTS or exc.code not in _RETRYABLE_ROW_ERRORS:
+                    if attempt + 1 == attempts or exc.code not in _RETRYABLE_ROW_ERRORS:
                         raise
             raise TaskError("employee_process_failed", "The employee process failed.")
 
@@ -949,7 +953,7 @@ def run_task(
                     record_failure(row, first_error)
                     continue
                 try:
-                    visual, generated = generate_row(row)
+                    visual, generated = generate_row_with_retry(row, attempts=ROW_ATTEMPTS - 1)
                 except TaskError as exc:
                     record_failure(row, exc)
                     continue

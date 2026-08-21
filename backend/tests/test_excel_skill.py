@@ -1045,6 +1045,44 @@ def test_parallel_row_recovery_waits_until_the_parallel_batch_drains(
     assert output["Products"]["E5"].value and output["Products"]["E6"].value
 
 
+def test_parallel_row_recovery_uses_remaining_transient_retry_budget(
+    tmp_path: Path, excel_modules, monkeypatch
+) -> None:
+    _, _, _, run = excel_modules
+    monkeypatch.setenv("ETSY_EMPLOYEE_MODEL_ENGINE", "hermes")
+    monkeypatch.setenv("ETSY_EMPLOYEE_ROW_WORKERS", "2")
+    source = make_book(
+        tmp_path / "parallel-third-attempt.xlsx",
+        rows=(("SKU-1", "Blue costume", 10, "ready"), ("SKU-2", "Red costume", 12, "ready")),
+        image_rows=(5, 6),
+    )
+    first_row_attempts = 0
+
+    def runner(command: list[str], prompt: str) -> subprocess.CompletedProcess[str]:
+        nonlocal first_row_attempts
+        if "--image" in command and "SKU-1" in prompt:
+            first_row_attempts += 1
+            if first_row_attempts < 3:
+                raise OSError("synthetic transient model failure")
+            return subprocess.CompletedProcess(command, 0, json.dumps(valid_visual_context()), "")
+        if "--image" in command:
+            return subprocess.CompletedProcess(command, 0, json.dumps(valid_visual_context()), "")
+        return subprocess.CompletedProcess(command, 0, json.dumps(valid_result()), "")
+
+    report = run.run_task(
+        source,
+        tmp_path / "parallel-third-attempt-job",
+        knowledge_path=None,
+        rules={"rule_version": "rules-v1"},
+        command_runner=runner,
+        emit=lambda _event: None,
+    )
+
+    assert first_row_attempts == 3
+    output = load_workbook(report["output_path"])
+    assert output["Products"]["E5"].value and output["Products"]["E6"].value
+
+
 def test_codex_engine_uses_http_only_route_and_preserves_visual_contract(
     tmp_path: Path, excel_modules, monkeypatch
 ) -> None:
