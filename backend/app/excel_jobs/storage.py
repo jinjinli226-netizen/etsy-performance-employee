@@ -293,6 +293,8 @@ def validate_artifact(path: Path, *, operation_dir: Path, source_path: Path, sou
     counts = {header: 0 for header in OUTPUT_HEADERS}
     try:
         for worksheet in workbook.worksheets:
+            if worksheet.sheet_state != "visible":
+                continue
             # Some valid Excel/WPS exports retain a stale ``A1`` dimension even
             # though the worksheet XML contains the full table. Read-only mode
             # otherwise trusts that hint and silently skips the output headers.

@@ -744,6 +744,30 @@ def test_artifact_contract_scans_workbook_with_stale_dimension(tmp_path) -> None
     assert size == artifact.stat().st_size
 
 
+def test_artifact_contract_ignores_hidden_duplicate_headers(tmp_path) -> None:
+    source = tmp_path / "source.xlsx"
+    operation = tmp_path / "operation"
+    operation.mkdir()
+    artifact = operation / "generated.xlsx"
+    shutil.copyfile(FIXTURE, source)
+    shutil.copyfile(FIXTURE, artifact)
+    workbook = load_workbook(artifact)
+    hidden = workbook.copy_worksheet(workbook.active)
+    hidden.title = "Archived Template"
+    hidden.sheet_state = "hidden"
+    workbook.save(artifact)
+
+    digest, size = excel_storage.validate_artifact(
+        artifact,
+        operation_dir=operation,
+        source_path=source,
+        source_sha256=sha256(source),
+    )
+
+    assert digest == sha256(artifact)
+    assert size == artifact.stat().st_size
+
+
 def test_unknown_job_and_invalid_pagination_are_rejected(api) -> None:
     client, _, _, _ = api
     assert client.get("/api/excel-jobs/not-a-uuid").status_code == 422
