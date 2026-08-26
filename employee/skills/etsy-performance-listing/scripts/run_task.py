@@ -48,9 +48,9 @@ _RULE_FIELDS = {
     "description_emoji_sections", "specification_template_version",
 }
 MAX_ROW_WORKERS = 4
-ROW_ATTEMPTS = 3
+ROW_ATTEMPTS = 5
 _RETRYABLE_ROW_ERRORS = {
-    "employee_timeout", "employee_process_failed", "employee_unavailable",
+    "employee_timeout", "employee_process_failed", "employee_unavailable", "image_unusable",
 }
 _PARALLEL_RECOVERY_ROW_ERRORS = _RETRYABLE_ROW_ERRORS | {
     "malformed_visual_json", "invalid_visual_context",

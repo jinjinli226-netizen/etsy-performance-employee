@@ -108,3 +108,24 @@ Add a parallel-only recovery set containing the existing transient process error
 **Step 4: Verify and rerun**
 
 Run the Excel skill tests and full backend suite, restart with two workers, and require the real workbook to reach 100% with a downloadable artifact.
+
+### Task 6: Keep long Excel streams connected and extend bounded row recovery
+
+**Files:**
+- Create: `frontend/src/api/excel.spec.ts`
+- Modify: `frontend/src/api/client.ts`
+- Modify: `frontend/src/api/excel.ts`
+- Modify: `backend/tests/test_excel_skill.py`
+- Modify: `employee/skills/etsy-performance-listing/scripts/run_task.py`
+
+**Step 1: Add failing regressions**
+
+Assert that the Excel event stream does not create a 190-second absolute timer. Add row tests for a transient `image_unusable` result and a row that succeeds on its fifth whole-row attempt.
+
+**Step 2: Implement the bounded fix**
+
+Allow an event stream to opt out of the client timer and use that option only for Excel jobs. Raise the total row attempt budget from three to five and treat model `image_unusable` as retryable; preserve the final failure and no-partial-artifact behavior after the budget is exhausted.
+
+**Step 3: Perform real acceptance**
+
+Restart the configured services and resubmit the exact 50,132,885-byte source workbook. Require 100%, download through the LAN proxy, match the artifact SHA-256, validate every generated row, confirm that only the five target columns changed, and confirm all embedded images and worksheet states remain intact.

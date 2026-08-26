@@ -1078,6 +1078,37 @@ def test_run_task_retries_a_transient_row_failure_before_skipping(
     assert load_workbook(report["output_path"])["Products"]["E5"].value
 
 
+def test_run_task_retries_a_transient_unusable_visual_result(
+    tmp_path: Path, excel_modules, monkeypatch
+) -> None:
+    _, _, _, run = excel_modules
+    monkeypatch.setenv("ETSY_EMPLOYEE_MODEL_ENGINE", "hermes")
+    monkeypatch.setenv("ETSY_EMPLOYEE_ROW_WORKERS", "1")
+    source = make_book(tmp_path / "retry-unusable-visual.xlsx")
+    image_attempts = 0
+
+    def runner(command: list[str], prompt: str) -> subprocess.CompletedProcess[str]:
+        nonlocal image_attempts
+        if "--image" in command:
+            image_attempts += 1
+            visual = valid_visual_context()
+            visual["image_usable"] = image_attempts > 1
+            return subprocess.CompletedProcess(command, 0, json.dumps(visual), "")
+        return subprocess.CompletedProcess(command, 0, json.dumps(valid_result()), "")
+
+    report = run.run_task(
+        source,
+        tmp_path / "retry-unusable-visual-job",
+        knowledge_path=None,
+        rules={"rule_version": "rules-v1"},
+        command_runner=runner,
+        emit=lambda _event: None,
+    )
+
+    assert image_attempts == 2
+    assert load_workbook(report["output_path"])["Products"]["E5"].value
+
+
 def test_parallel_row_recovery_waits_until_the_parallel_batch_drains(
     tmp_path: Path, excel_modules, monkeypatch
 ) -> None:
@@ -1156,6 +1187,44 @@ def test_parallel_row_recovery_uses_remaining_transient_retry_budget(
     )
 
     assert first_row_attempts == 3
+    output = load_workbook(report["output_path"])
+    assert output["Products"]["E5"].value and output["Products"]["E6"].value
+
+
+def test_parallel_row_recovery_uses_extended_transient_retry_budget(
+    tmp_path: Path, excel_modules, monkeypatch
+) -> None:
+    _, _, _, run = excel_modules
+    monkeypatch.setenv("ETSY_EMPLOYEE_MODEL_ENGINE", "hermes")
+    monkeypatch.setenv("ETSY_EMPLOYEE_ROW_WORKERS", "2")
+    source = make_book(
+        tmp_path / "parallel-fifth-attempt.xlsx",
+        rows=(("SKU-1", "Blue costume", 10, "ready"), ("SKU-2", "Red costume", 12, "ready")),
+        image_rows=(5, 6),
+    )
+    first_row_attempts = 0
+
+    def runner(command: list[str], prompt: str) -> subprocess.CompletedProcess[str]:
+        nonlocal first_row_attempts
+        if "--image" in command and "SKU-1" in prompt:
+            first_row_attempts += 1
+            if first_row_attempts < 5:
+                raise OSError("synthetic extended transient model failure")
+            return subprocess.CompletedProcess(command, 0, json.dumps(valid_visual_context()), "")
+        if "--image" in command:
+            return subprocess.CompletedProcess(command, 0, json.dumps(valid_visual_context()), "")
+        return subprocess.CompletedProcess(command, 0, json.dumps(valid_result()), "")
+
+    report = run.run_task(
+        source,
+        tmp_path / "parallel-fifth-attempt-job",
+        knowledge_path=None,
+        rules={"rule_version": "rules-v1"},
+        command_runner=runner,
+        emit=lambda _event: None,
+    )
+
+    assert first_row_attempts == 5
     output = load_workbook(report["output_path"])
     assert output["Products"]["E5"].value and output["Products"]["E6"].value
 
@@ -1332,7 +1401,7 @@ def test_run_task_rejects_unusable_image_before_listing_generation(
     source = make_book(tmp_path / "unusable-image.xlsx")
     visual = valid_visual_context()
     visual["image_usable"] = False
-    fake = FakeHermes([], visual_outputs=[json.dumps(visual)])
+    fake = FakeHermes([], visual_outputs=[json.dumps(visual)] * 5)
     events: list[dict[str, object]] = []
 
     with pytest.raises(run.TaskError) as raised:
@@ -1346,7 +1415,7 @@ def test_run_task_rejects_unusable_image_before_listing_generation(
         )
 
     assert raised.value.code == "image_unusable"
-    assert len(fake.calls) == 1 and listing_calls(fake) == []
+    assert len(fake.calls) == 5 and listing_calls(fake) == []
     assert [event["event"] for event in events][-2:] == ["row_failed", "failed"]
     assert not list((tmp_path / "job-unusable-image").glob("*.xlsx"))
 

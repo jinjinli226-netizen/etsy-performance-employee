@@ -47,13 +47,13 @@ const responseError = async (response: Response) => {
   return new HttpError(code, response.status);
 };
 
-const withTimeout = (external: AbortSignal | undefined, timeoutMs: number) => {
+const withTimeout = (external: AbortSignal | undefined, timeoutMs: number | null) => {
   const controller = new AbortController();
   let timedOut = false;
   const abort = () => controller.abort(external?.reason);
   external?.addEventListener("abort", abort, { once: true });
   if (external?.aborted) abort();
-  const timer = window.setTimeout(() => {
+  const timer = timeoutMs === null ? null : window.setTimeout(() => {
     timedOut = true;
     controller.abort();
   }, timeoutMs);
@@ -61,7 +61,7 @@ const withTimeout = (external: AbortSignal | undefined, timeoutMs: number) => {
     signal: controller.signal,
     timedOut: () => timedOut,
     dispose: () => {
-      window.clearTimeout(timer);
+      if (timer !== null) window.clearTimeout(timer);
       external?.removeEventListener("abort", abort);
     },
   };
@@ -118,10 +118,10 @@ export const openEventStream = async (
     lastEventId?: number;
     onEvent: (data: unknown, eventId: number) => void;
     signal: AbortSignal;
-    timeoutMs?: number;
+    timeoutMs?: number | null;
   },
 ) => {
-  const timeout = withTimeout(options.signal, options.timeoutMs ?? 190_000);
+  const timeout = withTimeout(options.signal, options.timeoutMs === undefined ? 190_000 : options.timeoutMs);
   const headers = new Headers({ Accept: "text/event-stream" });
   if (options.lastEventId) headers.set("Last-Event-ID", String(options.lastEventId));
   try {

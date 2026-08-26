@@ -110,6 +110,7 @@ export const excelApi: ExcelApi = {
   getJob: (id, signal) => apiRequest<ExcelJob>(`/excel-jobs/${safeJobId(id)}`, { signal }),
   streamJob: (id, options) => openEventStream(`/excel-jobs/${safeJobId(id)}/events`, {
     ...options,
+    timeoutMs: null,
     onEvent: (value, eventId) => {
       if (!value || typeof value !== "object") return;
       const event = value as Record<string, unknown>;
