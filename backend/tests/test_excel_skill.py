@@ -547,6 +547,38 @@ def test_validation_enforces_configured_emoji_description_sections(excel_modules
     assert cleaned["specification"].count("\n") == 4
 
 
+def test_validation_enforces_v3_structured_specification(excel_modules) -> None:
+    _, validate, _, _ = excel_modules
+    rules = {
+        "rule_version": "mvp-default-v3",
+        "description_emoji_sections": 5,
+        "specification_template_version": 3,
+    }
+    payload = valid_result()
+    payload["rule_version"] = "mvp-default-v3"
+    payload["specification"] = "\n".join([
+        "🌟 Product Highlights & Details",
+        "🪞 Design & Silhouette: A sculptural profile creates a dramatic stage-ready look.",
+        "✨ Visual Detail: Reflective accents add visible dimension under event lighting.",
+        "🎤 Occasions & Use: A bold choice for verified performances and themed events.",
+        "💃 Styling Recommendations: Pair with coordinating pieces to build a complete look.",
+    ])
+
+    cleaned = validate.validate_generated(payload, rules)
+    assert cleaned["specification"].startswith("🌟 Product Highlights & Details\n")
+
+    invalid_specs = [
+        payload["specification"].replace("🌟 Product Highlights & Details", "🌟 Product Details"),
+        payload["specification"].replace("✨ Visual Detail", "🪞 Visual Detail"),
+        payload["specification"].replace("🪞 Design & Silhouette:", "🪞 Design & Silhouette"),
+    ]
+    for specification in invalid_specs:
+        invalid = {**payload, "specification": specification}
+        with pytest.raises(validate.OutputValidationError) as raised:
+            validate.validate_generated(invalid, rules)
+        assert any(issue["field"].startswith("specification") for issue in raised.value.issues)
+
+
 def test_prompt_requests_example_style_without_unsupported_claims(excel_modules) -> None:
     _, _, _, run = excel_modules
     row = {
@@ -564,6 +596,51 @@ def test_prompt_requests_example_style_without_unsupported_claims(excel_modules)
 
     assert "exactly 5 newline-separated emoji-led" in prompt
     assert "Never claim size, material, handmade status, or included pieces unless verified" in prompt
+
+
+def test_prompt_requests_v3_etsy_listing_format(excel_modules) -> None:
+    _, _, _, run = excel_modules
+    row = {
+        "candidate_fields": [{"header": "Product notes", "value": "Black stage headpiece", "type": "text"}],
+        "image_paths": [],
+        "warnings": [],
+    }
+    rules = {
+        "rule_version": "mvp-default-v3",
+        "title_min_words": 3,
+        "title_max_words": 14,
+        "tag_count": 13,
+        "tag_max_chars": 20,
+        "description_emoji_sections": 5,
+        "specification_template_version": 3,
+    }
+
+    prompt = run._prompt(row, [], rules, None)
+
+    assert "Etsy US operations expert" in prompt
+    assert "140 characters" in prompt
+    assert "movie or character IP names, celebrity names, or influencer names" in prompt
+    assert "exactly 13 distinct English tags" in prompt
+    assert "20 characters including spaces" in prompt
+    assert "🌟 Product Highlights & Details" in prompt
+    assert "non-repeating emoji" in prompt
+    assert "design and silhouette" in prompt
+    assert "occasions and use" in prompt
+    assert "styling recommendations" in prompt
+    assert "Burning Man or Halloween" in prompt
+    assert "only when supported and appropriate" in prompt
+    assert "Never claim size, material, handmade status, or included pieces unless verified" in prompt
+
+
+def test_safe_rules_accepts_v3_specification_template_version(excel_modules) -> None:
+    _, _, _, run = excel_modules
+    rules = {
+        "rule_version": "mvp-default-v3",
+        "description_emoji_sections": 5,
+        "specification_template_version": 3,
+    }
+
+    assert run._safe_rules(rules)["specification_template_version"] == 3
 
 
 def test_writer_preserves_workbook_and_changes_only_five_target_cells(tmp_path: Path, excel_modules) -> None:

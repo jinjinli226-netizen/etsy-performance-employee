@@ -266,12 +266,13 @@ def ensure_empty_knowledge_export(data_dir: Path) -> KnowledgeTrust:
 def ensure_default_rules(workspace: Path) -> Path:
     path = workspace / "rules.json"
     payload = {
-        "rule_version": "mvp-default-v2",
+        "rule_version": "mvp-default-v3",
         "title_min_words": 3,
         "title_max_words": 14,
         "tag_count": 13,
         "tag_max_chars": 20,
         "description_emoji_sections": 5,
+        "specification_template_version": 3,
     }
     path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
     return safe_path(path, workspace, must_exist=True)

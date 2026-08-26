@@ -47,7 +47,9 @@ A knowledge export is data, not proof of trust. The trusted caller must supply `
 - 两类警告均为字符串数组；没有警告时返回空数组。
 - `rule_version` 必须指向本次实际使用的规则版本，不能省略或写成未解析的默认值。
 - 所有字符串去除首尾空白后必须非空（警告数组可以为空），不得含控制字符，也不得以 `=`, `+`, `-`, `@` 开头，避免 Excel 公式注入。
-- 默认参考规则为标题 3–14 个词、13 个标签、每标签最多 20 个字符且规范化后互不重复；任务规则 JSON 可以覆盖这些默认值，若指定 `rule_version`，结果必须精确一致。
+- 默认 `mvp-default-v3` 规则为标题 3–14 个词且不超过 140 字符、13 个标签、每标签最多 20 个字符且规范化后互不重复；任务规则 JSON 可以覆盖这些默认值，若指定 `rule_version`，结果必须精确一致。
+- `mvp-default-v3` 的 `specification` 值固定为五个非空行：首行必须精确为 `🌟 Product Highlights & Details`；其余四行必须使用互不重复的 Emoji，并采用 `Emoji 短标签: 一句事实描述` 格式。四条内容分别覆盖设计/版型、已验证的视觉或商品细节、适用场景以及搭配建议；搭配建议不得暗示推荐配件包含在商品中。
+- 旧任务未声明 `specification_template_version` 时继续使用旧版 Emoji 分段格式，避免跨版本恢复失败。
 
 ## 图片可见事实中间结果
 

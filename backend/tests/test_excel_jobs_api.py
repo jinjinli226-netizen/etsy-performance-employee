@@ -100,6 +100,20 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def test_default_rules_use_listing_prompt_v3(tmp_path: Path) -> None:
+    rules_path = excel_storage.ensure_default_rules(tmp_path)
+
+    assert json.loads(rules_path.read_text(encoding="utf-8")) == {
+        "rule_version": "mvp-default-v3",
+        "title_min_words": 3,
+        "title_max_words": 14,
+        "tag_count": 13,
+        "tag_max_chars": 20,
+        "description_emoji_sections": 5,
+        "specification_template_version": 3,
+    }
+
+
 @pytest.fixture
 def api(tmp_path):
     runner = FakeExcelRunner()

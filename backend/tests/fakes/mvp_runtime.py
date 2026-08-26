@@ -28,6 +28,21 @@ def listing_for_prompt(prompt: str) -> dict[str, object]:
     fields = {field["header"]: str(field["value"]) for field in context["candidate_fields"]}
     sku = fields.get("SKU", "Costume")
     color = "Blue" if sku.endswith("001") else "Red"
+    specification_lines = [
+        f"🎭 Stage Style: {color} performance costume for SKU {sku}.",
+        "✨ Sequin Detail: Visible sequins create a light-catching finish.",
+        "💃 Fitted Shape: The fitted one-piece silhouette supports dance styling.",
+        "🎨 Clear Color: The verified color is stated without adding material claims.",
+        "📏 Buyer Check: Review the supplied measurements before ordering.",
+    ]
+    if envelope["rules"].get("specification_template_version") == 3:
+        specification_lines = [
+            "🌟 Product Highlights & Details",
+            f"🎭 Design & Silhouette: The fitted one-piece profile gives SKU {sku} a stage-ready look.",
+            "✨ Visual Detail: Visible sequins create a light-catching finish.",
+            "🎤 Occasions & Use: The costume is suited to verified dance and stage settings.",
+            "💃 Styling Recommendations: Pair with coordinating footwear for an optional complete look.",
+        ]
     return {
         "head_titles": f"{color} Sequin Stage Dance Costume",
         "tags": [
@@ -35,13 +50,7 @@ def listing_for_prompt(prompt: str) -> dict[str, object]:
             "performance wear", "dancewear", "recital costume", "stage costume",
             "competition wear", "show costume", "costume outfit", "dancer gift", "theater costume",
         ],
-        "specification": "\n".join([
-            f"🎭 Stage Style: {color} performance costume for SKU {sku}.",
-            "✨ Sequin Detail: Visible sequins create a light-catching finish.",
-            "💃 Fitted Shape: The fitted one-piece silhouette supports dance styling.",
-            "🎨 Clear Color: The verified color is stated without adding material claims.",
-            "📏 Buyer Check: Review the supplied measurements before ordering.",
-        ]),
+        "specification": "\n".join(specification_lines),
         "category": "Costumes",
         "instructions_for_buyers": "Review the supplied measurements before ordering.",
         "confidence": 0.93,

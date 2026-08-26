@@ -30,7 +30,8 @@ DEFAULT_RULES = {
 }
 _CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _WARNING_URL = re.compile(r"(?:https?://|www\.)", re.IGNORECASE)
-_EMOJI_PREFIX = re.compile(r"^[\u2600-\u27bf\U0001f300-\U0001faff](?:\ufe0f)?\s")
+_EMOJI_PREFIX = re.compile(r"^([\u2600-\u27bf\U0001f300-\U0001faff](?:\ufe0f)?)\s")
+_SPECIFICATION_HEADING = "🌟 Product Highlights & Details"
 _FORMULA_PREFIX = ("=", "+", "-", "@")
 EXCEL_CELL_MAX_CHARS = 32_767
 MAX_TITLE_CHARS = 140
@@ -112,6 +113,9 @@ def validate_generated(payload: Any, rules: dict[str, Any] | None = None) -> dic
     description_sections = None
     if "description_emoji_sections" in active_rules:
         description_sections = _positive_int(active_rules, "description_emoji_sections", 5, issues)
+    specification_template_version = active_rules.get("specification_template_version")
+    if specification_template_version is not None:
+        specification_template_version = _positive_int(active_rules, "specification_template_version", 1, issues)
     if title_min > title_max:
         issues.append({"field": "rules", "message": "title_min_words must not exceed title_max_words"})
 
@@ -146,6 +150,24 @@ def validate_generated(payload: Any, rules: dict[str, Any] | None = None) -> dic
         for index, section in enumerate(sections):
             if not _EMOJI_PREFIX.match(section):
                 issues.append({"field": f"specification[{index}]", "message": "must begin with an emoji followed by a space"})
+        if specification_template_version == 3 and sections:
+            if sections[0] != _SPECIFICATION_HEADING:
+                issues.append({"field": "specification[0]", "message": f"must equal {_SPECIFICATION_HEADING!r}"})
+            emojis: list[str] = []
+            for index, section in enumerate(sections):
+                match = _EMOJI_PREFIX.match(section)
+                if match:
+                    emojis.append(match.group(1))
+                if index > 0:
+                    content = section[match.end():] if match else section
+                    label, separator, sentence = content.partition(":")
+                    if not separator or not label.strip() or not sentence.strip():
+                        issues.append({
+                            "field": f"specification[{index}]",
+                            "message": "must contain a short label, a colon, and one sentence",
+                        })
+            if len(emojis) != len(set(emojis)):
+                issues.append({"field": "specification", "message": "must use non-repeating emoji"})
 
     cleaned: dict[str, Any] = {
         "head_titles": title,
