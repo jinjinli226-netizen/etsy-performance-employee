@@ -90,7 +90,7 @@ README 顶部新增“交给 Codex 一键配置”章节，要求 Codex：
 - `ETSY_EMPLOYEE_CODEX_MODEL=gpt-5.4`
 - `ETSY_EMPLOYEE_ROW_WORKERS=3`
 - `ETSY_EMPLOYEE_HERMES_MAX_TURNS=30`
-- `ETSY_EMPLOYEE_EXCEL_WORKER_TIMEOUT_SECONDS=3600`
+- `ETSY_EMPLOYEE_EXCEL_WORKER_TIMEOUT_SECONDS=4800`
 
 参数包括 DataDirectory、BackendPort、FrontendPort、HermesExecutable、HermesHome 和 `Stop`，均透传给 `start.ps1`。启动与停止必须使用同一组 DataDirectory 和端口。
 

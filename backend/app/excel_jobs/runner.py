@@ -105,7 +105,7 @@ class SubprocessExcelRunner:
         repository_root: Path,
         max_event_bytes: int,
         cancel_timeout_seconds: float,
-        worker_timeout_seconds: float = 900,
+        worker_timeout_seconds: float = 4800,
     ) -> None:
         self.repository_root = repository_root.resolve()
         self.max_event_bytes = max_event_bytes

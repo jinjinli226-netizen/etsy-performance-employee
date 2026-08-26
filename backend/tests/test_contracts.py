@@ -34,7 +34,7 @@ def test_settings_default_database_is_inside_configured_data_directory(tmp_path)
 def test_excel_batch_timeout_allows_image_enriched_workbooks() -> None:
     settings = Settings()
 
-    assert settings.excel_worker_timeout_seconds >= 3600
+    assert settings.excel_worker_timeout_seconds == 80 * 60
 
 
 def test_excel_upload_default_allows_large_product_workbooks() -> None:

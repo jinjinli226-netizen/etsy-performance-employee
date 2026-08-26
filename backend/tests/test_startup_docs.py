@@ -59,7 +59,7 @@ def test_configured_start_sets_verified_non_secret_runtime_and_delegates() -> No
     assert '$env:ETSY_EMPLOYEE_CODEX_MODEL = $ModelId' in script
     assert '$env:ETSY_EMPLOYEE_ROW_WORKERS = "2"' in script
     assert '$env:ETSY_EMPLOYEE_HERMES_MAX_TURNS = "30"' in script
-    assert '$env:ETSY_EMPLOYEE_EXCEL_WORKER_TIMEOUT_SECONDS = "3600"' in script
+    assert '$env:ETSY_EMPLOYEE_EXCEL_WORKER_TIMEOUT_SECONDS = "4800"' in script
     assert "start.ps1" in script
     for forwarded in (
         "DataDirectory", "BackendPort", "FrontendPort", "HermesExecutable", "HermesHome"

@@ -1090,6 +1090,16 @@ def _runner_request(tmp_path: Path, public_id: str) -> RunnerRequest:
     )
 
 
+def test_subprocess_runner_default_timeout_is_eighty_minutes(tmp_path) -> None:
+    runner = SubprocessExcelRunner(
+        repository_root=tmp_path,
+        max_event_bytes=1024,
+        cancel_timeout_seconds=0.5,
+    )
+
+    assert runner.worker_timeout_seconds == 80 * 60
+
+
 def test_subprocess_runner_stderr_limit_terminates_blocked_worker_promptly(tmp_path, monkeypatch) -> None:
     script = "import sys,time;sys.stderr.write('x'*200000);sys.stderr.flush();time.sleep(30)"
     monkeypatch.setattr(
