@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { FileSpreadsheet, Upload } from "lucide-vue-next";
+import { FilePlus2, FileSpreadsheet, Upload } from "lucide-vue-next";
 import { ref } from "vue";
 
-const props = defineProps<{ uploading: boolean }>();
+const props = withDefaults(defineProps<{ uploading: boolean; compact?: boolean }>(), { compact: false });
 const emit = defineEmits<{ select: [file: File] }>();
 const input = ref<HTMLInputElement | null>(null);
 const button = ref<HTMLButtonElement | null>(null);
@@ -24,7 +24,7 @@ defineExpose({ focus: () => button.value?.focus(), openPicker: open });
 <template>
   <div
     class="excel-dropzone"
-    :class="{ 'is-dragging': dragging, 'is-uploading': uploading }"
+    :class="{ 'is-compact': compact, 'is-dragging': dragging, 'is-uploading': uploading }"
     @dragenter.prevent="dragging = true"
     @dragover.prevent="dragging = true"
     @dragleave.prevent="dragging = false"
@@ -32,19 +32,25 @@ defineExpose({ focus: () => button.value?.focus(), openPicker: open });
   >
     <button
       ref="button"
-      data-testid="excel-dropzone"
+      :data-testid="compact ? 'new-excel-job' : 'excel-dropzone'"
       class="excel-dropzone__target"
       type="button"
       :disabled="uploading"
-      aria-describedby="excel-upload-help"
+      :aria-describedby="compact ? undefined : 'excel-upload-help'"
       @click="open"
     >
-      <span class="excel-dropzone__icon" aria-hidden="true"><FileSpreadsheet :size="27" /></span>
-      <span class="excel-dropzone__copy">
-        <strong>{{ uploading ? "正在交给数字员工" : "上传商品工作簿" }}</strong>
-        <span>拖入文件，或按回车选择</span>
-      </span>
-      <span class="excel-dropzone__action"><Upload :size="16" aria-hidden="true" />选择 .xlsx</span>
+      <template v-if="compact">
+        <FilePlus2 :size="17" aria-hidden="true" />
+        <span>{{ uploading ? "正在创建任务…" : "新建 Listing 任务" }}</span>
+      </template>
+      <template v-else>
+        <span class="excel-dropzone__icon" aria-hidden="true"><FileSpreadsheet :size="27" /></span>
+        <span class="excel-dropzone__copy">
+          <strong>{{ uploading ? "正在交给数字员工" : "上传商品工作簿" }}</strong>
+          <span>拖入文件，或按回车选择</span>
+        </span>
+        <span class="excel-dropzone__action"><Upload :size="16" aria-hidden="true" />选择 .xlsx</span>
+      </template>
     </button>
     <input
       ref="input"
@@ -55,9 +61,9 @@ defineExpose({ focus: () => button.value?.focus(), openPicker: open });
       :disabled="uploading"
       @change="receive(($event.target as HTMLInputElement).files)"
     />
-    <p id="excel-upload-help">仅支持 .xlsx，最大 200 MB。原文件不会被覆盖，员工会自动识别表头。</p>
-    <button data-testid="excel-upload-button" class="sr-only" type="button" :disabled="uploading" @click="open">选择工作簿</button>
-    <div v-if="dragging" class="excel-dropzone__overlay" aria-hidden="true">松开即可上传</div>
+    <p v-if="!compact" id="excel-upload-help">仅支持 .xlsx，最大 200 MB。原文件不会被覆盖，员工会自动识别表头。</p>
+    <button v-if="!compact" data-testid="excel-upload-button" class="sr-only" type="button" :disabled="uploading" @click="open">选择工作簿</button>
+    <div v-if="dragging && !compact" class="excel-dropzone__overlay" aria-hidden="true">松开即可上传</div>
   </div>
 </template>
 
@@ -72,5 +78,9 @@ defineExpose({ focus: () => button.value?.focus(), openPicker: open });
 .excel-dropzone__action { display: inline-flex; min-height: 40px; align-items: center; gap: 8px; padding: 0 14px; border: 1px solid var(--border-strong); border-radius: var(--ds-radius-control); background: var(--surface-raised); font-size: 13px; }
 .excel-dropzone > p { margin: 11px 0 20px; color: var(--text-muted); font-size: 12px; }
 .excel-dropzone__overlay { position: absolute; z-index: 2; inset: 0 0 20px; display: grid; place-items: center; border: 1px solid var(--accent); border-radius: var(--ds-radius-frame); background: rgba(8, 9, 11, .92); color: var(--accent); font-size: 16px; font-weight: 600; pointer-events: none; }
+.excel-dropzone.is-compact { border: 0; }
+.excel-dropzone.is-compact .excel-dropzone__target { display: inline-flex; width: auto; min-height: 44px; align-items: center; gap: 8px; padding: 0 14px; border: 1px solid rgba(255, 122, 26, .55); border-radius: var(--ds-radius-control); background: rgba(255, 122, 26, .08); color: var(--text); font-size: 13px; font-weight: 600; white-space: nowrap; }
+.excel-dropzone.is-compact .excel-dropzone__target:hover { border-color: var(--accent); background: rgba(255, 122, 26, .14); }
+.excel-dropzone.is-compact .excel-dropzone__target:disabled { opacity: .56; cursor: wait; }
 @media (max-width: 640px) { .excel-dropzone__target { min-height: 260px; grid-template-columns: 1fr; justify-items: center; gap: 14px; padding: 28px 18px; text-align: center; } .excel-dropzone__action { min-height: 44px; } }
 </style>

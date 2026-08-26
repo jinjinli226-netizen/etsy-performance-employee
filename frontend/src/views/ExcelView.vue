@@ -11,8 +11,6 @@ import { defaultExcelStore, type ExcelStore } from "../features/excel/excel.stor
 const props = withDefaults(defineProps<{ store?: ExcelStore }>(), { store: () => defaultExcelStore });
 const store = props.store;
 const dropzone = ref<InstanceType<typeof ExcelDropzone> | null>(null);
-const anotherDropzone = ref<InstanceType<typeof ExcelDropzone> | null>(null);
-const another = ref<HTMLDetailsElement | null>(null);
 const alertRef = ref<HTMLElement | null>(null);
 const liveRef = ref<HTMLElement | null>(null);
 const errorCopy: Record<HttpErrorCode | "capacity" | "unsupported" | "empty" | "too_large", string> = {
@@ -41,9 +39,8 @@ const upload = async (file: File) => {
 const retry = async () => { await store.retryCurrent(); await nextTick(); liveRef.value?.focus(); };
 const download = async () => { await store.downloadCurrent(); await nextTick(); liveRef.value?.focus(); };
 const reselect = async () => {
-  if (another.value) another.value.open = true;
   await nextTick();
-  anotherDropzone.value?.openPicker();
+  dropzone.value?.openPicker();
 };
 
 onMounted(() => { if (!store.jobs.length && !store.loading) void store.initialize(); });
@@ -58,7 +55,14 @@ onMounted(() => { if (!store.jobs.length && !store.loading) void store.initializ
           <h2 id="excel-title">生成 Listing 表格</h2>
           <p>交给数字员工逐行处理，只补齐固定 Listing 字段并输出一份新文件。</p>
         </div>
-        <FileSpreadsheet :size="23" aria-hidden="true" />
+        <ExcelDropzone
+          v-if="store.currentJob"
+          ref="dropzone"
+          compact
+          :uploading="store.uploading"
+          @select="upload"
+        />
+        <FileSpreadsheet v-else :size="23" aria-hidden="true" />
       </header>
 
       <div v-if="errorMessage" ref="alertRef" class="excel-workspace__notice" role="alert" tabindex="-1">
@@ -83,10 +87,6 @@ onMounted(() => { if (!store.jobs.length && !store.loading) void store.initializ
           @retry="retry"
           @reselect="reselect"
         />
-        <details ref="another" class="excel-workspace__another">
-          <summary>上传另一个工作簿</summary>
-          <ExcelDropzone ref="anotherDropzone" :uploading="store.uploading" @select="upload" />
-        </details>
       </template>
     </div>
 
@@ -111,9 +111,7 @@ onMounted(() => { if (!store.jobs.length && !store.loading) void store.initializ
 .excel-workspace__notice { display: flex; min-height: 44px; align-items: center; gap: 9px; margin-top: 16px; padding: 8px 11px; border: 1px solid rgba(240, 180, 77, .34); border-radius: var(--ds-radius-control); background: rgba(240, 180, 77, .06); color: var(--warning); font-size: 12px; }
 .excel-workspace__notice span { min-width: 0; }.excel-workspace__notice button { min-width: 44px; min-height: 44px; margin-left: auto; border: 0; background: transparent; color: var(--text-secondary); cursor: pointer; }
 .excel-workspace__loading { display: grid; min-height: 280px; place-items: center; color: var(--text-muted); }
-.excel-workspace__another { margin-top: 28px; padding-top: 16px; border-top: 1px solid var(--border); }
-.excel-workspace__another summary { min-height: 44px; color: var(--text-secondary); font-size: 12px; cursor: pointer; }
-.excel-workspace__another :deep(.excel-dropzone__target) { min-height: 160px; }.excel-workspace__another :deep(.excel-dropzone) { padding-top: 12px; }
+.excel-workspace__intro :deep(.excel-dropzone.is-compact) { flex: 0 0 auto; }
 @media (max-width: 840px) { .excel-workspace { grid-template-columns: 1fr; }.excel-workspace__main { min-height: auto; grid-row: 2; } }
-@media (max-width: 640px) { .excel-workspace { overflow-x: clip; }.excel-workspace__main { min-width: 0; padding: 20px 14px 26px; overflow-x: clip; }.excel-workspace h2 { font-size: 20px; }.excel-workspace__intro { padding-bottom: 18px; } }
+@media (max-width: 640px) { .excel-workspace { overflow-x: clip; }.excel-workspace__main { min-width: 0; padding: 20px 14px 26px; overflow-x: clip; }.excel-workspace h2 { font-size: 20px; }.excel-workspace__intro { flex-wrap: wrap; padding-bottom: 18px; }.excel-workspace__intro > div { min-width: 0; flex: 1 1 240px; } }
 </style>

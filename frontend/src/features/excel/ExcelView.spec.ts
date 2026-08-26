@@ -173,6 +173,46 @@ describe("Excel automation workspace", () => {
     expect(api.uploads).toHaveLength(1);
   });
 
+  it("keeps a visible new-task entry above history and selects the uploaded job", async () => {
+    const api = new FakeExcelApi();
+    api.jobs = [makeJob("completed", { source_filename: "old-costume.xlsx" })];
+    const { wrapper, store } = await render(api);
+
+    expect(wrapper.get('[data-testid="new-excel-job"]').text()).toContain("新建 Listing 任务");
+    expect(wrapper.text()).not.toContain("上传另一个工作簿");
+
+    await chooseFile(wrapper, new File(["PK"], "new-costume.xlsx", {
+      type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    }));
+
+    expect(api.uploads).toHaveLength(1);
+    expect(store.currentJob?.source_filename).toBe("new-costume.xlsx");
+    expect(wrapper.text()).toContain("new-costume.xlsx");
+  });
+
+  it("disables the visible new-task entry while a workbook is being accepted", async () => {
+    const api = new FakeExcelApi();
+    api.jobs = [makeJob("running")];
+    let release!: () => void;
+    api.uploadGate = new Promise<void>((resolve) => { release = resolve; });
+    const { wrapper } = await render(api);
+    const input = wrapper.get<HTMLInputElement>('[data-testid="excel-file-input"]');
+    Object.defineProperty(input.element, "files", {
+      value: [new File(["PK"], "next.xlsx")],
+      configurable: true,
+    });
+
+    await input.trigger("change");
+    await nextTick();
+
+    const entry = wrapper.get('[data-testid="new-excel-job"]');
+    expect(entry.attributes("disabled")).toBeDefined();
+    expect(entry.text()).toContain("正在创建任务");
+
+    release();
+    await flushPromises();
+  });
+
   it.each([
     ["queued", "排队中"],
     ["running", "生成中"],
@@ -389,7 +429,7 @@ describe("Excel automation workspace", () => {
     const pickerSpy = vi.spyOn(HTMLInputElement.prototype, "click").mockImplementation(() => undefined);
     await refreshed.wrapper.get('[data-testid="reselect-job"]').trigger("click");
     await nextTick();
-    expect(refreshed.wrapper.get("details").attributes("open")).toBeDefined();
+    expect(refreshed.wrapper.get('[data-testid="new-excel-job"]').text()).toContain("新建 Listing 任务");
     expect(pickerSpy).toHaveBeenCalledOnce();
   });
 
