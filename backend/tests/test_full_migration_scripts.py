@@ -179,7 +179,7 @@ def test_manifest_validation_passes_then_rejects_tampering(tmp_path: Path) -> No
     valid = run_powershell(command)
     assert valid.returncode == 0, valid.stdout + valid.stderr
 
-    data_file.write_text("tampered", encoding="utf-8")
+    data_file.write_text("evil", encoding="utf-8")
     invalid = run_powershell(command)
     assert invalid.returncode != 0
     assert "hash" in (invalid.stdout + invalid.stderr).casefold()
@@ -200,4 +200,3 @@ def test_restore_target_must_be_missing_or_empty(tmp_path: Path) -> None:
     occupied = run_powershell(command)
     assert occupied.returncode != 0
     assert "DataDirectory must be empty" in occupied.stdout + occupied.stderr
-
