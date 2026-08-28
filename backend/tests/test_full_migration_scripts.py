@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -125,6 +126,15 @@ def test_full_restore_verifies_before_copy_and_uses_official_login() -> None:
     ):
         assert required in script
     assert "relay" not in script.casefold()
+
+
+def test_powershell_script_delegates_do_not_read_a_stale_native_exit_code() -> None:
+    export_script = read(EXPORT_FULL)
+    restore_script = read(RESTORE_FULL)
+    assert "& $configuredStart" in export_script
+    assert re.search(r"& \$configuredStart[^\n]*\nif \(\$LASTEXITCODE", export_script) is None
+    assert "& $bootstrap @arguments" in restore_script
+    assert re.search(r"& \$bootstrap @arguments[^\n]*\nif \(\$LASTEXITCODE", restore_script) is None
 
 
 def test_inventory_uses_canonical_relative_paths_and_sha256(tmp_path: Path) -> None:

@@ -131,7 +131,6 @@ if ($freeBytes -lt ($sourceBytes + $safetyBytes)) {
 
 Assert-NoActiveExcelJobs -Port $BackendPort
 & $configuredStart -DataDirectory $dataRoot -BackendPort $BackendPort -FrontendPort $FrontendPort -Stop
-if ($LASTEXITCODE -ne 0) { throw "Verified service shutdown failed." }
 
 $partial = Join-Path $parent ((Split-Path -Leaf $target) + ".partial-" + [Guid]::NewGuid().ToString("N"))
 $createdPartial = $false

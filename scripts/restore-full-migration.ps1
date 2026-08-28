@@ -66,7 +66,6 @@ if ($NonInteractive) { $arguments.NonInteractive = $true }
 if ($Start) { $arguments.Start = $true }
 
 & $bootstrap @arguments
-if ($LASTEXITCODE -ne 0) { throw "Official account bootstrap failed." }
 
 Write-Host "Full migration restore completed and destination hashes match."
 Write-Host "DataDirectory: $target"
