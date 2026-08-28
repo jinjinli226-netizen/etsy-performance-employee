@@ -2,7 +2,7 @@
 
 > 用途：在新电脑上把本仓库中的 Etsy 表演服数字员工完整配置到 HermesAgent，并启用图片 + Excel Listing 生成。
 >
-> 当前验证组合：Windows 10/11、Python 3.11、Hermes CLI 0.18.2、Codex CLI、模型 `gpt-5.4`。
+> 当前验证组合：Windows 10/11、Python 3.11、Hermes CLI 0.18.2、Codex CLI、模型 `gpt-5.6-sol`。
 
 ## 1. GitHub 中已经包含什么
 
@@ -88,7 +88,7 @@ Test-Path -LiteralPath $ProfilePath
 ```powershell
 .\scripts\provision-employee.ps1 `
   -Provider openai-codex `
-  -ModelId gpt-5.4 `
+  -ModelId gpt-5.6-sol `
   -ReasoningEffort high
 ```
 
@@ -146,8 +146,8 @@ codex login status
 
 ```powershell
 $env:ETSY_EMPLOYEE_MODEL_ENGINE = 'codex'
-$env:ETSY_EMPLOYEE_CODEX_MODEL = 'gpt-5.4'
-$env:ETSY_EMPLOYEE_ROW_WORKERS = '3'
+$env:ETSY_EMPLOYEE_CODEX_MODEL = 'gpt-5.6-sol'
+$env:ETSY_EMPLOYEE_ROW_WORKERS = '2'
 $env:ETSY_EMPLOYEE_HERMES_MAX_TURNS = '30'
 $env:ETSY_EMPLOYEE_EXCEL_WORKER_TIMEOUT_SECONDS = '4800'
 ```
@@ -157,8 +157,8 @@ $env:ETSY_EMPLOYEE_EXCEL_WORKER_TIMEOUT_SECONDS = '4800'
 | 变量 | 当前值 | 用途 |
 | --- | --- | --- |
 | `ETSY_EMPLOYEE_MODEL_ENGINE` | `codex` | Excel 生成使用 Codex CLI |
-| `ETSY_EMPLOYEE_CODEX_MODEL` | `gpt-5.4` | 图片事实提取和 Listing 生成模型 |
-| `ETSY_EMPLOYEE_ROW_WORKERS` | `3` | 最多同时处理 3 个商品行 |
+| `ETSY_EMPLOYEE_CODEX_MODEL` | `gpt-5.6-sol` | 图片事实提取和 Listing 生成模型 |
+| `ETSY_EMPLOYEE_ROW_WORKERS` | `2` | 最多同时处理 2 个商品行，降低大表并发压力 |
 | `ETSY_EMPLOYEE_HERMES_MAX_TURNS` | `30` | 网站训练/对话最大轮次 |
 | `ETSY_EMPLOYEE_EXCEL_WORKER_TIMEOUT_SECONDS` | `4800` | 单个 Excel 作业最长 80 分钟 |
 

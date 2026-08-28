@@ -2,6 +2,38 @@
 
 这是一个仅在本机运行的 Etsy 表演服工作台：通过长期对话训练独立的 Hermes 员工，并把 `.xlsx` 工作簿交给员工处理。员工按产品行原创生成并填写固定的五个 Listing 字段，系统另存结果，不覆盖源文件。
 
+## 换电脑：直接把本 README 交给 Codex
+
+本项目已经提供完整迁移脚本。它会保留训练知识、训练原图、对话、附件、历史 Excel、生成结果、审批记录和原创保护数据；不会携带旧电脑的中转站、OAuth、API Key、Cookie 或浏览器身份。
+
+源电脑先准备一个空间足够、仅本人可访问的移动硬盘目录。下面的导出会检查活动任务、停止网站、复制完整持久数据、生成 Git Bundle，并对每个文件计算 SHA-256：
+
+```powershell
+Set-Location 'D:\元序AI\etsy-performance-employee'
+.\scripts\export-full-migration.ps1 `
+  -DataDirectory "$env:LOCALAPPDATA\etsy-performance-employee\data" `
+  -OutputDirectory 'E:\EtsyEmployeeFullMigration' `
+  -BackendPort 8766
+```
+
+`OutputDirectory` 必须是一个尚不存在的新目录。导出成功后源电脑网站保持停止，迁移目录中会出现 `repository.bundle`、`data-full`、`migration-manifest.json` 和 `RESTORE-README.md`。
+
+新电脑把整个迁移目录复制过去，先从 Bundle 恢复代码：
+
+```powershell
+git clone 'E:\EtsyEmployeeFullMigration\repository.bundle' 'D:\元序AI\etsy-performance-employee'
+Set-Location 'D:\元序AI\etsy-performance-employee'
+.\scripts\restore-full-migration.ps1 `
+  -PackageDirectory 'E:\EtsyEmployeeFullMigration' `
+  -DataDirectory 'D:\EtsyEmployeeData' `
+  -BackendPort 8766 `
+  -Start
+```
+
+恢复脚本在复制前后都会校验文件清单和 SHA-256。新电脑固定使用 `openai-codex` 与 `gpt-5.6-sol`；Hermes OAuth 和 `codex login` 弹出时，需要你本人登录新的官方账号。模型真实检查未通过时，脚本不会错误地报告迁移完成。
+
+目标电脑的局域网 IP 会变化。端口 `5174` 的局域网转发属于可选的 Windows 管理员操作，不会在恢复时静默开启。完整说明见 [网站与数字员工部署迁移指南](docs/operations/网站与数字员工部署迁移指南.md)。
+
 ## 交给 Codex 一键配置
 
 把本仓库地址交给 Codex，并让它阅读本 README。Codex 在仓库根目录只需运行：
@@ -52,7 +84,7 @@
 全新电脑先创建员工 Profile；脚本不会覆盖同名旧员工：
 
 ```powershell
-.\scripts\provision-employee.ps1 -Provider openai-codex -ModelId gpt-5.4
+.\scripts\provision-employee.ps1 -Provider openai-codex -ModelId gpt-5.6-sol
 ```
 
 如果校验提示旧 Profile 的员工资产或清单与当前版本不一致，不要强行覆盖。先停止应用并完整备份该 Profile，再由维护人员迁移或把旧目录整体移出后重新 provision；业务对话与知识仍应随显式 `DataDirectory` 单独备份/迁移。
@@ -84,8 +116,8 @@ codex login
 
 ```powershell
 $env:ETSY_EMPLOYEE_MODEL_ENGINE = 'codex'
-$env:ETSY_EMPLOYEE_CODEX_MODEL = 'gpt-5.4'
-$env:ETSY_EMPLOYEE_ROW_WORKERS = '3'
+$env:ETSY_EMPLOYEE_CODEX_MODEL = 'gpt-5.6-sol'
+$env:ETSY_EMPLOYEE_ROW_WORKERS = '2'
 .\scripts\start.ps1
 ```
 
@@ -131,7 +163,7 @@ pnpm build
 
 ## 当前发布状态
 
-截至 2026-08-21，本机生产路径已经激活并通过真实 38 行图片工作簿验收：五字段完整，员工 Profile 校验通过。新任务默认使用 `mvp-default-v3`，Specification 固定为 `🌟 Product Highlights & Details` 大标题加 4 条互不重复的 Emoji 卖点，覆盖设计/版型、已验证细节、场景和搭配建议。生成任务采用有限并发和瞬时错误补跑，任一有图商品行最终失败时不会发布残缺工作簿。
+截至 2026-08-28，生产路径支持 200 MB 工作簿、80 分钟批处理、图片与 Listing 联合生成以及完整数据迁移。新任务默认使用 `mvp-default-v3`，Specification 固定为 `🌟 Product Highlights & Details` 大标题加 4 条互不重复的 Emoji 卖点，覆盖设计/版型、已验证细节、场景和搭配建议。生成任务采用有限并发和瞬时错误补跑，任一有图商品行最终失败时不会发布残缺工作簿。
 
 迁移到新电脑时仍必须重新创建 Profile、重新登录 Hermes/Codex，并运行 `verify-employee.ps1 -RunModelCheck -RunDoctor`。只对真实表格的副本做验收，不修改源文件。
 

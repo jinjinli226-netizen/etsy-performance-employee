@@ -274,7 +274,7 @@ def test_chinese_readme_documents_truthful_setup_start_stop_and_storage() -> Non
         "五个",
         "不会自动发布",
         "uv sync --extra dev --frozen",
-        "生产路径已经激活",
+        "生产路径支持",
     ):
         assert required in document
 
@@ -370,7 +370,7 @@ def test_hermes_guide_covers_profile_dual_login_runtime_and_secret_boundaries() 
     for required in (
         "provision-employee.ps1",
         "-Provider openai-codex",
-        "-ModelId gpt-5.4",
+        "-ModelId gpt-5.6-sol",
         "auth add openai-codex --type oauth",
         "codex login status",
         "verify-employee.ps1 -RunModelCheck -RunDoctor",

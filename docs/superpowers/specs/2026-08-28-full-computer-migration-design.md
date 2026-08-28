@@ -81,12 +81,12 @@ The target LAN IP is not copied because it belongs to the target network. The po
 
 ## Bootstrap changes
 
-`scripts/bootstrap-new-machine.ps1` currently hardcodes the older `gpt-5.4` and `openai-codex` path even though the provisioner already supports both official and custom providers. The migration work will:
+Before this work, `scripts/bootstrap-new-machine.ps1` hardcoded the older `gpt-5.4` official-account path even though the provisioner already supported separate custom-provider setup. The migration work will:
 
 - change the official default model to `gpt-5.6-sol`;
 - make provider authentication checks use the selected provider rather than a hardcoded name;
 - keep `openai-codex` as the approved migration default;
-- keep relay/custom-provider support available for future use without putting a secret in command-line arguments, Git, the manifest, or the README;
+- leave separate relay/custom-provider provisioning available for future use without activating it in the full-restore workflow or putting a secret in command-line arguments, Git, the manifest, or the README;
 - treat a failed real model check as a blocking failure even if the website itself returns HTTP 200.
 
 The target described in this design uses official OAuth only. The source relay outage does not block data export, and its settings do not become target defaults.
