@@ -13,6 +13,9 @@ ROOT = Path(__file__).resolve().parents[2]
 START = ROOT / "scripts" / "start.ps1"
 BOOTSTRAP = ROOT / "scripts" / "bootstrap-new-machine.ps1"
 CONFIGURED_START = ROOT / "scripts" / "start-configured.ps1"
+FULL_MIGRATION_MODULE = ROOT / "scripts" / "FullMigration.psm1"
+EXPORT_FULL = ROOT / "scripts" / "export-full-migration.ps1"
+RESTORE_FULL = ROOT / "scripts" / "restore-full-migration.ps1"
 START_ENV = ROOT / "scripts" / "start-environment.ps1"
 CLEAN_E2E = ROOT / "scripts" / "clean-e2e-data.ps1"
 README = ROOT / "README.md"
@@ -79,6 +82,7 @@ def test_codex_bootstrap_is_bounded_idempotent_and_fail_closed() -> None:
         "auth", "add", "openai-codex", "--type", "oauth",
         "login", "status", "start-configured.ps1",
         "NonInteractive", "Test-Path", "LASTEXITCODE",
+        "gpt-5.6-sol",
     ):
         assert required in script
     for forbidden in (
@@ -292,6 +296,9 @@ def test_readme_is_the_single_codex_bootstrap_entrypoint() -> None:
         "/excel",
         "HermesAgent配置指南.md",
         "网站与数字员工部署迁移指南.md",
+        "export-full-migration.ps1",
+        "restore-full-migration.ps1",
+        "gpt-5.6-sol",
     ):
         assert required in document
 
@@ -348,6 +355,11 @@ def test_migration_guide_covers_code_data_credentials_import_and_acceptance() ->
         "ETSY_EMPLOYEE_ROW_WORKERS",
         "不发布残缺工作簿",
         "不是公网网站",
+        "export-full-migration.ps1",
+        "restore-full-migration.ps1",
+        "browser-profile",
+        "新官方账号",
+        "gpt-5.6-sol",
     ):
         assert required in document
 
@@ -382,7 +394,8 @@ def test_e2e_cleanup_is_manifest_scoped_and_scripts_parse() -> None:
     powershell = shutil.which("pwsh") or shutil.which("powershell")
     if powershell is None:
         pytest.skip("PowerShell is not available")
-    for path in (START, BOOTSTRAP, CONFIGURED_START, START_ENV, CLEAN_E2E):
+    for path in (START, BOOTSTRAP, CONFIGURED_START, START_ENV, CLEAN_E2E, EXPORT_FULL, RESTORE_FULL):
+        assert path.is_file()
         result = subprocess.run(
             [powershell, "-NoProfile", "-NonInteractive", "-Command", f"$e=$null; [void][System.Management.Automation.Language.Parser]::ParseFile('{path}', [ref]$null, [ref]$e); if($e.Count){{exit 1}}"],
             check=False,
@@ -393,3 +406,4 @@ def test_e2e_cleanup_is_manifest_scoped_and_scripts_parse() -> None:
     assert "run-" in script and "GetFullPath" in script
     assert "Get-NetTCPConnection" in script
     assert "Remove-Item -LiteralPath $RunDirectory -Recurse -Force" in script
+    assert FULL_MIGRATION_MODULE.is_file()
