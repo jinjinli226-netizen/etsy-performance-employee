@@ -151,7 +151,8 @@ def test_inventory_uses_canonical_relative_paths_and_sha256(tmp_path: Path) -> N
     sample.write_text("evidence", encoding="utf-8")
     command = (
         f"Import-Module '{ps_literal(MODULE)}' -Force; "
-        f"@(Get-MigrationInventory -Root '{ps_literal(root)}') | ConvertTo-Json -Compress"
+        f"$inventory = @(Get-MigrationInventory -Root '{ps_literal(root)}'); "
+        "ConvertTo-Json -InputObject $inventory -Compress"
     )
     result = run_powershell(command)
     assert result.returncode == 0, result.stdout + result.stderr
@@ -163,6 +164,25 @@ def test_inventory_uses_canonical_relative_paths_and_sha256(tmp_path: Path) -> N
             "sha256": sha256(sample),
         }
     ]
+
+
+def test_inventory_emits_one_record_per_file_for_manifest_totals(tmp_path: Path) -> None:
+    root = tmp_path / "data-full"
+    root.mkdir()
+    (root / "one.txt").write_text("one", encoding="utf-8")
+    (root / "two.txt").write_text("two", encoding="utf-8")
+    command = (
+        f"Import-Module '{ps_literal(MODULE)}' -Force; "
+        f"$inventory = @(Get-MigrationInventory -Root '{ps_literal(root)}'); "
+        "$summary = [pscustomobject]@{ "
+        "count = $inventory.Count; "
+        "first_size_type = $inventory[0].size_bytes.GetType().FullName }; "
+        "$summary | ConvertTo-Json -Compress"
+    )
+    result = run_powershell(command)
+    assert result.returncode == 0, result.stdout + result.stderr
+    summary = json.loads(result.stdout)
+    assert summary == {"count": 2, "first_size_type": "System.Int64"}
 
 
 def test_inventory_rejects_forbidden_runtime_and_credentials(tmp_path: Path) -> None:

@@ -119,7 +119,7 @@ function Get-MigrationInventory {
         }
     }
     $sorted = @($results | Sort-Object path)
-    Write-Output -NoEnumerate $sorted
+    Write-Output $sorted
 }
 
 function Get-MigrationCategoryCounts {
