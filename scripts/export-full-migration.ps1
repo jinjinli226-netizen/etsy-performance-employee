@@ -120,7 +120,7 @@ if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($branch)) { throw "Full
 
 $parent = Split-Path -Parent $target
 if (-not (Test-Path -LiteralPath $parent)) { [void](New-Item -ItemType Directory -Path $parent) }
-$parent = Resolve-MigrationLocalPath -Path $parent -MustExist
+$parent = [IO.Path]::GetFullPath($parent)
 $sourceBytes = Get-IncludedSourceBytes -Root $dataRoot
 $safetyBytes = [Math]::Max(1GB, [int64][Math]::Ceiling($sourceBytes * 0.15))
 $driveName = [IO.Path]::GetPathRoot($parent).TrimEnd('\').TrimEnd(':')

@@ -137,6 +137,12 @@ def test_powershell_script_delegates_do_not_read_a_stale_native_exit_code() -> N
     assert re.search(r"& \$bootstrap @arguments[^\n]*\nif \(\$LASTEXITCODE", restore_script) is None
 
 
+def test_full_export_allows_a_dedicated_package_below_a_drive_root() -> None:
+    script = read(EXPORT_FULL)
+    assert "$parent = Resolve-MigrationLocalPath -Path $parent -MustExist" not in script
+    assert "$parent = [IO.Path]::GetFullPath($parent)" in script
+
+
 def test_inventory_uses_canonical_relative_paths_and_sha256(tmp_path: Path) -> None:
     assert MODULE.is_file()
     root = tmp_path / "data-full"
