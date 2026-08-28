@@ -4,7 +4,9 @@ param(
     [ValidateRange(1024, 65535)][int]$BackendPort = 8765,
     [ValidateRange(1024, 65535)][int]$FrontendPort = 5173,
     [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$')]
-    [string]$ModelId = "gpt-5.4",
+    [string]$ModelId = "gpt-5.6-sol",
+    [ValidateSet("openai-codex")]
+    [string]$Provider = "openai-codex",
     [ValidateSet("minimal", "low", "medium", "high", "xhigh", "max", "ultra")]
     [string]$ReasoningEffort = "high",
     [string]$HermesExecutable = "hermes",
@@ -171,7 +173,7 @@ Invoke-Checked -DisplayName "Frontend locked dependency installation" -FilePath 
 $ProfilePath = Join-Path $env:LOCALAPPDATA "hermes\profiles\$ProfileId"
 if (-not (Test-Path -LiteralPath $ProfilePath -PathType Container)) {
     Invoke-PowerShellScriptChecked -DisplayName "Hermes employee provisioning" -ScriptPath $ProvisionScript -Arguments @(
-        "-Provider", "openai-codex",
+        "-Provider", $Provider,
         "-ModelId", $ModelId,
         "-ReasoningEffort", $ReasoningEffort,
         "-HermesCommand", $HermesPath
@@ -179,22 +181,22 @@ if (-not (Test-Path -LiteralPath $ProfilePath -PathType Container)) {
 }
 
 $hermesStatus = Invoke-CapturedStatus -FilePath $HermesPath -Arguments @(
-    "-p", $ProfileId, "auth", "status", "openai-codex"
+    "-p", $ProfileId, "auth", "status", $Provider
 )
 $hermesReady = $hermesStatus.ExitCode -eq 0 -and $hermesStatus.Lines.Count -ge 1 -and
-    $hermesStatus.Lines[0].Trim() -ceq "openai-codex: logged in"
+    $hermesStatus.Lines[0].Trim() -ceq "${Provider}: logged in"
 if (-not $hermesReady) {
     if ($NonInteractive) {
-        throw "Hermes login is required. Run: hermes -p $ProfileId auth add openai-codex --type oauth"
+        throw "Hermes login is required. Run: hermes -p $ProfileId auth add $Provider --type oauth"
     }
     Invoke-Checked -DisplayName "Hermes OAuth login" -FilePath $HermesPath -Arguments @(
-        "-p", $ProfileId, "auth", "add", "openai-codex", "--type", "oauth"
+        "-p", $ProfileId, "auth", "add", $Provider, "--type", "oauth"
     )
     $hermesStatus = Invoke-CapturedStatus -FilePath $HermesPath -Arguments @(
-        "-p", $ProfileId, "auth", "status", "openai-codex"
+        "-p", $ProfileId, "auth", "status", $Provider
     )
     if ($hermesStatus.ExitCode -ne 0 -or $hermesStatus.Lines.Count -lt 1 -or
-        $hermesStatus.Lines[0].Trim() -cne "openai-codex: logged in") {
+        $hermesStatus.Lines[0].Trim() -cne "${Provider}: logged in") {
         throw "Hermes login did not reach the required logged-in state."
     }
 }

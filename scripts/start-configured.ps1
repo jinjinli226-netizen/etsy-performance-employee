@@ -4,7 +4,7 @@ param(
     [ValidateRange(1024, 65535)][int]$BackendPort = 8765,
     [ValidateRange(1024, 65535)][int]$FrontendPort = 5173,
     [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$')]
-    [string]$ModelId = "gpt-5.4",
+    [string]$ModelId = "gpt-5.6-sol",
     [string]$HermesExecutable = "hermes",
     [string]$HermesHome,
     [switch]$Stop
