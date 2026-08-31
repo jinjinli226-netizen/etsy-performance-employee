@@ -61,7 +61,7 @@ defineExpose({ focus: () => button.value?.focus(), openPicker: open });
       :disabled="uploading"
       @change="receive(($event.target as HTMLInputElement).files)"
     />
-    <p v-if="!compact" id="excel-upload-help">仅支持 .xlsx，最大 200 MB。原文件不会被覆盖，员工会自动识别表头。</p>
+    <p v-if="!compact" id="excel-upload-help">仅支持 .xlsx，最大 500 MB。原文件不会被覆盖，员工会自动识别表头。</p>
     <button v-if="!compact" data-testid="excel-upload-button" class="sr-only" type="button" :disabled="uploading" @click="open">选择工作簿</button>
     <div v-if="dragging && !compact" class="excel-dropzone__overlay" aria-hidden="true">松开即可上传</div>
   </div>

@@ -129,16 +129,16 @@ afterEach(() => {
 });
 
 describe("Excel automation workspace", () => {
-  it("accepts the 50.68 MiB production workbook and caps uploads at 200 MiB", () => {
+  it("accepts the production workbook and caps uploads at 500 MiB", () => {
     expect(validateExcelFile(sizedFile(53_142_485))).toBeNull();
-    expect(validateExcelFile(sizedFile(200 * 1024 * 1024))).toBeNull();
-    expect(validateExcelFile(sizedFile(200 * 1024 * 1024 + 1))).toBe("too_large");
+    expect(validateExcelFile(sizedFile(500 * 1024 * 1024))).toBeNull();
+    expect(validateExcelFile(sizedFile(500 * 1024 * 1024 + 1))).toBe("too_large");
   });
 
   it("accepts only a real-sized .xlsx selection and never asks for header configuration", async () => {
     const { wrapper, api } = await render();
     expect(wrapper.text()).toContain("员工会自动识别表头");
-    expect(wrapper.text()).toContain("最大 200 MB");
+    expect(wrapper.text()).toContain("最大 500 MB");
     expect(wrapper.text()).not.toMatch(/配置表头|选择列|映射字段/);
     expect(wrapper.get('[data-testid="excel-file-input"]').attributes("accept")).toBe(".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
 
@@ -146,7 +146,7 @@ describe("Excel automation workspace", () => {
       new File(["x"], "bad.xlsm", { type: "application/vnd.ms-excel.sheet.macroEnabled.12" }),
       new File(["x"], "bad.xls"),
       new File(["x"], "bad.csv", { type: "text/csv" }),
-      sizedFile(200 * 1024 * 1024 + 1, "large.xlsx"),
+      sizedFile(500 * 1024 * 1024 + 1, "large.xlsx"),
     ]) {
       await chooseFile(wrapper, file);
       expect(api.uploads).toHaveLength(0);
@@ -531,7 +531,7 @@ describe("Excel API safety", () => {
       new Response(new Blob([]), { status: 200, headers: { "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" } }),
       new Response(new TextEncoder().encode("not zip"), { status: 200, headers: { "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" } }),
       new Response(new Uint8Array([0x50, 0x4b, 0x03, 0x04]), { status: 200, headers: { "Content-Type": "text/html" } }),
-      new Response(null, { status: 200, headers: { "Content-Length": String(100 * 1024 * 1024 + 1), "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" } }),
+      new Response(null, { status: 200, headers: { "Content-Length": String(500 * 1024 * 1024 + 1), "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" } }),
     ]) {
       vi.stubGlobal("fetch", vi.fn(async () => response));
       await expect(excelApi.downloadJob("11111111-1111-4111-8111-111111111111", "source.xlsx")).rejects.toMatchObject({ code: "server_error" });

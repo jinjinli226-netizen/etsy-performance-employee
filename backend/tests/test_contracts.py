@@ -4,6 +4,7 @@ import pytest
 from pydantic import ValidationError
 
 from app.core.config import Settings
+from app.excel_jobs import storage as excel_storage
 from app.excel_jobs.schemas import GeneratedListingFields, JobStatus
 from app.knowledge.schemas import KnowledgeStatus
 
@@ -40,7 +41,11 @@ def test_excel_batch_timeout_allows_image_enriched_workbooks() -> None:
 def test_excel_upload_default_allows_large_product_workbooks() -> None:
     settings = Settings()
 
-    assert settings.max_excel_upload_bytes == 200 * 1024 * 1024
+    assert settings.max_excel_upload_bytes == 500 * 1024 * 1024
+
+
+def test_excel_archive_safety_budget_can_expand_a_valid_500_mib_workbook() -> None:
+    assert excel_storage.MAX_UNCOMPRESSED_BYTES == 1024 * 1024 * 1024
 
 
 def test_job_status_values_are_stable() -> None:

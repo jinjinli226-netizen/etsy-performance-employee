@@ -32,13 +32,13 @@ describe("excel api event stream", () => {
 });
 
 describe("excel api download", () => {
-  it("accepts a generated workbook between 100 MB and the 200 MB upload limit", async () => {
+  it("accepts a generated workbook below the 500 MB Excel limit", async () => {
     const zipSignature = new Uint8Array([0x50, 0x4b, 0x03, 0x04]);
     vi.stubGlobal("fetch", vi.fn(async () => new Response(zipSignature, {
       status: 200,
       headers: {
         "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        "Content-Length": String(150 * 1024 * 1024),
+        "Content-Length": String(450 * 1024 * 1024),
         "Content-Disposition": 'attachment; filename="result.xlsx"',
       },
     })));
