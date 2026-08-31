@@ -64,7 +64,7 @@ export interface ExcelApi {
 }
 
 const safeJobId = (id: string) => encodeURIComponent(id);
-const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024;
+const MAX_DOWNLOAD_BYTES = 200 * 1024 * 1024;
 const DOWNLOAD_MEDIA_TYPES = new Set([
   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
   "application/zip",

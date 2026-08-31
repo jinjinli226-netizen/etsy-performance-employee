@@ -30,3 +30,25 @@ describe("excel api event stream", () => {
     expect(timeoutSpy).not.toHaveBeenCalled();
   });
 });
+
+describe("excel api download", () => {
+  it("accepts a generated workbook between 100 MB and the 200 MB upload limit", async () => {
+    const zipSignature = new Uint8Array([0x50, 0x4b, 0x03, 0x04]);
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(zipSignature, {
+      status: 200,
+      headers: {
+        "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "Content-Length": String(150 * 1024 * 1024),
+        "Content-Disposition": 'attachment; filename="result.xlsx"',
+      },
+    })));
+
+    const result = await excelApi.downloadJob(
+      "00000000-0000-4000-8000-000000000001",
+      "source.xlsx",
+    );
+
+    expect(result.filename).toBe("result.xlsx");
+    expect(result.blob.size).toBe(zipSignature.byteLength);
+  });
+});
